@@ -1,0 +1,9 @@
+# Python dependencies
+langgraph
+langchain-core
+lupa
+typing-extensions
+
+# System runtime dependencies, install separately:
+# - lua or luajit
+# - luacheck (for example: luarocks install luacheck)
