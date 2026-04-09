@@ -16,7 +16,7 @@ logger = structlog.get_logger(__name__)
 _CHUNK_SIZE = 500
 _CHUNK_OVERLAP = 100
 _METADATA_FILE = "metadata.json"
-_INDEX_FILE = "index.faiss"
+_INDEX_FILE = "index.npy"   # numpy format avoids FAISS C++ unicode-path issues on Windows
 
 
 def _chunk_text(text: str, size: int = _CHUNK_SIZE, overlap: int = _CHUNK_OVERLAP) -> list[str]:
@@ -83,7 +83,10 @@ class LuaRAG(Tool):
         index.add(embeddings)
 
         self._index_path.mkdir(parents=True, exist_ok=True)
-        faiss.write_index(index, str(self._index_path / _INDEX_FILE))
+
+        # Serialize via numpy to avoid FAISS C++ unicode-path issues on Windows
+        serialized = faiss.serialize_index(index)
+        np.save(str(self._index_path / _INDEX_FILE), serialized)
 
         metadata = [{"text": t, "source": s} for t, s in zip(texts, sources)]
         (self._index_path / _METADATA_FILE).write_text(
@@ -98,7 +101,8 @@ class LuaRAG(Tool):
         """Load an existing FAISS index from disk."""
         import faiss
 
-        self._index = faiss.read_index(str(self._index_path / _INDEX_FILE))
+        serialized = np.load(str(self._index_path / _INDEX_FILE))
+        self._index = faiss.deserialize_index(serialized)
         self._metadata = json.loads(
             (self._index_path / _METADATA_FILE).read_text(encoding="utf-8")
         )
