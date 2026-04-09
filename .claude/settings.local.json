@@ -19,7 +19,14 @@
       "Bash(.venv/Scripts/python -c ':*)",
       "Bash(.venv/Scripts/python -c \"from langgraph.graph import StateGraph, END, START; print\\('langgraph OK, END type:', type\\(END\\)\\)\")",
       "Bash(.venv/Scripts/python -m pytest tests/test_engine.py -v)",
-      "Bash(.venv/Scripts/python -m pytest tests/test_engine.py -v --tb=short)"
+      "Bash(.venv/Scripts/python -m pytest tests/test_engine.py -v --tb=short)",
+      "Bash(.venv/Scripts/python -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000)",
+      "Bash(curl -s http://localhost:8000/api/health)",
+      "Bash(.venv/Scripts/python -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --log-level warning)",
+      "Bash(echo \"SERVER_PID=$!\")",
+      "Bash(taskkill //F //IM python.exe //FI \"WINDOWTITLE eq *uvicorn*\")",
+      "Bash(netstat -ano)",
+      "Bash(taskkill //F //PID 32036)"
     ]
   }
 }
