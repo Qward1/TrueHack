@@ -13,7 +13,6 @@ under the short name used in ``settings.yaml`` (``llm.provider``).
 from __future__ import annotations
 
 import json
-import re
 import time
 from abc import ABC, abstractmethod
 
@@ -21,6 +20,7 @@ import structlog
 from openai import APIConnectionError, APIError, AsyncOpenAI
 
 from src.core.config import Settings, get_settings
+from src.core.utils import parse_llm_json
 
 logger = structlog.get_logger(__name__)
 
@@ -51,14 +51,16 @@ class LLMProvider(ABC):
         prompt: str,
         system: str,
         schema: dict,
+        fallback: dict | None = None,
     ) -> dict:
-        """Generate a JSON response conforming to ``schema``."""
+        """Generate a JSON response conforming to ``schema``.
+
+        If the model's output cannot be parsed after retries, returns *fallback*
+        (or raises ``ValueError`` when *fallback* is ``None``).
+        """
 
 
 # ─── LM Studio implementation ─────────────────────────────────────────────
-_JSON_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL)
-
-
 class LMStudioProvider(LLMProvider):
     """LLM provider backed by LM Studio's local OpenAI-compatible server."""
 
@@ -133,56 +135,36 @@ class LMStudioProvider(LLMProvider):
         prompt: str,
         system: str,
         schema: dict,
+        fallback: dict | None = None,
     ) -> dict:
-        """Ask the model for JSON, strip markdown fences, retry up to 2 times."""
+        """Ask the model for JSON; use ``parse_llm_json`` for robust parsing.
+
+        Retries up to 2 times on parse failure.  After all attempts:
+        - returns *fallback* if provided
+        - raises ``ValueError`` otherwise
+        """
         json_instruction = (
             "You must respond with ONLY valid JSON matching this schema: "
             f"{json.dumps(schema)}. No explanations, no markdown, just JSON."
         )
         full_system = f"{system}\n\n{json_instruction}".strip()
 
-        last_error: Exception | None = None
-        for attempt in range(3):  # 1 initial attempt + 2 retries
+        _sentinel: dict = {"__parse_failed__": True}
+        for attempt in range(3):
             raw = await self.generate(
                 prompt=prompt,
                 system=full_system,
                 temperature=0.1,
             )
-            cleaned = self._strip_json_fence(raw)
-            try:
-                parsed = json.loads(cleaned)
-            except json.JSONDecodeError as exc:
-                last_error = exc
-                logger.warning(
-                    "llm_json_parse_failed",
-                    attempt=attempt + 1,
-                    error=str(exc),
-                    raw=raw[:200],
-                )
-                continue
-            if not isinstance(parsed, dict):
-                last_error = ValueError(
-                    f"Expected JSON object, got {type(parsed).__name__}"
-                )
-                logger.warning(
-                    "llm_json_not_object",
-                    attempt=attempt + 1,
-                    type=type(parsed).__name__,
-                )
-                continue
-            return parsed
+            parsed = parse_llm_json(raw, fallback=_sentinel)
+            if parsed is not _sentinel:
+                return parsed
+            logger.warning("llm_structured_retry", attempt=attempt + 1)
 
-        raise ValueError(
-            f"Failed to parse JSON from model after 3 attempts: {last_error}"
-        )
-
-    @staticmethod
-    def _strip_json_fence(text: str) -> str:
-        """Remove ```json ... ``` fences if present, leaving raw JSON."""
-        match = _JSON_FENCE_RE.match(text)
-        if match:
-            return match.group(1).strip()
-        return text.strip()
+        if fallback is not None:
+            logger.warning("llm_structured_fallback_used", schema_keys=list(schema.keys()))
+            return fallback
+        raise ValueError("Failed to parse JSON from model after 3 attempts")
 
 
 # ─── Provider registry ────────────────────────────────────────────────────

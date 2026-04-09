@@ -4,7 +4,18 @@
       "Bash(.venv/Scripts/pip install:*)",
       "Bash(.venv/Scripts/python -c \"from src.core.config import get_settings; s = get_settings\\(\\); print\\('model:', s.llm.model\\); print\\('lua:', s.lua.interpreter\\); print\\('fix_iter:', s.max_fix_iterations\\)\")",
       "Bash(.venv/Scripts/python -c \"from src.core.llm import LLMProvider, LMStudioProvider, LLMManager, register_provider; print\\('imports OK'\\)\")",
-      "Bash(.venv/Scripts/python src/core/llm.py)"
+      "Bash(.venv/Scripts/python src/core/llm.py)",
+      "Bash(lua54 -v)",
+      "Bash(.venv/Scripts/python -c \"import shutil, subprocess; print\\('lua54:', shutil.which\\('lua54'\\)\\); print\\('lua:', shutil.which\\('lua'\\)\\); print\\('luac:', shutil.which\\('luac'\\)\\)\")",
+      "Read(//c/Program Files/**)",
+      "Read(//c//**)",
+      "Read(//c/Program Files \\(x86\\)/**)",
+      "Read(//c/ProgramData/chocolatey/**)",
+      "Read(//c/Users/Dimentiy/**)",
+      "Bash(cmd //c \"where lua54 & where lua & where luarocks\")",
+      "Bash(.venv/Scripts/python -c 'import subprocess; r = subprocess.run\\(['\\\\''lua54'\\\\'', '\\\\''-v'\\\\''], capture_output=True, text=True\\); print\\('\\\\''stdout:'\\\\'', r.stdout\\); print\\('\\\\''stderr:'\\\\'', r.stderr\\); print\\('\\\\''rc:'\\\\'', r.returncode\\)')",
+      "Bash(.venv/Scripts/python -m pytest tests/test_lua_tools.py -v)",
+      "Bash(.venv/Scripts/python -m pytest tests/test_storage.py -v)"
     ]
   }
 }
