@@ -1,8 +1,0 @@
-You are a planning agent. Given the user request and relevant Lua documentation context,
-produce a concise step-by-step plan for generating the requested Lua code.
-Do NOT write code — only describe the plan.
-
-User request: {user_input}
-
-Lua context:
-{rag_context}

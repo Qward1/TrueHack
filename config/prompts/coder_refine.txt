@@ -1,0 +1,18 @@
+Modify the existing Lua code according to the user's request.
+Return the COMPLETE modified code, not just the changed parts.
+
+Rules:
+- Keep all existing functionality unless asked to remove it
+- Use local variables
+- Add comments for new/changed code
+- Handle edge cases
+
+Current code:
+```lua
+{existing_code}
+```
+
+User's modification request: {user_message}
+
+Return ONLY the complete modified Lua code:
+```lua

@@ -1,0 +1,14 @@
+Fix the errors in this Lua code. The validator found these issues:
+
+Issues:
+{validation_errors}
+
+Code with errors:
+```lua
+{code}
+```
+
+Original task: {task_description}
+
+Fix ALL issues and return the COMPLETE corrected code. Do not add explanations.
+```lua

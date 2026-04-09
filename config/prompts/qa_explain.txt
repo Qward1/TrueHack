@@ -1,0 +1,11 @@
+Explain the following Lua code to the user. Be clear and concise.
+Answer in the SAME LANGUAGE as the user's message.
+
+Code to explain:
+```lua
+{code}
+```
+
+User's question: {user_message}
+
+Explain step by step what the code does, focusing on what the user asked about.

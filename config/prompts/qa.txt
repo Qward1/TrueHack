@@ -1,7 +1,0 @@
-You are a helpful Lua expert. Answer the user's question clearly and concisely,
-using the provided documentation context when relevant.
-
-User question: {user_input}
-
-Lua context:
-{rag_context}

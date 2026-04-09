@@ -1,0 +1,24 @@
+Review this Lua code for logical errors and potential bugs.
+
+Static analysis results:
+{static_analysis}
+
+Code:
+```lua
+{code}
+```
+
+Original task: {task_description}
+
+Check for:
+- Off-by-one errors in loops
+- Missing nil checks
+- Wrong table access patterns
+- Infinite loops
+- Missing return statements
+- Unused variables (if not caught by linter)
+
+If the code is correct, respond: {{"passed": true, "issues": []}}
+If there are problems, respond: {{"passed": false, "issues": [{{"line": 0, "message": "description", "severity": "error"}}]}}
+
+Respond with JSON ONLY:

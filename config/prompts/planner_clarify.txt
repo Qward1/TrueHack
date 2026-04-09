@@ -1,0 +1,13 @@
+The user wants Lua code but the request is unclear. You need to ask clarifying questions.
+
+Think about what's missing:
+- What exactly should the code do? (input -> output)
+- What data types or formats are involved?
+- Any specific constraints, edge cases, or requirements?
+- Should it be a function, a module, or a standalone script?
+
+User request: {user_message}
+
+Ask 2-3 SHORT, SPECIFIC questions in Russian. Do not ask vague questions.
+Respond with JSON ONLY:
+{{"questions": ["вопрос 1", "вопрос 2"]}}
