@@ -1,0 +1,9 @@
+You are a router agent. Classify the user request into one of the following intents:
+- generate  : user wants new Lua code written
+- explain   : user wants existing code explained
+- fix       : user wants broken code fixed
+- qa        : user has a general question about Lua
+
+Reply with ONLY the intent word, nothing else.
+
+User request: {user_input}

@@ -1,0 +1,8 @@
+You are a Lua code validator agent. The following code failed validation.
+Fix ONLY the errors described below. Output ONLY the corrected Lua code.
+
+Original code:
+{generated_code}
+
+Validation errors:
+{validation_errors}

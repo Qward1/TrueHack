@@ -1,0 +1,32 @@
+llm:
+  provider: "lmstudio"
+  base_url: "http://localhost:1234/v1"
+  api_key: "lm-studio"
+  model: "qwen2.5-coder-3b-instruct"
+  generation_params:
+    router:
+      temperature: 0.1
+      max_tokens: 100
+    planner:
+      temperature: 0.3
+      max_tokens: 1024
+    coder:
+      temperature: 0.2
+      max_tokens: 2048
+    validator:
+      temperature: 0.1
+      max_tokens: 512
+    qa:
+      temperature: 0.5
+      max_tokens: 1024
+
+max_fix_iterations: 3
+max_chat_history: 10
+
+paths:
+  database: "data/localscript.db"
+  rag_index: "data/rag_index"
+  lua_docs: "data/lua_docs"
+
+lua:
+  interpreter: "lua54"

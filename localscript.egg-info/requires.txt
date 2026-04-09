@@ -1,0 +1,16 @@
+langgraph>=0.2
+langchain-core>=0.3
+fastapi>=0.115
+uvicorn[standard]>=0.32
+openai>=1.55
+faiss-cpu>=1.9
+sentence-transformers>=3.3
+structlog>=24.4
+aiosqlite>=0.20
+pyyaml>=6.0
+pydantic>=2.10
+pydantic-settings>=2.6
+
+[dev]
+pytest>=8.3
+pytest-asyncio>=0.24
