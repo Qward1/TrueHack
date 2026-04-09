@@ -15,7 +15,8 @@
       "Bash(cmd //c \"where lua54 & where lua & where luarocks\")",
       "Bash(.venv/Scripts/python -c 'import subprocess; r = subprocess.run\\(['\\\\''lua54'\\\\'', '\\\\''-v'\\\\''], capture_output=True, text=True\\); print\\('\\\\''stdout:'\\\\'', r.stdout\\); print\\('\\\\''stderr:'\\\\'', r.stderr\\); print\\('\\\\''rc:'\\\\'', r.returncode\\)')",
       "Bash(.venv/Scripts/python -m pytest tests/test_lua_tools.py -v)",
-      "Bash(.venv/Scripts/python -m pytest tests/test_storage.py -v)"
+      "Bash(.venv/Scripts/python -m pytest tests/test_storage.py -v)",
+      "Bash(.venv/Scripts/python -c ':*)"
     ]
   }
 }

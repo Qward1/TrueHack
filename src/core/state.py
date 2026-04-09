@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 
 class Message(TypedDict):
@@ -17,22 +17,28 @@ class AgentState(TypedDict):
     user_input: str                  # latest user message
 
     # ── Planning / routing ────────────────────────────────────────
-    intent: str                      # determined by router: "generate" | "explain" | "fix" | "qa"
-    plan: str                        # high-level plan produced by planner agent
+    intent: str                      # router output: see router.txt categories
+    plan: list[dict]                 # structured tasks from planner: [{id, description, function_name, signature, dependencies}]
+    current_task_index: int          # which task in plan is being processed
+    task_description: str            # description of the current task (for prompts)
+    clarification_questions: NotRequired[list[str]]  # from planner_clarify
 
     # ── Code generation ───────────────────────────────────────────
-    generated_code: str              # current Lua code candidate
+    generated_code: str              # current Lua code candidate (latest)
+    generated_codes: dict[str, str]  # task_id -> generated Lua code
+    assembled_code: str              # final assembled module from planner.assemble()
     fix_iterations: int              # how many fix attempts have been made
 
     # ── Validation ────────────────────────────────────────────────
     validation_passed: bool
-    validation_errors: str           # stderr / error message from lua54
+    validation_errors: str           # combined error string (syntax + LLM review)
 
     # ── RAG context ───────────────────────────────────────────────
     rag_context: str                 # retrieved Lua documentation snippets
 
     # ── Final answer ──────────────────────────────────────────────
     response: str                    # text response sent back to the user
+    response_type: str               # "text" | "code" | "clarification"
 
     # ── Metadata ──────────────────────────────────────────────────
     metadata: dict[str, Any]         # arbitrary extra data (agent diagnostics, etc.)
