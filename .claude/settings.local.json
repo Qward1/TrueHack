@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(.venv/Scripts/pip install:*)",
-      "Bash(.venv/Scripts/python -c \"from src.core.config import get_settings; s = get_settings\\(\\); print\\('model:', s.llm.model\\); print\\('lua:', s.lua.interpreter\\); print\\('fix_iter:', s.max_fix_iterations\\)\")"
+      "Bash(.venv/Scripts/python -c \"from src.core.config import get_settings; s = get_settings\\(\\); print\\('model:', s.llm.model\\); print\\('lua:', s.lua.interpreter\\); print\\('fix_iter:', s.max_fix_iterations\\)\")",
+      "Bash(.venv/Scripts/python -c \"from src.core.llm import LLMProvider, LMStudioProvider, LLMManager, register_provider; print\\('imports OK'\\)\")",
+      "Bash(.venv/Scripts/python src/core/llm.py)"
     ]
   }
 }
