@@ -4,7 +4,7 @@
 
 ## 1. New Lua without explicit path
 ### Prompt
-`Создай Lua-скрипт калькулятора с консольным вводом`
+`Верни последний email из wf.vars.emails`
 
 ### Expected pipeline
 `resolve_target -> route_intent(create) -> generate -> validate -> verify -> save -> explain_solution -> respond`
@@ -18,7 +18,7 @@
 
 ## 2. New Lua in explicit directory
 ### Prompt
-`Создай текстовую игру в папке C:\Work\LuaProjects`
+`Преобразуй DATUM и TIME из wf.vars.json.IDOC.ZCDF_HEAD в ISO дату в папке C:\Work\LuaProjects`
 
 ### Expected path behavior
 - создается `C:\Work\LuaProjects\<slug>\<slug>.lua`
@@ -48,8 +48,8 @@
 
 ## 4. Refine active target in same chat
 ### Prompt sequence
-1. `Создай калькулятор в C:\Work\LuaProjects\calc.lua`
-2. `Добавь историю последних операций`
+1. `Преобразуй wf.initVariables.recallTime в epoch в C:\Work\LuaProjects\recall_time.lua`
+2. `Добавь безопасную обработку nil и невалидного формата даты`
 
 ### Expected behavior
 - turn 2 переиспользует active target
@@ -58,7 +58,7 @@
 
 ## 5. Validation failure -> fix loop
 ### Prompt
-`Создай интерактивный Lua-скрипт с обработкой ввода`
+`Верни wf.vars.total + 1, но в коде есть ошибка обращения к полю`
 
 ### Pass criteria
 - при провале runtime-валидации через `lua` запускается минимум одна итерация `fix_code`
@@ -66,24 +66,50 @@
 
 ## 6. Verification failure -> fix loop
 ### Prompt
-`Сделай калькулятор с историей и экспортом истории в файл`
+`Преобразуй DATUM/TIME из wf.vars.json.IDOC.ZCDF_HEAD в ISO дату и сохрани в wf.vars.iso_date`
 
 ### Pass criteria
 - если verification вернул недостающие требования, pipeline уходит в fix-loop
 - после фикса снова идут validate -> verify -> save
 
+## 6a. LowCode init variables are mocked in validation
+### Prompt
+`Преобразуй wf.initVariables.recallTime в Unix timestamp и сохрани в wf.vars.unixTime`
+
+### Pass criteria
+- локальная validation не падает только из-за отсутствия `wf.initVariables`
+- harness автоматически подставляет test value для `recallTime`
+- если логика преобразования сломана, runtime по-прежнему возвращает реальную Lua-ошибку
+
+## 6b. Nested workflow paths are mocked in validation
+### Prompt
+`Преобразуй DATUM/TIME из wf.initVariables.json.IDOC.ZCDF_HEAD в ISO строку`
+
+### Pass criteria
+- harness строит nested mock path `wf.initVariables.json.IDOC.ZCDF_HEAD`
+- alias access к промежуточной таблице не ломает validation сам по себе
+- если логика внутри преобразования ошибочна, runtime возвращает реальную Lua-ошибку, а не nil path failure
+
 ## 7. E2E temporarily disabled
 ### Prompt
-`Сделай CLI-скрипт, который принимает имя и печатает приветствие`
+`Верни wf.vars.customerName`
 
 ### Pass criteria
 - pipeline не вызывает e2e suite generation/execution
 - сохранение не зависит от e2e gate
 - `/status` показывает, что e2e временно отключен
 
+## 7a. Console input is rejected by active contract
+### Prompt
+`Сделай Lua-скрипт, который читает строку через io.read()`
+
+### Pass criteria
+- validation помечает это как нарушение workflow/LUS contract
+- fix-loop получает diagnostics, что нужно убрать console input API
+
 ## 8. Explanation and follow-up suggestions
 ### Prompt sequence
-1. `Создай todo-менеджер в C:\Work\LuaProjects\todo.lua`
+1. `Нормализуй wf.vars.json.IDOC.ZCDF_HEAD.ZCDF_PACKAGES так, чтобы obj.items всегда был массивом, в C:\Work\LuaProjects\normalize_packages.lua`
 2. `Примени предложение 1`
 
 ### Pass criteria
@@ -95,7 +121,7 @@
 
 ## 9. Question/inspect without file rewrite
 ### Prompt sequence
-1. `Создай игру в C:\Work\LuaProjects\game.lua`
+1. `Сделай скрипт, который возвращает wf.vars.emails[#wf.vars.emails], в C:\Work\LuaProjects\last_email.lua`
 2. `Объясни, как работает этот код`
 
 ### Pass criteria

@@ -121,6 +121,39 @@ UI `/status` и финальный ответ показывают оба пут
 
 ## 2026-04-10
 ### Decision
+Локальная validation для LowCode-скриптов запускается через temporary mock harness.
+
+### Why
+Голый запуск `lua script.lua` давал ложные падения на `wf.initVariables` и `_utils`, хотя проблема была в отсутствии платформенного контекста, а не в самом Lua-коде.
+
+### Consequences
+`validate_code` теперь исполняет временный harness, который:
+- создаёт mock `wf.vars` и `wf.initVariables`;
+- добавляет `_utils.array.new()` / `_utils.array.markAsArray(arr)`;
+- строит nested mock tables для найденных `wf.vars.*` / `wf.initVariables.*`, в том числе при alias access.
+Это снижает ложные validation failures и даёт fix-loop реальные runtime diagnostics.
+
+---
+
+## 2026-04-11
+### Decision
+Канонический runtime генерирует workflow/LUS scripts, а не console/CLI Lua-программы.
+
+### Why
+Текущий продуктовый формат — это data/workflow chunk с работой через `wf.vars` / `wf.initVariables`, а не интерактивное консольное приложение.
+
+### Consequences
+Generation/refine/fix prompts теперь требуют:
+- workflow/LUS script shape;
+- прямую работу с `wf.vars` и `wf.initVariables`;
+- возврат значения и/или обновление `wf.vars`;
+- отсутствие console input/output по умолчанию.
+Локальная validation дополнительно блокирует `io.read` / `io.stdin:read` как нарушение активного контракта.
+
+---
+
+## 2026-04-10
+### Decision
 После успешного сохранения система обязана возвращать объяснение решения и следующий шаг для пользователя.
 
 ### Why

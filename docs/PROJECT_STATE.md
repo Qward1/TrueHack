@@ -26,9 +26,11 @@
 - generation contract для LowCode:
   - `Lua 5.5`
   - wrapper `lua{ ... }lua`
+  - workflow/LUS script instead of console/CLI app
   - direct access вместо JsonPath
   - `wf.vars` / `wf.initVariables` для данных схемы
-- локальная валидация через `lua`
+- локальная валидация через `lua` с temporary LowCode harness
+- nested mock paths для `wf.vars` / `wf.initVariables` в validation harness
 - fix loop по стадиям ошибок
 - LLM verification требований
 - улучшенный naming:
@@ -73,6 +75,7 @@ README описывает канонический запуск через `app.
 - без e2e-gate сохранение теперь опирается только на локальную валидацию и LLM verification
 - без `luacheck` lint-класс проблем сейчас не отлавливается отдельным шагом
 - naming эвристики остаются rule-based и могут потребовать дальнейшей подстройки под реальные prompt patterns
+- mock values в validation harness остаются эвристическими и не заменяют реальные platform variables
 
 ## Next tasks
 - перевести canonical runtime на Ollama-конфигурацию хакатона

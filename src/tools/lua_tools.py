@@ -16,6 +16,7 @@ from src.core.llm import LLMProvider
 from src.tools.local_runtime import (
     run_lua_file,
     run_lua_file_with_input,
+    to_cmd_path,
 )
 
 logger = structlog.get_logger(__name__)
@@ -32,10 +33,13 @@ LOWCODE_CONTRACT_TEXT = (
     f"Target contract:\n"
     f"- Use {LOWCODE_LUA_VERSION} syntax and conventions.\n"
     f"- The script is described in JsonString format: {LOWCODE_JSONSTRING_OPEN}<code>{LOWCODE_JSONSTRING_CLOSE}.\n"
+    "- This is a workflow/LUS script, not a console or CLI application.\n"
     "- Never use JsonPath to access variables or fields.\n"
     "- Access data directly by field/key.\n"
     "- Declared LowCode variables are stored in wf.vars.\n"
     "- Variables received at startup from variables are stored in wf.initVariables.\n"
+    "- The script should transform workflow data, return a value, and/or update wf.vars.\n"
+    "- Avoid console input/output flows, prompts, menus, io.read, io.stdin:read, print, and io.write.\n"
     "- Allowed primitive types: nil, boolean, number, string, array, table, function.\n"
     "- To create/mark arrays use _utils.array.new() and _utils.array.markAsArray(arr).\n"
     "- Allowed basic constructs: if/then/else, while/do/end, for/do/end, repeat/until.\n"
@@ -46,7 +50,7 @@ DEFAULT_VERIFICATION_SYSTEM_PROMPT = (
     "Use passed=true only if all important requirements are satisfied."
 )
 DEFAULT_E2E_SYSTEM_PROMPT = (
-    "You design deterministic end-to-end tests for a single Lua CLI file. "
+    "You design deterministic end-to-end tests for a single Lua workflow script. "
     "Return strict JSON only with key: tests. "
     "Each test must contain: name, stdin, expected_stdout_contains, expected_stdout_not_contains, expected_exit_code. "
     "Use concise assertions and keep at most 3 tests."
@@ -91,6 +95,28 @@ _LUA_FUNC_DEF_RE = re.compile(
     r"([A-Za-z_][A-Za-z_0-9]*(?:[.:][A-Za-z_][A-Za-z_0-9]*)?)"
     r"\s*\([^)]*\)[\s\S]*?\bend\b",
     re.MULTILINE,
+)
+WF_PATH_SUFFIX_RE = re.compile(
+    r"(?:\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)|\s*\[\s*['\"]([^'\"]+)['\"]\s*\])"
+)
+WF_ROOT_ACCESS_RE = re.compile(
+    r"\bwf\.(vars|initVariables)"
+    r"((?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*|\s*\[\s*['\"][^'\"]+['\"]\s*\])+)"
+)
+WF_ALIAS_ASSIGN_RE = re.compile(
+    r"(?:local\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+    r"(wf\.(?:vars|initVariables)(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*|\s*\[\s*['\"][^'\"]+['\"]\s*\])+)"
+)
+LOWCODE_CONSOLE_INPUT_PATTERNS = (
+    (re.compile(r"\bio\.read\s*\("), "io.read"),
+    (re.compile(r"\bio\.stdin\s*:\s*read\s*\("), "io.stdin:read"),
+    (re.compile(r"\bio\.stdin:read\s*\("), "io.stdin:read"),
+)
+LOWCODE_CONSOLE_OUTPUT_PATTERNS = (
+    (re.compile(r"\bprint\s*\("), "print"),
+    (re.compile(r"\bio\.write\s*\("), "io.write"),
+    (re.compile(r"\bio\.stdout\s*:\s*write\s*\("), "io.stdout:write"),
+    (re.compile(r"\bio\.stdout:write\s*\("), "io.stdout:write"),
 )
 _DELETE_KEYWORDS = (
     "remove", "delete", "drop",
@@ -176,7 +202,7 @@ def contains_mojibake(text: str) -> bool:
 
 
 def infer_program_mode(lua_code: str) -> str:
-    """Treat `io.read`-driven scripts as interactive console apps."""
+    """Classify validation mode for the generated Lua chunk."""
     interactive_patterns = (
         r"\bio\.read\s*\(",
         r"\bio\.stdin\s*:\s*read\s*\(",
@@ -185,7 +211,23 @@ def infer_program_mode(lua_code: str) -> str:
     for pattern in interactive_patterns:
         if re.search(pattern, lua_code):
             return "interactive"
-    return "batch"
+    return "workflow"
+
+
+def inspect_lowcode_script_contract(lua_code: str) -> dict[str, list[str]]:
+    """Detect console-style APIs that do not fit the workflow/LUS script contract."""
+    blockers: list[str] = []
+    warnings: list[str] = []
+
+    for pattern, label in LOWCODE_CONSOLE_INPUT_PATTERNS:
+        if pattern.search(lua_code):
+            blockers.append(label)
+
+    for pattern, label in LOWCODE_CONSOLE_OUTPUT_PATTERNS:
+        if pattern.search(lua_code):
+            warnings.append(label)
+
+    return {"blockers": blockers, "warnings": warnings}
 
 
 def is_tooling_problem(diagnostics: dict[str, Any]) -> bool:
@@ -225,6 +267,179 @@ def classify_failure_kind(diagnostics: dict[str, Any]) -> str:
     return "unknown"
 
 
+def build_mock_init_value(name: str) -> str:
+    """Build a conservative Lua literal for an inferred init variable name."""
+    lowered = name.strip().lower()
+    if not lowered:
+        return '"sample"'
+
+    if lowered == "datum":
+        return '"20260410"'
+    if lowered == "time":
+        return '"123045"'
+    if any(token in lowered for token in ("time", "date", "timestamp", "datetime", "recall")):
+        return '"2026-04-10T12:00:00"'
+    if any(token in lowered for token in ("email", "emails")):
+        return '{"user@example.com"}'
+    if lowered.startswith(("is", "has", "can", "should")) or any(
+        token in lowered for token in ("enabled", "active", "valid", "success", "available")
+    ):
+        return "true"
+    if any(token in lowered for token in ("count", "amount", "sum", "total", "price", "age", "index", "num", "id")):
+        return "1"
+    if any(token in lowered for token in ("list", "items", "array", "values", "result")):
+        return "{}"
+    if lowered in {"json", "body", "head", "data", "payload", "idoc"}:
+        return "{}"
+    if lowered in {"packages"}:
+        return "{{ items = {} }}"
+    return '"sample"'
+
+
+def _parse_wf_expression(expression: str) -> tuple[str, list[str]] | None:
+    match = re.match(r"\s*wf\.(vars|initVariables)(.*)", expression)
+    if not match:
+        return None
+    root = match.group(1)
+    suffix = match.group(2)
+    segments: list[str] = []
+    for segment_match in WF_PATH_SUFFIX_RE.finditer(suffix):
+        segment = str(segment_match.group(1) or segment_match.group(2) or "").strip()
+        if segment:
+            segments.append(segment)
+    if not segments:
+        return None
+    return root, segments
+
+
+def collect_lowcode_access_paths(lua_code: str) -> dict[str, list[list[str]]]:
+    """Collect direct and aliased wf.vars/wf.initVariables access paths."""
+    discovered: dict[str, list[list[str]]] = {"vars": [], "initVariables": []}
+    seen: set[tuple[str, ...]] = set()
+    aliases: dict[str, tuple[str, list[str]]] = {}
+
+    def add_path(root: str, segments: list[str]) -> None:
+        key = (root, *segments)
+        if not segments or key in seen:
+            return
+        seen.add(key)
+        discovered[root].append(segments)
+
+    for match in WF_ROOT_ACCESS_RE.finditer(lua_code):
+        parsed = _parse_wf_expression(match.group(0))
+        if parsed:
+            add_path(*parsed)
+
+    for match in WF_ALIAS_ASSIGN_RE.finditer(lua_code):
+        alias = str(match.group(1) or "").strip()
+        parsed = _parse_wf_expression(str(match.group(2) or ""))
+        if not alias or not parsed:
+            continue
+        aliases[alias] = parsed
+        add_path(*parsed)
+
+    for alias, (root, base_segments) in aliases.items():
+        alias_pattern = re.compile(
+            rf"\b{re.escape(alias)}"
+            r"((?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*|\s*\[\s*['\"][^'\"]+['\"]\s*\])+)"
+        )
+        for match in alias_pattern.finditer(lua_code):
+            suffix_segments = [
+                str(segment_match.group(1) or segment_match.group(2) or "").strip()
+                for segment_match in WF_PATH_SUFFIX_RE.finditer(str(match.group(1) or ""))
+                if str(segment_match.group(1) or segment_match.group(2) or "").strip()
+            ]
+            if suffix_segments:
+                add_path(root, [*base_segments, *suffix_segments])
+
+    return discovered
+
+
+def build_mock_leaf_value(path_segments: list[str]) -> str:
+    """Choose a conservative Lua literal for the leaf of a mocked path."""
+    if not path_segments:
+        return "{}"
+    return build_mock_init_value(path_segments[-1])
+
+
+def _lua_path_expression(root: str, segments: list[str]) -> str:
+    expression = f"wf.{root}"
+    for segment in segments:
+        expression += f"[{json.dumps(segment)}]"
+    return expression
+
+
+def build_mock_assignment_lines(root: str, paths: list[list[str]]) -> list[str]:
+    """Build Lua lines that materialize nested mock tables for the given wf root."""
+    lines: list[str] = []
+    ensured_tables: set[tuple[str, ...]] = set()
+
+    for path in sorted(paths, key=lambda item: (len(item), item)):
+        for depth in range(1, len(path)):
+            prefix = tuple(path[:depth])
+            if prefix in ensured_tables:
+                continue
+            expression = _lua_path_expression(root, list(prefix))
+            lines.append(f'if {expression} == nil or type({expression}) ~= "table" then {expression} = {{}} end')
+            ensured_tables.add(prefix)
+
+        leaf_expression = _lua_path_expression(root, path)
+        leaf_value = build_mock_leaf_value(path)
+        lines.append(f"if {leaf_expression} == nil then {leaf_expression} = {leaf_value} end")
+    return lines
+
+
+def build_lowcode_validation_harness(lua_file: str, lua_code: str) -> tuple[str, dict[str, list[str]]]:
+    """Build a temporary harness that injects a mock LowCode runtime around the user file."""
+    access_paths = collect_lowcode_access_paths(lua_code)
+    assignment_lines = [
+        *build_mock_assignment_lines("vars", access_paths["vars"]),
+        *build_mock_assignment_lines("initVariables", access_paths["initVariables"]),
+    ]
+    assignments_block = "\n".join(assignment_lines)
+    if assignments_block:
+        assignments_block = f"{assignments_block}\n"
+
+    user_path_literal = json.dumps(to_cmd_path(lua_file))
+    harness = (
+        "wf = wf or {}\n"
+        "wf.vars = wf.vars or {}\n"
+        "wf.initVariables = wf.initVariables or {}\n"
+        "_utils = _utils or {}\n"
+        "_utils.array = _utils.array or {}\n"
+        "if _utils.array.new == nil then\n"
+        "    _utils.array.new = function()\n"
+        "        return {}\n"
+        "    end\n"
+        "end\n"
+        "if _utils.array.markAsArray == nil then\n"
+        "    _utils.array.markAsArray = function(arr)\n"
+        "        return arr\n"
+        "    end\n"
+        "end\n"
+        f"{assignments_block}"
+        "local function _traceback(err)\n"
+        "    if debug and debug.traceback then\n"
+        "        return debug.traceback(err, 2)\n"
+        "    end\n"
+        "    return tostring(err)\n"
+        "end\n"
+        "local ok, err = xpcall(function()\n"
+        f"    dofile({user_path_literal})\n"
+        "end, _traceback)\n"
+        "if not ok then\n"
+        "    io.stderr:write(tostring(err))\n"
+        "    io.stderr:write('\\n')\n"
+        "    os.exit(1)\n"
+        "end\n"
+    )
+    mocked_paths = {
+        "vars": [".".join(path) for path in access_paths["vars"]],
+        "initVariables": [".".join(path) for path in access_paths["initVariables"]],
+    }
+    return harness, mocked_paths
+
+
 def _sync_run_diagnostics(
     lua_file: str,
     lua_bin: str = DEFAULT_LUA_BIN,
@@ -236,17 +451,64 @@ def _sync_run_diagnostics(
     run_output = ""
     started_ok = False
     timed_out = False
-    program_mode = "batch"
+    program_mode = "workflow"
+    harness_path = ""
+    mocked_init_variables: list[str] = []
+    mocked_var_paths: list[str] = []
+    contract_blockers: list[str] = []
+    contract_warnings: list[str] = []
 
     try:
         with open(lua_file, "r", encoding="utf-8", errors="replace") as file:
-            program_mode = infer_program_mode(file.read())
+            lua_code = file.read()
+            program_mode = infer_program_mode(lua_code)
     except OSError:
-        program_mode = "batch"
+        lua_code = ""
+        program_mode = "workflow"
+
+    contract_analysis = inspect_lowcode_script_contract(lua_code)
+    contract_blockers = contract_analysis["blockers"]
+    contract_warnings = contract_analysis["warnings"]
+    if contract_blockers:
+        run_error = (
+            "Workflow/LUS script must not use console input APIs "
+            f"({', '.join(contract_blockers)}). Use wf.vars / wf.initVariables and return values instead."
+        )
+        diagnostics = {
+            "success": False,
+            "started_ok": False,
+            "timed_out": False,
+            "program_mode": "workflow",
+            "validation_context": "lowcode_mock_harness",
+            "mocked_init_variables": [],
+            "mocked_var_paths": [],
+            "contract_blockers": contract_blockers,
+            "contract_warnings": contract_warnings,
+            "run_output": "",
+            "run_error": run_error,
+            "run_warning": "",
+            "luacheck_output": "",
+            "luacheck_error": "",
+            "luacheck_warning": "",
+            "failure_kind": "contract",
+        }
+        return diagnostics
 
     try:
+        harness_code, mocked_paths = build_lowcode_validation_harness(lua_file, lua_code)
+        mocked_init_variables = mocked_paths["initVariables"]
+        mocked_var_paths = mocked_paths["vars"]
+        with tempfile.NamedTemporaryFile(
+            suffix=".lua",
+            delete=False,
+            mode="w",
+            encoding="utf-8",
+        ) as harness_file:
+            harness_file.write(harness_code)
+            harness_path = harness_file.name
+
         run_result = run_lua_file(
-            lua_file,
+            harness_path,
             lua_bin,
             startup_timeout,
             stdin_mode="inherit" if program_mode == "interactive" else "devnull",
@@ -260,18 +522,24 @@ def _sync_run_diagnostics(
         else:
             started_ok = run_result["success"] and no_runtime_stderr and not timed_out
 
-        if contains_mojibake(raw_run_output) or contains_mojibake(run_output):
+        if contract_warnings:
             run_warning = (
+                "Workflow/LUS scripts should avoid console output APIs unless explicitly required: "
+                f"{', '.join(contract_warnings)}."
+            )
+        if contains_mojibake(raw_run_output) or contains_mojibake(run_output):
+            mojibake_warning = (
                 "Console output looks garbled in Windows cmd. "
-                "Prefer ASCII UI text or configure UTF-8 explicitly.\n"
+                "Prefer returning values or wf.vars updates instead of console output.\n"
                 f"{run_output}"
             )
+            run_warning = f"{run_warning}\n{mojibake_warning}".strip() if run_warning else mojibake_warning
         if not run_result["success"] and not timed_out:
             run_error = run_output or f"Lua process exited with code {run_result['returncode']}."
-        elif program_mode == "batch" and timed_out:
+        elif program_mode == "workflow" and timed_out:
             run_error = (
-                "Batch Lua script did not finish during the startup timeout. "
-                "If the program is intentionally interactive, keep input-driven behavior explicit."
+                "Workflow/LUS script did not finish during the validation timeout. "
+                "Avoid console waits and keep the script as a pure data transformation."
             )
     except (FileNotFoundError, RuntimeError) as exc:
         run_error = repair_mojibake(str(exc))
@@ -281,6 +549,11 @@ def _sync_run_diagnostics(
         "started_ok": started_ok,
         "timed_out": timed_out,
         "program_mode": program_mode,
+        "validation_context": "lowcode_mock_harness",
+        "mocked_init_variables": mocked_init_variables,
+        "mocked_var_paths": mocked_var_paths,
+        "contract_blockers": contract_blockers,
+        "contract_warnings": contract_warnings,
         "run_output": run_output,
         "run_error": run_error,
         "run_warning": run_warning,
@@ -289,6 +562,11 @@ def _sync_run_diagnostics(
         "luacheck_warning": "",
     }
     diagnostics["failure_kind"] = classify_failure_kind(diagnostics)
+    if harness_path:
+        try:
+            os.unlink(harness_path)
+        except OSError:
+            pass
     return diagnostics
 
 

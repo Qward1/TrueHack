@@ -68,10 +68,11 @@ User message: {user_input}
 JSON only:"""
 
 _GENERATE_SYSTEM = (
-    f"You generate clean, correct {LOWCODE_LUA_VERSION} code from the user's request. "
+    f"You generate clean, correct {LOWCODE_LUA_VERSION} workflow/LUS scripts from the user's request. "
     "Return the script in LowCode JsonString format lua{...}lua without markdown fences or explanations. "
     f"{LOWCODE_CONTRACT_TEXT} "
-    "If the program is a Windows console app, prefer ASCII-only UI text."
+    "Generate a data/workflow script, not a console or CLI app. "
+    "Prefer direct work with wf.vars / wf.initVariables, keep helper functions only when needed, and return the final value and/or update wf.vars."
 )
 
 _REFINE_SYSTEM = (
@@ -79,7 +80,8 @@ _REFINE_SYSTEM = (
     "Return the COMPLETE updated file, not just the changed parts. "
     "Preserve existing functions unless explicitly asked to remove them. "
     "Return the script in LowCode JsonString format lua{...}lua. "
-    f"{LOWCODE_CONTRACT_TEXT}"
+    f"{LOWCODE_CONTRACT_TEXT} "
+    "Keep the result as a workflow/LUS script instead of a console or CLI app."
 )
 
 _REFINE_USER = """Primary target file: {target_path}
@@ -101,7 +103,7 @@ _FIX_SYSTEM = (
     "You fix broken Lua code using the user's goal and diagnostics. "
     "Return only corrected Lua code in JsonString format lua{...}lua without markdown fences, explanations, or extra text. "
     f"{LOWCODE_CONTRACT_TEXT} "
-    "Do not remove legitimate interactivity just to pass checks."
+    "Keep the result as a workflow/LUS script. Do not introduce console input/output, prompts, menus, or CLI scaffolding."
 )
 
 _FIX_USER = """Primary target file: {target_path}
@@ -885,7 +887,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
 
         run_output = diagnostics.get("run_output", "").strip()
         if run_output:
-            lines.append(f"\nВывод программы:\n```\n{run_output}\n```")
+            lines.append(f"\nRuntime output:\n```\n{run_output}\n```")
 
         if isinstance(explanation, dict):
             summary = str(explanation.get("summary", "")).strip()
