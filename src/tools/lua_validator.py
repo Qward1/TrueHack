@@ -28,6 +28,11 @@ class LuaValidator(Tool):
     def __init__(self, lua_cmd: str) -> None:
         self._lua_cmd = lua_cmd
         self._luacheck_available: bool | None = None
+        # On Windows ``luacheck`` is often installed as ``luacheck.BAT`` by
+        # luarocks. asyncio.create_subprocess_exec cannot launch .BAT files
+        # directly (CreateProcess rejects them), so we cache the resolved
+        # absolute path and fall through to ``cmd /c`` for .bat targets.
+        self._luacheck_path: str | None = None
 
     async def run(self, code: str, **_: object) -> dict:
         """Run full validation (syntax + lint). Primary tool entry point."""
@@ -62,22 +67,41 @@ class LuaValidator(Tool):
     async def lint(self, code: str) -> dict:
         """Run luacheck if present; otherwise return ``available=False``."""
         if self._luacheck_available is None:
-            self._luacheck_available = shutil.which("luacheck") is not None
+            resolved = shutil.which("luacheck")
+            self._luacheck_path = resolved
+            self._luacheck_available = resolved is not None
 
         if not self._luacheck_available:
             return {"available": False, "warnings": [], "errors": []}
 
         tmp_path = self._write_tmp(code)
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "luacheck",
-                "--no-color",
-                "--codes",
-                "--ranges",
-                tmp_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            # On Windows luacheck is often a .bat shim — CreateProcess cannot
+            # run those directly, so route batch files through cmd /c.
+            lc_path = self._luacheck_path or "luacheck"
+            is_batch = lc_path.lower().endswith((".bat", ".cmd"))
+            if is_batch:
+                proc = await asyncio.create_subprocess_exec(
+                    os.environ.get("COMSPEC", "cmd.exe"),
+                    "/c",
+                    lc_path,
+                    "--no-color",
+                    "--codes",
+                    "--ranges",
+                    tmp_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    lc_path,
+                    "--no-color",
+                    "--codes",
+                    "--ranges",
+                    tmp_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
             stdout, _ = await proc.communicate()
             warnings, errors = self._parse_luacheck(
                 stdout.decode("utf-8", errors="replace")

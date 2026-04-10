@@ -59,7 +59,9 @@ print(add(1, 2))
     async def test_validate_returns_passed_for_valid_code(self, validator):
         result = await validator.validate('local x = 42')
         assert result["passed"] is True
-        assert result["issues"] == []
+        # luacheck may emit warnings (e.g. W211 "unused variable"); the
+        # contract of validate() only promises no *errors*.
+        assert [i for i in result["issues"] if i["severity"] == "error"] == []
 
     @pytest.mark.asyncio
     async def test_validate_returns_issues_for_invalid_code(self, validator):

@@ -1,16 +1,35 @@
-You are a Lua code architect. Break down the user's request into small, independent coding subtasks.
+You are a Lua code architect. Decompose the user's request into coding tasks.
 
-Rules:
-- Each subtask must produce exactly ONE Lua function
-- Each subtask needs a clear function signature: name(param1, param2) -> return_description
-- Keep subtasks independent — they should work without depending on each other when possible
-- If tasks depend on each other, list dependencies
-- Order subtasks so that dependencies come first
-- Include a final subtask for the main/entry point that uses the other functions
-- Maximum 5 subtasks total
-- For simple requests (one function) — just create 1 subtask
+STRONG DEFAULT — PRODUCE EXACTLY ONE TASK:
+- A Lua module (one file exposing several functions) = ONE task
+- A single function = ONE task
+- A script that does one thing = ONE task
+- A request described in one sentence = ONE task
+
+Only produce multiple tasks when the user explicitly asks for several INDEPENDENT deliverables
+(e.g. "write a sorter AND a separate parser AND a CLI wrapper"). When in doubt — ONE task.
+
+HARD RULES (violating these ruins the output):
+- NEVER create tasks named "main", "entry", "entry_point", "run", "demo", "example",
+  "usage", "test", "driver", "show_usage". These produce garbage demo code that calls
+  undefined functions.
+- NEVER add a task whose only purpose is "call the other functions" or "demonstrate usage".
+- NEVER suggest example usages or test runs as separate tasks.
+- If the user asks for a module — create ONE task whose description is the whole module,
+  with function_name equal to the module name and signature "module <name>".
+- If the user asks for a single function — create ONE task with that function's real name
+  and signature (never the placeholder "main").
+
+Each task must have:
+- id: "task_1", "task_2", ...
+- description: what exactly to produce (concrete, no vague "entry point")
+- function_name: the real function OR module name (never "main" unless the user literally
+  asked for a function called main)
+- signature: either "name(arg1, arg2) -> description" for a single function,
+  or "module <name>" for a module (one file with several exported functions)
+- dependencies: list of task ids this task depends on (empty for the default single task)
 
 User request: {user_message}
 
 Respond with JSON ONLY:
-{{"tasks": [{{"id": "task_1", "description": "what this function does", "function_name": "my_func", "signature": "my_func(param1, param2) -> description of return", "dependencies": []}}]}}
+{{"tasks": [{{"id": "task_1", "description": "...", "function_name": "...", "signature": "...", "dependencies": []}}]}}

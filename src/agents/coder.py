@@ -43,9 +43,11 @@ class CoderAgent(BaseAgent):
         task_desc: str = task.get("description", state["user_input"])
         signature: str = task.get("signature", "main()")
 
-        # RAG search for relevant examples
-        rag_results = await self._rag.search(task_desc, top_k=3)
-        rag_context = "\n\n".join(r["text"] for r in rag_results)
+        # NOTE: RAG is intentionally disabled for code generation. The Lua docs
+        # are narrative/pattern text and tend to leak unrelated function names
+        # (reverse_string, is_prime, bubble_sort, class patterns, …) into the
+        # generated code. RAG is still used by the QA agent for explanations.
+        rag_context = ""
 
         prompt = self._render_prompt(
             self._gen_template,

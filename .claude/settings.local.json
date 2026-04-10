@@ -26,7 +26,21 @@
       "Bash(echo \"SERVER_PID=$!\")",
       "Bash(taskkill //F //IM python.exe //FI \"WINDOWTITLE eq *uvicorn*\")",
       "Bash(netstat -ano)",
-      "Bash(taskkill //F //PID 32036)"
+      "Bash(taskkill //F //PID 32036)",
+      "Bash(curl -s http://localhost:8000/)",
+      "Bash(.venv/Scripts/python -c 'from src.graph.engine import AgentEngine')",
+      "Bash(.venv/Scripts/python -m uvicorn src.api.main:app --port 8000 --log-level warning)",
+      "Bash(curl -s -X POST \"http://localhost:8000/api/chats/1e0a02db-03bf-4a40-97e7-9818a1dca07d/messages\" -H \"Content-Type: application/json\" -d '{\"content\":\"напиши функцию которая переворачивает строку\"}')",
+      "Bash(curl -s -X POST \"http://localhost:8000/api/chats/1e0a02db-03bf-4a40-97e7-9818a1dca07d/messages\" -H \"Content-Type: application/json\" --data-binary \"{\\\\\"content\\\\\":\\\\\"write a function to reverse a string\\\\\"}\")",
+      "Bash(.venv/Scripts/python -m pytest tests/ -v --tb=short)",
+      "Bash(.venv/Scripts/python -m pytest tests/test_router.py::TestPlannerAgent::test_assemble_deduplicates -v --tb=short)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/ -x -q)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/test_lua_tools.py::TestLuaValidatorSyntax::test_validate_returns_passed_for_valid_code -x)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/ --ignore=tests/test_lua_tools.py -q)",
+      "Bash(.venv/Scripts/python.exe -c \"import shutil; print\\('luacheck:', shutil.which\\('luacheck'\\)\\)\")",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/test_router.py tests/test_engine.py tests/test_storage.py -q)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/test_tools.py tests/test_lua_tools.py -q)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/ -q)"
     ]
   }
 }
