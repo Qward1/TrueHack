@@ -7,12 +7,12 @@
 `Создай Lua-скрипт калькулятора с консольным вводом`
 
 ### Expected pipeline
-`resolve_target -> route_intent(create) -> generate -> validate -> verify -> generate_e2e_suite -> run_e2e_suite -> save -> explain_solution -> respond`
+`resolve_target -> route_intent(create) -> generate -> validate -> verify -> save -> explain_solution -> respond`
 
 ### Pass criteria
 - fallback target создан в workspace
 - код сохранен на диск
-- в ответе есть код, e2e summary и объяснение
+- в ответе есть код, explanation и предложения улучшений
 
 ## 2. New Lua in explicit directory
 ### Prompt
@@ -23,7 +23,7 @@
 
 ### Pass criteria
 - директория создана
-- файл создан и сохранен только после e2e pass
+- файл создан и сохранен только после validate + verify
 
 ## 3. Create/update explicit Lua file by path
 ### Prompt
@@ -33,6 +33,15 @@
 - используется именно указанный `.lua` path
 - follow-up turn сохраняет изменения в тот же файл
 
+## 3a. Invalid Windows path segments are sanitized
+### Prompt
+`Создай проект в C:\Work\LuaProjects\MM\-HH:MM`
+
+### Pass criteria
+- runtime не падает на `save_code`
+- невалидный сегмент пути санитизируется до filesystem-safe имени
+- итоговый Lua target создается в нормализованной директории
+
 ## 4. Refine active target in same chat
 ### Prompt sequence
 1. `Создай калькулятор в C:\Work\LuaProjects\calc.lua`
@@ -40,14 +49,14 @@
 
 ### Expected behavior
 - turn 2 переиспользует active target
-- проходит полный цикл validate/verify/e2e
+- проходит полный цикл validate/verify/save
 
 ## 5. Validation failure -> fix loop
 ### Prompt
 `Создай интерактивный Lua-скрипт с обработкой ввода`
 
 ### Pass criteria
-- при провале валидации запускается минимум одна итерация `fix_code`
+- при провале runtime-валидации через `lua` запускается минимум одна итерация `fix_code`
 - после исчерпания лимита итераций файл не сохраняется
 
 ## 6. Verification failure -> fix loop
@@ -56,16 +65,16 @@
 
 ### Pass criteria
 - если verification вернул недостающие требования, pipeline уходит в fix-loop
-- после фикса снова идут validate -> verify -> e2e
+- после фикса снова идут validate -> verify -> save
 
-## 7. E2E failure -> fix loop
+## 7. E2E temporarily disabled
 ### Prompt
 `Сделай CLI-скрипт, который принимает имя и печатает приветствие`
 
 ### Pass criteria
-- e2e suite генерируется агентом
-- при провале e2e pipeline идет в fix-loop
-- сохранение блокируется до успешного e2e pass
+- pipeline не вызывает e2e suite generation/execution
+- сохранение не зависит от e2e gate
+- `/status` показывает, что e2e временно отключен
 
 ## 8. Explanation and follow-up suggestions
 ### Prompt sequence
@@ -97,6 +106,8 @@
 - `/retry`
 
 ### Pass criteria
-- `/status` показывает last e2e summary и количество предложений/вопросов
+- `/status` показывает, что e2e временно отключен, и количество предложений/вопросов
 - `/prompt` показывает базовый prompt, правки и последние предложения
-- `/retry` повторно запускает полный цикл с e2e gate
+- `/retry` повторно запускает validate/verify/save цикл без e2e gate
+- `luacheck` не требуется для прохождения сценариев canonical runtime
+- список чатов показывает очищенные title без шумного полного пути из prompt

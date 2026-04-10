@@ -16,18 +16,20 @@ import structlog
 from console_utils import configure_console_utf8
 from src.core.llm import LLMProvider
 from src.graph.engine import PipelineEngine
+from src.tools.target_tools import build_chat_title
 
 logger = structlog.get_logger(__name__)
 
 # ── Defaults (kept compatible with CLI args) ─────────────────────────
 DEFAULT_URL = "http://127.0.0.1:1234/v1"
 DEFAULT_MODEL = "local-model"
-DEFAULT_MAX_ATTEMPTS = 5
+DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_REQUEST_TIMEOUT = 600.0
 
 
 CHAT_DB_NAME = ".lua_console_chats.db"
 MAX_CHAT_TITLE_LENGTH = 72
+E2E_DISABLED_SUMMARY = "E2E-проверка временно отключена."
 
 
 def utc_now_iso() -> str:
@@ -50,7 +52,7 @@ def _empty_state_dict(workspace_root: str | None = None) -> dict:
         "last_suggested_changes": [],
         "last_clarifying_questions": [],
         "last_explanation": {},
-        "last_e2e_summary": "",
+        "last_e2e_summary": E2E_DISABLED_SUMMARY,
     }
 
 
@@ -100,18 +102,18 @@ def _normalize_state_dict(state_dict: dict | None, workspace_root: str | None = 
     ]
     explanation = state_dict.get("last_explanation", {})
     normalized["last_explanation"] = explanation if isinstance(explanation, dict) else {}
-    normalized["last_e2e_summary"] = str(state_dict.get("last_e2e_summary", "") or "").strip()
+    normalized["last_e2e_summary"] = (
+        str(state_dict.get("last_e2e_summary", "") or "").strip() or E2E_DISABLED_SUMMARY
+    )
     return normalized
 
 
-def _derive_title(base_prompt: str, fallback: str = "Новый чат") -> str:
+def _derive_title(base_prompt: str, target_path: str = "", fallback: str = "Новый чат") -> str:
     """Build a short chat title from the base prompt."""
-    if not base_prompt.strip():
-        return fallback
-    single_line = " ".join(base_prompt.split())
-    if len(single_line) <= MAX_CHAT_TITLE_LENGTH:
-        return single_line
-    return f"{single_line[: MAX_CHAT_TITLE_LENGTH - 3].rstrip()}..."
+    derived = build_chat_title(base_prompt, target_path=target_path, fallback=fallback)
+    if len(derived) <= MAX_CHAT_TITLE_LENGTH:
+        return derived
+    return f"{derived[: MAX_CHAT_TITLE_LENGTH - 3].rstrip()}..."
 
 
 def _extract_suggestion_indexes(text: str) -> list[int]:
@@ -799,7 +801,7 @@ HTML_PAGE = """<!doctype html>
       <div class="hero">
         <div>
           <h1>Lua Console Builder</h1>
-          <p>Локальный чат для генерации, редактирования и проверки Lua-скриптов. Внутри остается та же логика: запуск через <code>lua</code>, проверка через <code>luacheck</code>, автопочинка и контекст чата.</p>
+          <p>Локальный чат для генерации, редактирования и проверки Lua-скриптов. Внутри остается та же логика: запуск через <code>lua</code>, автопочинка, сохранение файла и объяснение результата с предложениями улучшений.</p>
         </div>
         <div class="badge" id="statusBadge">Локально</div>
       </div>
@@ -1301,7 +1303,10 @@ class AppRuntime:
         return future.result(timeout=660)  # generous timeout
 
     def _save_current_chat(self, title: str | None = None) -> None:
-        effective_title = title or _derive_title(self.state_dict.get("base_prompt", ""))
+        effective_title = title or _derive_title(
+            self.state_dict.get("base_prompt", ""),
+            self.state_dict.get("target_path", ""),
+        )
         self.store.save_chat_state(self.current_chat_id, self.state_dict, effective_title)
 
     def build_messages_payload(self) -> list[dict]:
@@ -1437,9 +1442,11 @@ class AppRuntime:
             sd["last_explanation"] = explanation if isinstance(explanation, dict) else {}
             e2e_results = result.get("e2e_results", {})
             if isinstance(e2e_results, dict):
-                sd["last_e2e_summary"] = str(e2e_results.get("summary", "")).strip()
+                sd["last_e2e_summary"] = (
+                    str(e2e_results.get("summary", "")).strip() or E2E_DISABLED_SUMMARY
+                )
             else:
-                sd["last_e2e_summary"] = ""
+                sd["last_e2e_summary"] = E2E_DISABLED_SUMMARY
 
         return result.get("response", "")
 
@@ -1463,7 +1470,7 @@ class AppRuntime:
                 f"Активный Lua target: {sd.get('target_path', '(не выбран)') or '(не выбран)'}",
                 f"Workspace: {sd.get('workspace_root', self.default_workspace)}",
                 f"Последнее сохранение: {sd.get('last_saved_path', '(ещё не было)') or '(ещё не было)'}",
-                f"Последний e2e: {sd.get('last_e2e_summary', '(нет данных)') or '(нет данных)'}",
+                f"E2E: {sd.get('last_e2e_summary', E2E_DISABLED_SUMMARY) or E2E_DISABLED_SUMMARY}",
                 f"Предложений от системы: {len(sd.get('last_suggested_changes', []))}",
                 f"Уточняющих вопросов: {len(sd.get('last_clarifying_questions', []))}",
                 f"Последний intent: {sd.get('last_intent', '(не определён)')}",
@@ -1504,7 +1511,7 @@ class AppRuntime:
             self.state_dict["last_suggested_changes"] = []
             self.state_dict["last_clarifying_questions"] = []
             self.state_dict["last_explanation"] = {}
-            self.state_dict["last_e2e_summary"] = ""
+            self.state_dict["last_e2e_summary"] = E2E_DISABLED_SUMMARY
             self.state_dict["workspace_root"] = self.default_workspace
             return self._process_via_pipeline(argument)
 
@@ -1517,8 +1524,9 @@ class AppRuntime:
             if not self.state_dict.get("current_code", "").strip():
                 return "Нет текущего Lua-кода для повторной проверки."
             retry_request = (
-                "Проверь текущий Lua код ещё раз, исправь найденные проблемы, прогони e2e сценарии "
-                "и сохрани его в тот же целевой файл только если проверки пройдены."
+                "Проверь текущий Lua код ещё раз, исправь найденные проблемы, "
+                "снова запусти локальную валидацию и проверку требований, "
+                "а затем сохрани его в тот же целевой файл, если проверки пройдены."
             )
             return self._process_via_pipeline(retry_request)
 
