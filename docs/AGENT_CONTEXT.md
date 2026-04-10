@@ -1,6 +1,6 @@
 # Общий контекст проекта
 
-# LocalScript / Lua Console Builder
+# LocalScript / LowCode Lua Script Builder
 
 ## Canonical runtime
 - Единственный пользовательский entry point: `app.py`
@@ -15,6 +15,7 @@
 - Generated/refined/fixed Lua now targets the LowCode contract:
   - target version: `Lua 5.5`;
   - script description format: `lua{ ... }lua`;
+  - workflow/LUS script instead of console/CLI app;
   - без `JsonPath`, только прямой доступ к данным;
   - declared variables: `wf.vars`;
   - startup variables: `wf.initVariables`.
@@ -25,7 +26,10 @@
   - fallback target для нового create turn без пути.
   - невалидные Windows-сегменты пути санитизируются до сохранения.
 - `generate_code` / `refine_code` возвращают полный Lua-файл.
-- `validate_code` запускает локальную диагностику через `lua`.
+- `validate_code` запускает локальную диагностику через `lua` в temporary LowCode harness:
+  - создаёт mock `wf.vars` / `wf.initVariables`;
+  - добавляет `_utils.array.*` stubs;
+  - строит nested mock paths для найденных `wf.vars.*` / `wf.initVariables.*`, включая alias-derived field access.
 - `fix_code` выполняет итеративные правки по стадии ошибки:
   - validation;
   - requirements;
@@ -67,13 +71,13 @@
   - naming/sanitization helpers для auto-created folder/file и chat title.
 - `src/tools/lua_tools.py`:
   - нормализация Lua-ответа;
-  - локальная диагностика;
+  - локальная диагностика и LowCode validation harness;
   - verification helper;
   - временно неиспользуемые e2e helpers для будущего возврата e2e-gate.
 - `src/tools/local_runtime.py`:
   - низкоуровневые wrappers для `lua`;
   - сохраненные, но неиспользуемые wrappers для `luacheck`;
-  - запуск с stdin для проверки интерактивных сценариев.
+  - запуск с stdin сохранен только для legacy/unused interactive scenarios.
 
 ## Runtime зависимости
 - Python 3.12+

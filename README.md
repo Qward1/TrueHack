@@ -1,11 +1,11 @@
-# LocalScript / Lua Console Builder
+# LocalScript / LowCode Lua Script Builder
 
-Локальный web runtime для генерации, доработки, валидации и сохранения Lua-скриптов.
+Локальный web runtime для генерации, доработки, валидации и сохранения workflow/LUS Lua-скриптов.
 
 ## Что делает проект
 - принимает задачу на естественном языке;
-- генерирует или дорабатывает LowCode-скрипт на `Lua 5.5`;
-- запускает локальную проверку через `lua`;
+- генерирует или дорабатывает LowCode workflow/LUS script на `Lua 5.5`;
+- запускает локальную проверку через `lua` в temporary LowCode harness;
 - делает fix loop при ошибках;
 - выполняет LLM-проверку соответствия исходному запросу;
 - сохраняет код после успешной локальной валидации и проверки требований:
@@ -68,7 +68,7 @@ python app.py --url http://127.0.0.1:1234/v1 --model local-model
 Пример:
 
 ```text
-Создай текстовую игру в папке C:\Work\LuaProjects
+Преобразуй DATUM и TIME из wf.vars.json.IDOC.ZCDF_HEAD в ISO дату в папке C:\Work\LuaProjects
 ```
 
 Система построит slug из prompt и создаст:
@@ -94,8 +94,16 @@ C:\Work\LuaProjects\<slug>\<slug>.lua
 - `JsonPath` использовать нельзя; доступ к данным должен быть прямым
 - declared variables: `wf.vars`
 - startup variables from `variables`: `wf.initVariables`
+- это workflow/LUS script, а не console/CLI program
+- скрипт должен возвращать значение и/или обновлять `wf.vars`
+- console input/output (`io.read`, `print`, `io.write`) по умолчанию не используются
 - массивы создаются/маркируются через `_utils.array.new()` и `_utils.array.markAsArray(arr)`
 - базовые конструкции: `if`, `while`, `for`, `repeat`
+
+Во время локальной validation runtime поднимает временный harness:
+- создаёт mock `wf.vars` и `wf.initVariables`;
+- добавляет `_utils.array.new()` и `_utils.array.markAsArray(arr)`;
+- автоматически строит nested mock-таблицы для найденных цепочек `wf.vars.*` и `wf.initVariables.*`, включая aliased access patterns.
 
 ## Pipeline
 Основная ветка:
@@ -145,5 +153,6 @@ resolve_target -> route_intent -> generate/refine -> validate -> verify -> save 
 - это еще не финальная Ollama-конфигурация для хакатона;
 - `e2e`-агент и e2e-gate сейчас временно отключены;
 - `luacheck` сейчас не используется в каноническом runtime;
+- generation/refine/fix ориентированы на workflow/LUS scripts, а не на console/CLI apps;
 - naming для auto-created folder/file и title чата строится из очищенного prompt и санитизируется под Windows;
 - README фиксирует текущее состояние кода, а не желаемое будущее.

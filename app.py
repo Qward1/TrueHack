@@ -292,7 +292,7 @@ HTML_PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Lua Console Builder</title>
+  <title>LowCode Lua Script Builder</title>
   <style>
     :root {
       --bg: #f3ecdf;
@@ -805,8 +805,8 @@ HTML_PAGE = """<!doctype html>
     <section class="panel chat-panel">
       <div class="hero">
         <div>
-          <h1>Lua Console Builder</h1>
-          <p>Локальный чат для генерации, редактирования и проверки Lua-скриптов. Внутри остается та же логика: запуск через <code>lua</code>, автопочинка, сохранение файла и объяснение результата с предложениями улучшений.</p>
+          <h1>LowCode Lua Script Builder</h1>
+          <p>Локальный чат для генерации, редактирования и проверки workflow/LUS Lua-скриптов. Runtime проверяет код в LowCode harness, сохраняет `.lua` и JsonString sidecar, а затем объясняет сделанное и предлагает улучшения.</p>
         </div>
         <div class="badge" id="statusBadge">Локально</div>
       </div>
@@ -1236,7 +1236,7 @@ HTML_PAGE = """<!doctype html>
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Lua Console Builder — canonical web runtime.")
+    parser = argparse.ArgumentParser(description="LowCode Lua Script Builder — canonical web runtime.")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind the local web UI.")
     parser.add_argument("--port", type=int, default=8765, help="Port for the local web UI.")
     parser.add_argument("--no-browser", action="store_true", help="Do not auto-open the browser.")
@@ -1645,7 +1645,7 @@ def main() -> int:
     runtime = AppRuntime(args)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(runtime))
     url = f"http://{args.host}:{args.port}/"
-    print(f"Lua Console Builder (LangGraph) запущен: {url}")
+    print(f"LowCode Lua Script Builder (LangGraph) запущен: {url}")
     print("Для остановки нажми Ctrl+C")
 
     if not args.no_browser:
