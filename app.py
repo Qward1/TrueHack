@@ -49,6 +49,7 @@ def _empty_state_dict(workspace_root: str | None = None) -> dict:
         "workspace_root": normalized_workspace,
         "last_intent": "",
         "last_saved_path": "",
+        "last_saved_jsonstring_path": "",
         "last_suggested_changes": [],
         "last_clarifying_questions": [],
         "last_explanation": {},
@@ -88,6 +89,10 @@ def _normalize_state_dict(state_dict: dict | None, workspace_root: str | None = 
     normalized["last_saved_path"] = str(
         state_dict.get("last_saved_path")
         or target_path
+        or ""
+    ).strip()
+    normalized["last_saved_jsonstring_path"] = str(
+        state_dict.get("last_saved_jsonstring_path")
         or ""
     ).strip()
     normalized["last_suggested_changes"] = [
@@ -1328,6 +1333,7 @@ class AppRuntime:
             "workspace_root": sd.get("workspace_root", self.default_workspace),
             "last_intent": sd.get("last_intent", ""),
             "last_saved_path": sd.get("last_saved_path", ""),
+            "last_saved_jsonstring_path": sd.get("last_saved_jsonstring_path", ""),
             "change_requests_count": len(sd.get("change_requests", [])),
             "suggested_changes": sd.get("last_suggested_changes", []),
             "clarifying_questions": sd.get("last_clarifying_questions", []),
@@ -1427,6 +1433,8 @@ class AppRuntime:
         sd["target_path"] = result.get("target_path", sd.get("target_path", ""))
         if result.get("saved_to", "").strip():
             sd["last_saved_path"] = result["saved_to"].strip()
+        if result.get("saved_jsonstring_to", "").strip():
+            sd["last_saved_jsonstring_path"] = result["saved_jsonstring_to"].strip()
         if result.get("response_type") == "code":
             sd["last_suggested_changes"] = [
                 str(item).strip()
@@ -1470,6 +1478,7 @@ class AppRuntime:
                 f"Активный Lua target: {sd.get('target_path', '(не выбран)') or '(не выбран)'}",
                 f"Workspace: {sd.get('workspace_root', self.default_workspace)}",
                 f"Последнее сохранение: {sd.get('last_saved_path', '(ещё не было)') or '(ещё не было)'}",
+                f"Последний JsonString: {sd.get('last_saved_jsonstring_path', '(ещё не было)') or '(ещё не было)'}",
                 f"E2E: {sd.get('last_e2e_summary', E2E_DISABLED_SUMMARY) or E2E_DISABLED_SUMMARY}",
                 f"Предложений от системы: {len(sd.get('last_suggested_changes', []))}",
                 f"Уточняющих вопросов: {len(sd.get('last_clarifying_questions', []))}",
@@ -1508,6 +1517,7 @@ class AppRuntime:
             self.state_dict["change_requests"] = []
             self.state_dict["target_path"] = ""
             self.state_dict["last_saved_path"] = ""
+            self.state_dict["last_saved_jsonstring_path"] = ""
             self.state_dict["last_suggested_changes"] = []
             self.state_dict["last_clarifying_questions"] = []
             self.state_dict["last_explanation"] = {}

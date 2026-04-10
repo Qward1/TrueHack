@@ -94,6 +94,33 @@ Generation/refine/fix/verify/explain используют единый LLM provi
 
 ## 2026-04-10
 ### Decision
+Переводим generation contract на LowCode-формат `Lua 5.5 + lua{...}lua`.
+
+### Why
+Новые продуктовые условия требуют описывать скрипт как JsonString, хранить данные схемы через `wf.vars` / `wf.initVariables` и не использовать JsonPath.
+
+### Consequences
+Prompt contract и user-facing code representation обновлены под `lua{...}lua`, при этом runtime продолжает валидировать и сохранять чистое Lua-body после нормализации wrapper.
+
+---
+
+## 2026-04-10
+### Decision
+Сохраняем оба представления результата: canonical `.lua` и JsonString sidecar.
+
+### Why
+Продуктовый контракт требует работать и с исполняемым Lua-файлом, и с форматом `lua{...}lua`, но дублировать pipeline ради этого не нужно.
+
+### Consequences
+`save_code` выполняет один save-step и пишет:
+- основной `.lua` файл для runtime;
+- соседний `*.jsonstring.txt` c wrapper `lua{...}lua`.
+UI `/status` и финальный ответ показывают оба пути, если сохранение прошло успешно.
+
+---
+
+## 2026-04-10
+### Decision
 После успешного сохранения система обязана возвращать объяснение решения и следующий шаг для пользователя.
 
 ### Why

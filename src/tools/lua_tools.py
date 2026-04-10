@@ -25,6 +25,21 @@ DEFAULT_STARTUP_TIMEOUT = 3.0
 DEFAULT_E2E_TIMEOUT = 8.0
 DEFAULT_MAX_E2E_CASES = 3
 DEFAULT_VERIFICATION_TEMPERATURE = 0.0
+LOWCODE_LUA_VERSION = "Lua 5.5"
+LOWCODE_JSONSTRING_OPEN = "lua{"
+LOWCODE_JSONSTRING_CLOSE = "}lua"
+LOWCODE_CONTRACT_TEXT = (
+    f"Target contract:\n"
+    f"- Use {LOWCODE_LUA_VERSION} syntax and conventions.\n"
+    f"- The script is described in JsonString format: {LOWCODE_JSONSTRING_OPEN}<code>{LOWCODE_JSONSTRING_CLOSE}.\n"
+    "- Never use JsonPath to access variables or fields.\n"
+    "- Access data directly by field/key.\n"
+    "- Declared LowCode variables are stored in wf.vars.\n"
+    "- Variables received at startup from variables are stored in wf.initVariables.\n"
+    "- Allowed primitive types: nil, boolean, number, string, array, table, function.\n"
+    "- To create/mark arrays use _utils.array.new() and _utils.array.markAsArray(arr).\n"
+    "- Allowed basic constructs: if/then/else, while/do/end, for/do/end, repeat/until.\n"
+)
 DEFAULT_VERIFICATION_SYSTEM_PROMPT = (
     "You review whether a Lua solution fully satisfies the user's request. "
     "Return strict JSON only with the keys: passed, score, summary, missing_requirements, warnings. "
@@ -38,6 +53,7 @@ DEFAULT_E2E_SYSTEM_PROMPT = (
 )
 
 ZERO_WIDTH_PATTERN = re.compile(r"[\u200b\u200c\u200d\ufeff]")
+LOWCODE_JSONSTRING_PATTERN = re.compile(r"lua\{\s*([\s\S]*?)\s*\}lua", re.IGNORECASE)
 PROBABLE_LUA_LINE_PATTERN = re.compile(
     r"^(--|local\b|function\b|if\b|for\b|while\b|repeat\b|return\b|break\b|goto\b|do\b|"
     r"print\s*\(|io\.|os\.|table\.|math\.|string\.|package\.|require\s*\(|"
@@ -333,9 +349,23 @@ def strip_explanatory_preamble(cleaned: str) -> str:
     return trimmed
 
 
+def unwrap_lowcode_jsonstring(text: str) -> str:
+    """Extract Lua body from the LowCode JsonString wrapper when present."""
+    match = LOWCODE_JSONSTRING_PATTERN.search(text.strip())
+    if not match:
+        return text
+    return match.group(1).strip()
+
+
+def format_lowcode_jsonstring(lua_code: str) -> str:
+    """Render plain Lua code into the LowCode JsonString wrapper."""
+    return f"{LOWCODE_JSONSTRING_OPEN}\n{lua_code.strip()}\n{LOWCODE_JSONSTRING_CLOSE}"
+
+
 def normalize_lua_code(text: str) -> str:
     """Normalize model output into a standalone Lua file."""
     cleaned = ZERO_WIDTH_PATTERN.sub("", text).replace("\r\n", "\n").replace("\r", "\n").strip()
+    cleaned = unwrap_lowcode_jsonstring(cleaned)
     fenced = re.search(r"```(?:lua)?\s*(.*?)```", cleaned, flags=re.IGNORECASE | re.DOTALL)
     if fenced:
         cleaned = fenced.group(1).strip()
@@ -447,7 +477,7 @@ async def async_verify_requirements(
     """Run requirement verification using the same local LLM provider as the graph."""
     messages = [
         {"role": "system", "content": DEFAULT_VERIFICATION_SYSTEM_PROMPT},
-        {"role": "user", "content": f"User request:\n{prompt}"},
+        {"role": "user", "content": f"User request:\n{prompt}\n\n{LOWCODE_CONTRACT_TEXT}"},
     ]
     if run_output.strip():
         messages.append(
@@ -458,7 +488,7 @@ async def async_verify_requirements(
         )
     messages.extend(
         [
-            {"role": "assistant", "content": code},
+            {"role": "assistant", "content": format_lowcode_jsonstring(code)},
             {
                 "role": "user",
                 "content": (

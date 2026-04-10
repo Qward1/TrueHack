@@ -4,11 +4,13 @@
 
 ## Что делает проект
 - принимает задачу на естественном языке;
-- генерирует или дорабатывает Lua-код;
+- генерирует или дорабатывает LowCode-скрипт на `Lua 5.5`;
 - запускает локальную проверку через `lua`;
 - делает fix loop при ошибках;
 - выполняет LLM-проверку соответствия исходному запросу;
-- сохраняет код в целевой `.lua` файл после успешной локальной валидации и проверки требований;
+- сохраняет код после успешной локальной валидации и проверки требований:
+  - как чистый целевой `.lua` файл;
+  - как sidecar JsonString `lua{...}lua` рядом с ним;
 - возвращает:
   - код;
   - путь сохранения;
@@ -60,7 +62,7 @@ python app.py --url http://127.0.0.1:1234/v1 --model local-model
 Создай скрипт заметок в C:\Work\LuaProjects\notes.lua
 ```
 
-Система сохранит итог именно в этот файл.
+Система сохранит итог именно в этот файл и рядом создаст sidecar `*.jsonstring.txt`.
 
 ### 2. Директория
 Пример:
@@ -86,6 +88,15 @@ C:\Work\LuaProjects\<slug>\<slug>.lua
 
 Система переиспользует active target текущего чата.
 
+## LowCode contract
+- generation target: `Lua 5.5`
+- script description format in prompts/user-facing output: `lua{ ... }lua`
+- `JsonPath` использовать нельзя; доступ к данным должен быть прямым
+- declared variables: `wf.vars`
+- startup variables from `variables`: `wf.initVariables`
+- массивы создаются/маркируются через `_utils.array.new()` и `_utils.array.markAsArray(arr)`
+- базовые конструкции: `if`, `while`, `for`, `repeat`
+
 ## Pipeline
 Основная ветка:
 
@@ -99,9 +110,9 @@ resolve_target -> route_intent -> generate/refine -> validate -> verify -> save 
 - если лимит fix-итераций исчерпан, файл не сохраняется.
 
 ## Что видно в ответе
-- итоговый Lua-код;
+- итоговый скрипт в формате `lua{ ... }lua`;
 - статус local validation / verification;
-- путь сохранения;
+- путь сохранения `.lua` и sidecar JsonString;
 - объяснение (что есть в коде и как работает);
 - предложения улучшений;
 - уточняющие вопросы.

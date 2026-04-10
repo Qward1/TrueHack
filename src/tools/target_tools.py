@@ -534,11 +534,28 @@ def load_target_code(target_path: str) -> str:
     return read_text_if_exists(target_path).strip()
 
 
-def save_final_output(output_path: str, code: str) -> None:
-    """Persist the generated Lua code to the resolved target path."""
+def build_jsonstring_sidecar_path(output_path: str) -> str:
+    """Build a sidecar path for the JsonString representation of the Lua file."""
+    directory = os.path.dirname(os.path.abspath(output_path))
+    stem, _ = os.path.splitext(os.path.basename(output_path))
+    sidecar_name = sanitize_windows_component(f"{stem}.jsonstring.txt", fallback="script.jsonstring.txt")
+    return os.path.join(directory, sidecar_name)
+
+
+def save_final_output(output_path: str, code: str, jsonstring_code: str = "") -> dict[str, str]:
+    """Persist the generated Lua code and optional JsonString sidecar to disk."""
     directory = os.path.dirname(os.path.abspath(output_path))
     if directory:
         os.makedirs(directory, exist_ok=True)
     with open(output_path, "w", encoding="utf-8", newline="\n") as file:
         file.write(code.rstrip())
         file.write("\n")
+
+    saved = {"lua_path": os.path.abspath(output_path), "jsonstring_path": ""}
+    if jsonstring_code.strip():
+        jsonstring_path = build_jsonstring_sidecar_path(output_path)
+        with open(jsonstring_path, "w", encoding="utf-8", newline="\n") as file:
+            file.write(jsonstring_code.rstrip())
+            file.write("\n")
+        saved["jsonstring_path"] = jsonstring_path
+    return saved

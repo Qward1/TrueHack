@@ -43,6 +43,7 @@ class PipelineState(TypedDict):
     save_success: bool
     save_error: str
     saved_to: str
+    saved_jsonstring_to: str
 
     # Explanation for user
     explanation: dict[str, Any]

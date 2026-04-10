@@ -10,9 +10,12 @@ import structlog
 from src.core.llm import LLMProvider
 from src.core.state import PipelineState
 from src.tools.lua_tools import (
+    LOWCODE_CONTRACT_TEXT,
+    LOWCODE_LUA_VERSION,
     async_run_diagnostics,
     async_verify_requirements,
     extract_function_names,
+    format_lowcode_jsonstring,
     restore_lost_functions,
     smart_normalize,
     validate_lua_response,
@@ -65,8 +68,9 @@ User message: {user_input}
 JSON only:"""
 
 _GENERATE_SYSTEM = (
-    "You generate clean, correct Lua 5.4 code from the user's request. "
-    "Return ONLY Lua code without markdown fences or explanations. "
+    f"You generate clean, correct {LOWCODE_LUA_VERSION} code from the user's request. "
+    "Return the script in LowCode JsonString format lua{...}lua without markdown fences or explanations. "
+    f"{LOWCODE_CONTRACT_TEXT} "
     "If the program is a Windows console app, prefer ASCII-only UI text."
 )
 
@@ -74,7 +78,8 @@ _REFINE_SYSTEM = (
     "You modify existing Lua code according to the user's request. "
     "Return the COMPLETE updated file, not just the changed parts. "
     "Preserve existing functions unless explicitly asked to remove them. "
-    "Return only Lua code."
+    "Return the script in LowCode JsonString format lua{...}lua. "
+    f"{LOWCODE_CONTRACT_TEXT}"
 )
 
 _REFINE_USER = """Primary target file: {target_path}
@@ -87,11 +92,15 @@ Original code:
 User request:
 {user_input}
 
-Return the complete updated Lua file. No fences. No prose."""
+LowCode contract:
+{lowcode_contract}
+
+Return the complete updated Lua file in JsonString format lua{{...}}lua. No fences. No prose."""
 
 _FIX_SYSTEM = (
     "You fix broken Lua code using the user's goal and diagnostics. "
-    "Return only corrected Lua code without markdown fences, explanations, or extra text. "
+    "Return only corrected Lua code in JsonString format lua{...}lua without markdown fences, explanations, or extra text. "
+    f"{LOWCODE_CONTRACT_TEXT} "
     "Do not remove legitimate interactivity just to pass checks."
 )
 
@@ -112,7 +121,7 @@ Current code:
 {code}
 
 Fix the code so it satisfies the original task and passes validation + requirement checks.
-Return only the full corrected Lua file."""
+Return only the full corrected Lua file in JsonString format lua{{...}}lua."""
 
 _ANSWER_SYSTEM = (
     "You are a helpful Lua programming assistant. "
@@ -317,11 +326,11 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             strict_prompt = (
                 f"{prompt}\n\n"
                 f"Previous response issue: {analysis['reason']}\n"
-                "Return ONLY the full Lua file."
+                "Return ONLY the full Lua file in JsonString format lua{...}lua."
             )
             strict_system = (
                 f"{_GENERATE_SYSTEM} "
-                "The first non-whitespace character must be valid Lua code."
+                "The first non-whitespace characters must start with lua{."
             )
             logger.info(
                 f"[{_AGENT_GENERATE_CODE}/llm.generate] retry calling",
@@ -362,6 +371,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             "save_success": False,
             "save_error": "",
             "saved_to": "",
+            "saved_jsonstring_to": "",
             "explanation": {},
             "suggested_changes": [],
             "clarifying_questions": [],
@@ -402,6 +412,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             function_list=func_list,
             code=existing,
             user_input=user_input,
+            lowcode_contract=LOWCODE_CONTRACT_TEXT,
         )
 
         logger.info(
@@ -454,6 +465,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             "save_success": False,
             "save_error": "",
             "saved_to": "",
+            "saved_jsonstring_to": "",
             "explanation": {},
             "suggested_changes": [],
             "clarifying_questions": [],
@@ -572,6 +584,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             "save_success": False,
             "save_error": "",
             "saved_to": "",
+            "saved_jsonstring_to": "",
             "explanation": {},
             "suggested_changes": [],
             "clarifying_questions": [],
@@ -651,10 +664,20 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
 
         if not code.strip():
             logger.warning(f"[{_AGENT_SAVE_CODE}] code is empty — cannot save")
-            return {"save_success": False, "save_error": "Empty code cannot be saved.", "saved_to": ""}
+            return {
+                "save_success": False,
+                "save_error": "Empty code cannot be saved.",
+                "saved_to": "",
+                "saved_jsonstring_to": "",
+            }
         if not target_path:
             logger.warning(f"[{_AGENT_SAVE_CODE}] target_path is not set — cannot save")
-            return {"save_success": False, "save_error": "Target path is not set.", "saved_to": ""}
+            return {
+                "save_success": False,
+                "save_error": "Target path is not set.",
+                "saved_to": "",
+                "saved_jsonstring_to": "",
+            }
 
         try:
             logger.info(
@@ -662,10 +685,15 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 target_path=target_path,
                 code_len=len(code),
             )
-            save_final_output(target_path, code)
+            saved = save_final_output(
+                target_path,
+                code,
+                jsonstring_code=format_lowcode_jsonstring(code),
+            )
             logger.info(
                 f"[{_AGENT_SAVE_CODE}/save_final_output] done",
-                target_path=target_path,
+                target_path=saved.get("lua_path", target_path),
+                jsonstring_path=saved.get("jsonstring_path", ""),
             )
         except OSError as exc:
             logger.error(
@@ -678,17 +706,20 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 "save_success": False,
                 "save_error": str(exc),
                 "saved_to": "",
+                "saved_jsonstring_to": "",
             }
 
         logger.info(
             f"[{_AGENT_SAVE_CODE}] completed",
-            target_path=target_path,
+            target_path=saved.get("lua_path", target_path),
+            jsonstring_path=saved.get("jsonstring_path", ""),
         )
         return {
             "current_code": code,
             "save_success": True,
             "save_error": "",
-            "saved_to": target_path,
+            "saved_to": saved.get("lua_path", target_path),
+            "saved_jsonstring_to": saved.get("jsonstring_path", ""),
         }
 
     async def explain_solution(state: PipelineState) -> dict:
@@ -711,11 +742,12 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
 
         explain_prompt = (
             f"user_request: {base_prompt}\n\n"
+            f"{LOWCODE_CONTRACT_TEXT}\n"
             f"Runtime validation summary:\n"
             f"- run_error: {diagnostics.get('run_error', 'none')}\n"
             f"- verification_summary: {verification.get('summary', 'none')}\n\n"
             "Code:\n"
-            f"{code}\n\n"
+            f"{format_lowcode_jsonstring(code)}\n\n"
             "Respond with JSON only. Write all text values in the same language as user_request."
         )
 
@@ -804,6 +836,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         diagnostics = state.get("diagnostics", {})
         verification = state.get("verification", {})
         saved_to = state.get("saved_to", "")
+        saved_jsonstring_to = state.get("saved_jsonstring_to", "")
         save_error = state.get("save_error", "")
         explanation = state.get("explanation", {})
         suggested_changes = state.get("suggested_changes", [])
@@ -843,10 +876,12 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
 
         if saved_to:
             lines.append(f"Сохранено в: `{saved_to}`\n")
+            if saved_jsonstring_to:
+                lines.append(f"JsonString сохранен в: `{saved_jsonstring_to}`\n")
         elif save_error:
             lines.append(f"Сохранение не удалось: {save_error}\n")
 
-        lines.append(f"```lua\n{code}\n```")
+        lines.append(f"```text\n{format_lowcode_jsonstring(code)}\n```")
 
         run_output = diagnostics.get("run_output", "").strip()
         if run_output:

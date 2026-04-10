@@ -12,6 +12,12 @@
 `resolve_target -> route_intent -> generate|refine|answer -> validate -> verify -> save -> explain_solution -> respond`
 
 ### Поведение pipeline
+- Generated/refined/fixed Lua now targets the LowCode contract:
+  - target version: `Lua 5.5`;
+  - script description format: `lua{ ... }lua`;
+  - без `JsonPath`, только прямой доступ к данным;
+  - declared variables: `wf.vars`;
+  - startup variables: `wf.initVariables`.
 - `resolve_target`:
   - explicit `.lua` path;
   - директория -> slug-папка + slug.lua;
@@ -25,6 +31,9 @@
   - requirements;
 - `verify_requirements` — семантическая LLM-проверка соответствия исходному запросу.
 - `save_code` выполняется только после успешной локальной валидации и проверки требований.
+- `save_code` сохраняет два артефакта:
+  - чистый `.lua` файл в canonical target path;
+  - sidecar `*.jsonstring.txt` с представлением `lua{...}lua` рядом с ним.
 - `explain_solution` формирует:
   - краткое объяснение;
   - что есть в коде;
@@ -54,7 +63,7 @@
 - `src/graph/`:
   - состояние, узлы, условия переходов и компоновка pipeline.
 - `src/tools/target_tools.py`:
-  - path parsing/resolution и сохранение Lua-файла.
+  - path parsing/resolution и dual-save артефактов (`.lua` + JsonString sidecar).
   - naming/sanitization helpers для auto-created folder/file и chat title.
 - `src/tools/lua_tools.py`:
   - нормализация Lua-ответа;

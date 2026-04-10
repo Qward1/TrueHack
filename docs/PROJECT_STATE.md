@@ -7,7 +7,9 @@
 
 `generate/refine -> local validate -> fix -> requirement verify -> save -> explain/respond`
 
-Сохранение итогового `.lua` файла происходит после успешной локальной валидации и проверки требований.
+Сохранение итогового кода происходит после успешной локальной валидации и проверки требований:
+- canonical artifact: чистый `.lua` файл;
+- дополнительный artifact: sidecar `*.jsonstring.txt` с `lua{...}lua`.
 
 ## Что работает
 - единый LangGraph pipeline без дублирующего orchestration path
@@ -16,8 +18,16 @@
   - директория -> slug-папка + slug.lua;
   - active target в рамках чата
   - санитизация невалидных Windows-сегментов пути перед созданием файлов и папок
+- dual-save результата:
+  - чистый `.lua` файл для runtime;
+  - JsonString sidecar рядом с ним для LowCode contract
 - генерация Lua-кода
 - refine существующего Lua-кода
+- generation contract для LowCode:
+  - `Lua 5.5`
+  - wrapper `lua{ ... }lua`
+  - direct access вместо JsonPath
+  - `wf.vars` / `wf.initVariables` для данных схемы
 - локальная валидация через `lua`
 - fix loop по стадиям ошибок
 - LLM verification требований

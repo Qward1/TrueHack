@@ -11,8 +11,10 @@
 
 ### Pass criteria
 - fallback target создан в workspace
-- код сохранен на диск
-- в ответе есть код, explanation и предложения улучшений
+- код сохранен на диск как `.lua`
+- рядом создан JsonString sidecar `*.jsonstring.txt`
+- в ответе есть код в формате `lua{ ... }lua`, explanation и предложения улучшений
+- код следует LowCode contract: direct access, `wf.vars`, `wf.initVariables`
 
 ## 2. New Lua in explicit directory
 ### Prompt
@@ -24,6 +26,7 @@
 ### Pass criteria
 - директория создана
 - файл создан и сохранен только после validate + verify
+- sidecar JsonString сохранен рядом с `.lua`
 
 ## 3. Create/update explicit Lua file by path
 ### Prompt
@@ -31,6 +34,7 @@
 
 ### Pass criteria
 - используется именно указанный `.lua` path
+- JsonString sidecar создается рядом с этим файлом
 - follow-up turn сохраняет изменения в тот же файл
 
 ## 3a. Invalid Windows path segments are sanitized
@@ -50,6 +54,7 @@
 ### Expected behavior
 - turn 2 переиспользует active target
 - проходит полный цикл validate/verify/save
+- ответ по-прежнему показывает результат в формате `lua{ ... }lua`
 
 ## 5. Validation failure -> fix loop
 ### Prompt
@@ -107,6 +112,7 @@
 
 ### Pass criteria
 - `/status` показывает, что e2e временно отключен, и количество предложений/вопросов
+- `/status` показывает последний `.lua` path и последний JsonString path
 - `/prompt` показывает базовый prompt, правки и последние предложения
 - `/retry` повторно запускает validate/verify/save цикл без e2e gate
 - `luacheck` не требуется для прохождения сценариев canonical runtime
