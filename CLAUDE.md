@@ -1,25 +1,96 @@
-# LocalScript / Lua Console Builder
+# Claude instructions for this repository
 
-## Architecture
-- LangGraph pipeline in `src/graph/` orchestrates all agents
-- Existing tool files (`check_lua.py`, `run_lua.py`, `generate.py`, `auto_fix_lua.py`, `prompt_verifier.py`) are used as-is via async wrappers in `src/tools/lua_tools.py`
-- `app.py` serves web UI and calls `PipelineEngine.process_message()` for each user turn
-- `src/core/llm.py` — async LLM provider using `openai` library (LM Studio compatible)
+Перед любой работой по проекту ОБЯЗАТЕЛЬНО прочитай в таком порядке:
 
-## LangGraph Pipeline (src/graph/)
-Flow: route_intent → [generate|refine|answer] → validate → [verify|fix] → respond
-- `builder.py` — builds the StateGraph
-- `nodes.py` — all node functions (route, generate, refine, validate, fix, verify, answer, respond)
-- `conditions.py` — edge conditions (route_by_intent, check_validation, check_verification)
-- `engine.py` — PipelineEngine wraps the graph with a simple `process_message()` API
+1. docs/AGENT_CONTEXT.md
+2. docs/PROJECT_STATE.md
+3. docs/DECISIONS.md
+4. docs/TEST_SCENARIOS.md
+5. README.md
+6. текущее состояние репозитория: git status, git diff, последние коммиты
 
-## Key Quality Features
-- **Smart response parsing** from `generate.py` (strip fences, preamble, zero-width chars, retry on non-Lua)
-- **Preservation guard** in refine: extract function names before/after, force-restore silently dropped functions
-- **Auto-fix loop** with classification (syntax/runtime/lint/format/requirements) via `auto_fix_lua.py`
-- **Requirements verification** via `prompt_verifier.py`
-- **Mojibake repair** for Windows console encoding issues
+Не опирайся на прошлый чат как на источник истины.
+Источник истины — текущие файлы репозитория и git history.
 
-## Platform
-- Windows, Python 3.12, LM Studio on localhost:1234
-- Lua via `lua` / `luacheck` (system PATH)
+## Цель проекта
+
+Мы делаем решение для кейса MTS True Tech Hack / LocalScript:
+локальная агентская система на open-source LLM, которая принимает задачу на естественном языке
+(русский или английский), генерирует корректный Lua-код, умеет хотя бы одну итерацию
+уточнения/доработки и валидирует результат.
+
+## Жесткие ограничения проекта
+
+- Финальное решение должно работать локально.
+- Нельзя делать зависимость решения от внешних AI API в runtime.
+- Целевая модель должна запускаться локально через Ollama.
+- Ограничения демо: GPU 8 GB VRAM, без CPU offload.
+- Контрольные параметры: num_ctx=4096, num_predict=256, batch=1, parallel=1.
+- В README должны быть точные шаги запуска.
+- Если используются retrieval / knowledge base / шаблоны, они должны быть локальными и входить в поставку.
+- Важны: качество Lua-кода, агентность/итерации, воспроизводимость.
+
+## Приоритеты при разработке
+
+Приоритеты по убыванию:
+
+1. Корректность генерируемого Lua-кода.
+2. Наличие понятного цикла: анализ → уточнение/исправление → валидация.
+3. Воспроизводимость локального запуска.
+4. Простота архитектуры.
+5. Интерфейс и косметика.
+
+## Правила изменения кода
+
+Перед тем как писать новый код:
+
+- найди существующую реализацию похожей логики;
+- проверь, нет ли уже генератора / валидатора / оркестратора / API-слоя;
+- не создавай дублирующий pipeline;
+- не добавляй новый модуль, если можно расширить существующий.
+
+Если логика заменяется:
+
+- удали старую реализацию в этом же изменении;
+- обнови импорты, конфиги, тесты, документацию;
+- не оставляй “временные” альтернативные пути выполнения без явной причины.
+
+## Обязательный рабочий протокол
+
+Для каждой новой задачи:
+
+1. Сначала кратко опиши текущее состояние проекта.
+2. Затем перечисли файлы, которые относятся к задаче.
+3. Потом предложи короткий план изменений.
+4. Только после этого меняй код.
+5. После изменений проверь, что не появилось дублирующей логики.
+6. Запусти релевантные проверки/тесты.
+7. Обнови docs/PROJECT_STATE.md, если состояние проекта изменилось.
+8. Обнови docs/DECISIONS.md, если было принято архитектурное решение.
+
+## Формат ответа после работы
+
+После завершения задачи отвечай в таком виде:
+
+- Что изменено
+- Какие файлы затронуты
+- Какие проверки запущены
+- Что осталось риском / следующим шагом
+
+## Definition of done
+
+Задача считается завершенной только если:
+
+- код соответствует текущей архитектуре;
+- нет дублирующей логики;
+- удален устаревший код, если он был заменен;
+- обновлены тесты и/или проверки;
+- обновлены документы состояния проекта, если поведение системы поменялось.
+
+## Поведение при неопределенности
+
+Если не хватает данных:
+
+- сначала задай короткие уточняющие вопросы;
+- если можно безопасно принять допущение — зафиксируй его в docs/DECISIONS.md;
+- не выдумывай несуществующие модули, файлы и фичи.

@@ -21,9 +21,7 @@ logger = structlog.get_logger(__name__)
 # ── Defaults (kept compatible with CLI args) ─────────────────────────
 DEFAULT_URL = "http://127.0.0.1:1234/v1"
 DEFAULT_MODEL = "local-model"
-DEFAULT_OUTPUT = "generated.lua"
 DEFAULT_MAX_ATTEMPTS = 5
-DEFAULT_TEMPERATURE = 0.2
 DEFAULT_REQUEST_TIMEOUT = 600.0
 
 
@@ -37,15 +35,55 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _empty_state_dict() -> dict:
+def _empty_state_dict(workspace_root: str | None = None) -> dict:
     """Return a fresh empty state dict for serialization."""
+    normalized_workspace = os.path.abspath(workspace_root or os.getcwd())
     return {
         "base_prompt": "",
         "change_requests": [],
         "current_code": "",
-        "output_path": DEFAULT_OUTPUT,
+        "target_path": "",
+        "workspace_root": normalized_workspace,
         "last_intent": "",
+        "last_saved_path": "",
     }
+
+
+def _normalize_state_dict(state_dict: dict | None, workspace_root: str | None = None) -> dict:
+    """Normalize persisted chat state and migrate legacy keys."""
+    normalized = _empty_state_dict(workspace_root)
+    if not isinstance(state_dict, dict):
+        return normalized
+
+    target_path = str(
+        state_dict.get("target_path")
+        or state_dict.get("output_path")
+        or ""
+    ).strip()
+    if target_path:
+        target_path = os.path.abspath(target_path)
+
+    normalized["base_prompt"] = str(state_dict.get("base_prompt", "") or "").strip()
+    normalized["change_requests"] = [
+        str(item).strip()
+        for item in state_dict.get("change_requests", [])
+        if str(item).strip()
+    ]
+    normalized["current_code"] = str(state_dict.get("current_code", "") or "")
+    normalized["target_path"] = target_path
+    normalized["workspace_root"] = os.path.abspath(
+        str(
+            state_dict.get("workspace_root")
+            or (os.path.dirname(target_path) if target_path else normalized["workspace_root"])
+        )
+    )
+    normalized["last_intent"] = str(state_dict.get("last_intent", "") or "")
+    normalized["last_saved_path"] = str(
+        state_dict.get("last_saved_path")
+        or target_path
+        or ""
+    ).strip()
+    return normalized
 
 
 def _derive_title(base_prompt: str, fallback: str = "Новый чат") -> str:
@@ -828,16 +866,18 @@ HTML_PAGE = """<!doctype html>
       }
 
       if (
-        normalized.includes("readme")
-        || normalized.includes("документац")
-        || normalized.includes("инструкц")
-        || normalized.includes("руководств")
+        normalized.includes(".lua")
+        || normalized.includes("\\\\")
+        || normalized.includes("/")
+        || normalized.includes("папк")
+        || normalized.includes("директор")
+        || normalized.includes("каталог")
       ) {
         return [
-          "Определяет тип документа",
-          "Собирает контекст проекта",
-          "Пишет структуру README",
-          "Проверяет итоговый текст",
+          "Определяет целевой путь",
+          "Подбирает Lua target",
+          "Готовит содержимое файла",
+          "Проверяет и сохраняет результат",
         ];
       }
 
@@ -912,7 +952,7 @@ HTML_PAGE = """<!doctype html>
         if (state && state.has_project) {
           addMessage("system", "Контекст Восстановлен", `Чат ${state.chat_id || ""} готов к продолжению.`);
         } else {
-          addMessage("system", "Новый Чат", "Контекст пуст. Опиши задачу внизу, и приложение создаст или обновит Lua-файл по тем же правилам, что и в консоли.");
+          addMessage("system", "Новый Чат", "Контекст пуст. Опиши задачу внизу, и приложение создаст или обновит Lua-файл в нужном пути.");
         }
         return;
       }
@@ -1116,15 +1156,32 @@ HTML_PAGE = """<!doctype html>
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Lua Console Builder — LangGraph edition.")
+    parser = argparse.ArgumentParser(description="Lua Console Builder — canonical web runtime.")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind the local web UI.")
     parser.add_argument("--port", type=int, default=8765, help="Port for the local web UI.")
     parser.add_argument("--no-browser", action="store_true", help="Do not auto-open the browser.")
-    parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Fallback output Lua file path.")
-    parser.add_argument("--model", default=os.getenv("LMSTUDIO_MODEL", DEFAULT_MODEL), help="Model name loaded in LM Studio.")
-    parser.add_argument("--url", default=os.getenv("LMSTUDIO_URL", DEFAULT_URL), help="LM Studio base URL.")
+    parser.add_argument(
+        "--workspace",
+        default=os.getcwd(),
+        help="Default workspace root used when the prompt does not name a target path.",
+    )
+    parser.add_argument(
+        "--model",
+        default=os.getenv("LOCAL_LLM_MODEL", os.getenv("LMSTUDIO_MODEL", DEFAULT_MODEL)),
+        help="Model name exposed by the local OpenAI-compatible runtime.",
+    )
+    parser.add_argument(
+        "--url",
+        default=os.getenv("LOCAL_LLM_BASE_URL", os.getenv("LMSTUDIO_URL", DEFAULT_URL)),
+        help="Base URL of the local OpenAI-compatible runtime.",
+    )
     parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS, help="Max validation/fix iterations.")
-    parser.add_argument("--request-timeout", type=float, default=DEFAULT_REQUEST_TIMEOUT, help="Seconds to wait for LM Studio.")
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=DEFAULT_REQUEST_TIMEOUT,
+        help="Seconds to wait for the local runtime.",
+    )
     return parser.parse_args()
 
 
@@ -1134,6 +1191,7 @@ class AppRuntime:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.lock = threading.Lock()
+        self.default_workspace = os.path.abspath(getattr(args, "workspace", os.getcwd()) or os.getcwd())
         self.store = ChatStore(os.path.join(os.getcwd(), CHAT_DB_NAME))
 
         # Create the async event loop for the engine
@@ -1153,11 +1211,14 @@ class AppRuntime:
         )
 
         # Chat state (simple dict now)
-        self.state_dict: dict = _empty_state_dict()
+        self.state_dict: dict = _empty_state_dict(self.default_workspace)
         chats = self.store.list_chats()
         if chats:
             self.current_chat_id = int(chats[0]["id"])
-            self.state_dict = self.store.load_state_dict(self.current_chat_id)
+            self.state_dict = _normalize_state_dict(
+                self.store.load_state_dict(self.current_chat_id),
+                self.default_workspace,
+            )
         else:
             self.current_chat_id = self.store.create_chat(self.state_dict, "Новый чат")
 
@@ -1176,12 +1237,19 @@ class AppRuntime:
     def build_state_payload(self) -> dict:
         sd = self.state_dict
         return {
-            "has_project": bool(sd.get("current_code", "").strip() or sd.get("base_prompt", "").strip()),
+            "chat_id": self.current_chat_id,
+            "has_project": bool(
+                sd.get("current_code", "").strip()
+                or sd.get("base_prompt", "").strip()
+                or sd.get("target_path", "").strip()
+            ),
             "base_prompt": sd.get("base_prompt", ""),
             "change_requests": sd.get("change_requests", []),
             "current_code": sd.get("current_code", ""),
-            "output_path": sd.get("output_path", DEFAULT_OUTPUT),
+            "target_path": sd.get("target_path", ""),
+            "workspace_root": sd.get("workspace_root", self.default_workspace),
             "last_intent": sd.get("last_intent", ""),
+            "last_saved_path": sd.get("last_saved_path", ""),
             "change_requests_count": len(sd.get("change_requests", [])),
         }
 
@@ -1195,14 +1263,17 @@ class AppRuntime:
 
     def create_new_chat(self) -> dict:
         with self.lock:
-            self.state_dict = _empty_state_dict()
+            self.state_dict = _empty_state_dict(self.default_workspace)
             self.current_chat_id = self.store.create_chat(self.state_dict, "Новый чат")
             return self.build_full_payload()
 
     def switch_chat(self, chat_id: int) -> dict:
         with self.lock:
             self.current_chat_id = chat_id
-            self.state_dict = self.store.load_state_dict(chat_id)
+            self.state_dict = _normalize_state_dict(
+                self.store.load_state_dict(chat_id),
+                self.default_workspace,
+            )
             return self.build_full_payload()
 
     def delete_chat(self, chat_id: int) -> dict:
@@ -1210,11 +1281,14 @@ class AppRuntime:
             self.store.delete_chat(chat_id)
             chats = self.store.list_chats()
             if not chats:
-                self.state_dict = _empty_state_dict()
+                self.state_dict = _empty_state_dict(self.default_workspace)
                 self.current_chat_id = self.store.create_chat(self.state_dict, "Новый чат")
                 return self.build_full_payload()
             self.current_chat_id = int(chats[0]["id"])
-            self.state_dict = self.store.load_state_dict(self.current_chat_id)
+            self.state_dict = _normalize_state_dict(
+                self.store.load_state_dict(self.current_chat_id),
+                self.default_workspace,
+            )
             return self.build_full_payload()
 
     def handle_message(self, message: str) -> dict:
@@ -1243,13 +1317,6 @@ class AppRuntime:
         """Run the LangGraph pipeline for user text and return response."""
         sd = self.state_dict
 
-        # Build message history for context
-        raw_messages = self.store.load_messages(self.current_chat_id)
-        messages = [
-            {"role": m["role"], "content": m["content"]}
-            for m in raw_messages[-10:]  # last 10 messages for context
-        ]
-
         try:
             result = self._run_async(
                 self.engine.process_message(
@@ -1258,8 +1325,8 @@ class AppRuntime:
                     current_code=sd.get("current_code", ""),
                     base_prompt=sd.get("base_prompt", ""),
                     change_requests=sd.get("change_requests", []),
-                    messages=messages,
-                    output_path=sd.get("output_path", DEFAULT_OUTPUT),
+                    workspace_root=sd.get("workspace_root", self.default_workspace),
+                    target_path=sd.get("target_path", ""),
                 )
             )
         except Exception as exc:
@@ -1271,6 +1338,10 @@ class AppRuntime:
         sd["base_prompt"] = result.get("base_prompt", sd.get("base_prompt", ""))
         sd["change_requests"] = result.get("change_requests", sd.get("change_requests", []))
         sd["last_intent"] = result.get("intent", "")
+        sd["workspace_root"] = result.get("workspace_root", sd.get("workspace_root", self.default_workspace))
+        sd["target_path"] = result.get("target_path", sd.get("target_path", ""))
+        if result.get("saved_to", "").strip():
+            sd["last_saved_path"] = result["saved_to"].strip()
 
         return result.get("response", "")
 
@@ -1291,9 +1362,25 @@ class AppRuntime:
                 f"Задача: {sd.get('base_prompt', '(не задана)')}",
                 f"Правки: {len(sd.get('change_requests', []))}",
                 f"Код: {'есть' if sd.get('current_code', '').strip() else 'нет'}",
+                f"Активный Lua target: {sd.get('target_path', '(не выбран)') or '(не выбран)'}",
+                f"Workspace: {sd.get('workspace_root', self.default_workspace)}",
+                f"Последнее сохранение: {sd.get('last_saved_path', '(ещё не было)') or '(ещё не было)'}",
                 f"Последний intent: {sd.get('last_intent', '(не определён)')}",
             ]
             return "\n".join(lines)
+
+        if command == "/path":
+            sd = self.state_dict
+            target_path = sd.get("target_path", "").strip()
+            if not target_path:
+                return (
+                    f"Активный Lua target ещё не выбран.\n"
+                    f"Workspace: {sd.get('workspace_root', self.default_workspace)}"
+                )
+            return (
+                f"Активный Lua target:\n{target_path}\n\n"
+                f"Workspace:\n{sd.get('workspace_root', self.default_workspace)}"
+            )
 
         if command == "/prompt":
             sd = self.state_dict
@@ -1305,10 +1392,13 @@ class AppRuntime:
         if command == "/new":
             if not argument:
                 return "Использование: /new <задача>"
-            # Force intent to "create" by clearing current code
+            # Start a fresh chat context and let the pipeline resolve a new target.
             self.state_dict["current_code"] = ""
             self.state_dict["base_prompt"] = ""
             self.state_dict["change_requests"] = []
+            self.state_dict["target_path"] = ""
+            self.state_dict["last_saved_path"] = ""
+            self.state_dict["workspace_root"] = self.default_workspace
             return self._process_via_pipeline(argument)
 
         if command == "/edit":
@@ -1316,16 +1406,27 @@ class AppRuntime:
                 return "Использование: /edit <изменение>"
             return self._process_via_pipeline(argument)
 
+        if command == "/retry":
+            if not self.state_dict.get("current_code", "").strip():
+                return "Нет текущего Lua-кода для повторной проверки."
+            retry_request = (
+                "Проверь текущий Lua код ещё раз, исправь найденные проблемы и сохрани "
+                "его в тот же целевой файл."
+            )
+            return self._process_via_pipeline(retry_request)
+
         if command == "/help":
             return (
                 "Команды:\n"
                 "  /new <задача> — новый проект\n"
                 "  /edit <изменение> — изменить текущий код\n"
+                "  /retry — повторно проверить и поправить текущий код\n"
                 "  /code — показать текущий код\n"
+                "  /path — показать активный Lua target\n"
                 "  /status — статус\n"
                 "  /prompt — текущее задание\n"
                 "  /help — эта справка\n\n"
-                "Или просто напиши задачу / правки обычным текстом."
+                "Обычный текст можно дополнять путём к .lua файлу или директорией, где нужно создать проект."
             )
 
         return "Неизвестная команда. Используй /help."

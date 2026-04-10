@@ -1,11 +1,8 @@
-"""PipelineEngine — top-level API that replaces main.py orchestration.
-
-Exposes a single ``process_message(chat_id, user_input, ...)`` method
-that runs the full LangGraph pipeline and returns a response dict.
-"""
+"""PipelineEngine — canonical API for the Lua generation pipeline."""
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import structlog
@@ -20,7 +17,7 @@ DEFAULT_MAX_FIX = 5
 
 
 class PipelineEngine:
-    """Wraps the LangGraph-compiled pipeline with a simple message API."""
+    """Wraps the compiled LangGraph pipeline with a simple message API."""
 
     def __init__(
         self,
@@ -40,27 +37,22 @@ class PipelineEngine:
         current_code: str = "",
         base_prompt: str = "",
         change_requests: list[str] | None = None,
-        messages: list[dict] | None = None,
-        output_path: str = "generated.lua",
+        workspace_root: str = "",
+        target_path: str = "",
     ) -> dict[str, Any]:
-        """Run the full pipeline for one user turn.
-
-        Parameters are loaded from the chat store by the caller (app.py).
-
-        Returns a dict with at least:
-            response (str), response_type (str),
-            current_code (str — updated if code was generated),
-            intent (str), base_prompt (str), change_requests (list).
-        """
+        """Run the full pipeline for one user turn."""
+        initial_workspace = os.path.abspath(workspace_root or os.getcwd())
+        initial_target = os.path.abspath(target_path) if target_path else ""
         initial_state: PipelineState = {
             "chat_id": chat_id,
-            "messages": messages or [],
             "user_input": user_input,
+            "workspace_root": initial_workspace,
+            "target_path": initial_target,
+            "target_directory": os.path.dirname(initial_target) if initial_target else initial_workspace,
+            "target_explicit": False,
             "intent": "",
             "base_prompt": base_prompt,
             "change_requests": change_requests or [],
-            "output_path": output_path,
-            "artifact_type": "lua",
             "current_code": current_code,
             "generated_code": "",
             "diagnostics": {},
@@ -69,13 +61,14 @@ class PipelineEngine:
             "max_fix_iterations": self._max_fix,
             "verification": {},
             "verification_passed": False,
+            "save_success": False,
+            "save_error": "",
+            "saved_to": "",
             "response": "",
             "response_type": "text",
-            "metadata": {},
         }
 
         logger.info("pipeline_start", chat_id=chat_id, msg_len=len(user_input))
-
         result: PipelineState = await self._graph.ainvoke(initial_state)
 
         output = {
@@ -89,6 +82,11 @@ class PipelineEngine:
             "validation_passed": result.get("validation_passed", False),
             "diagnostics": result.get("diagnostics", {}),
             "verification": result.get("verification", {}),
+            "workspace_root": result.get("workspace_root", initial_workspace),
+            "target_path": result.get("target_path", initial_target),
+            "save_success": result.get("save_success", False),
+            "save_error": result.get("save_error", ""),
+            "saved_to": result.get("saved_to", ""),
         }
 
         logger.info(
@@ -97,6 +95,7 @@ class PipelineEngine:
             intent=output["intent"],
             response_type=output["response_type"],
             validation_passed=output["validation_passed"],
+            target_path=output["target_path"],
+            save_success=output["save_success"],
         )
-
         return output

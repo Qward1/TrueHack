@@ -39,6 +39,9 @@ def check_verification(state: PipelineState) -> str:
     Returns: "respond" | "fix"
     """
     verification = state.get("verification", {})
+    if verification.get("error"):
+        return "respond"
+
     passed = verification.get("passed", False)
     score = verification.get("score", 0)
 

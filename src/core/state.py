@@ -1,51 +1,45 @@
-"""LangGraph pipeline state definition."""
+"""LangGraph pipeline state definition for the canonical Lua runtime."""
 
 from __future__ import annotations
 
 from typing import Any, TypedDict
 
 
-class Message(TypedDict):
-    role: str       # "user" | "assistant" | "system"
-    content: str
-
-
 class PipelineState(TypedDict):
     """Full state that flows through every LangGraph node."""
 
-    # ── Conversation ─────────────────────────────────────────────────
+    # Conversation
     chat_id: int
-    messages: list[Message]
     user_input: str
 
-    # ── Routing ──────────────────────────────────────────────────────
-    intent: str             # "create" | "change" | "inspect" | "retry" | "question"
+    # Lua target resolution
+    workspace_root: str
+    target_path: str
+    target_directory: str
+    target_explicit: bool
 
-    # ── Task context ─────────────────────────────────────────────────
-    base_prompt: str        # original task description (accumulated)
+    # Routing and task context
+    intent: str
+    base_prompt: str
     change_requests: list[str]
-    output_path: str        # where to save the Lua file
-    artifact_type: str      # "lua" | "readme" | "text"
 
-    # ── Code ─────────────────────────────────────────────────────────
-    current_code: str       # existing code before this turn
-    generated_code: str     # new/edited code from LLM this turn
+    # Code
+    current_code: str
+    generated_code: str
 
-    # ── Validation ───────────────────────────────────────────────────
+    # Validation / fix loop
     diagnostics: dict[str, Any]
     validation_passed: bool
-
-    # ── Fix loop ─────────────────────────────────────────────────────
     fix_iterations: int
     max_fix_iterations: int
 
-    # ── Verification ─────────────────────────────────────────────────
+    # Verification / save state
     verification: dict[str, Any]
     verification_passed: bool
+    save_success: bool
+    save_error: str
+    saved_to: str
 
-    # ── Response ─────────────────────────────────────────────────────
+    # User-visible output
     response: str
-    response_type: str      # "code" | "text" | "error"
-
-    # ── Metadata ─────────────────────────────────────────────────────
-    metadata: dict[str, Any]
+    response_type: str

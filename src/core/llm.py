@@ -1,4 +1,4 @@
-"""Async LLM provider wrapping the openai library for LM Studio."""
+"""Async provider for a local OpenAI-compatible LLM runtime."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ DEFAULT_TIMEOUT = 600.0
 
 
 class LLMProvider:
-    """Async LLM client using the OpenAI-compatible API of LM Studio."""
+    """Async LLM client for a local OpenAI-compatible endpoint."""
 
     def __init__(
         self,
@@ -26,7 +26,7 @@ class LLMProvider:
     ) -> None:
         self._client = AsyncOpenAI(
             base_url=base_url,
-            api_key="lm-studio",
+            api_key="local-runtime",
             timeout=timeout,
         )
         self._model = model

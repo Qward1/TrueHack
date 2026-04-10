@@ -20,14 +20,16 @@ def build_graph(llm: LLMProvider):
     """Construct and compile the full pipeline graph.
 
     Flow:
-        START → route_intent
+        START → resolve_target
+        resolve_target → route_intent
         route_intent → [generate_code | refine_code | answer_question]
         generate_code → validate_code
         refine_code → validate_code
         validate_code → [verify_requirements | fix_code | prepare_response(force)]
-        verify_requirements → [prepare_response | fix_code]
+        verify_requirements → [save_code | fix_code]
         fix_code → validate_code (loop)
         answer_question → END
+        save_code → prepare_response
         prepare_response → END
     """
     nodes = create_nodes(llm)
@@ -40,8 +42,9 @@ def build_graph(llm: LLMProvider):
 
     # ── Edges ────────────────────────────────────────────────────────
 
-    # START → route
-    g.add_edge(START, "route_intent")
+    # START → target resolution → route
+    g.add_edge(START, "resolve_target")
+    g.add_edge("resolve_target", "route_intent")
 
     # route → generate / refine / answer
     g.add_conditional_edges(
@@ -74,13 +77,16 @@ def build_graph(llm: LLMProvider):
         "verify_requirements",
         check_verification,
         {
-            "respond": "prepare_response",
+            "respond": "save_code",
             "fix": "fix_code",
         },
     )
 
     # fix → back to validate (loop)
     g.add_edge("fix_code", "validate_code")
+
+    # save → respond
+    g.add_edge("save_code", "prepare_response")
 
     # terminals
     g.add_edge("answer_question", END)
