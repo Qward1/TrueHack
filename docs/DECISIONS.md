@@ -1,4 +1,4 @@
-# "Архитектурные решения"
+# Архитектурные решения
 
 # Decisions log
 
@@ -7,56 +7,82 @@
 Используем `app.py + src/graph` как единственный поддерживаемый runtime.
 
 ### Why
-В проекте было дублирование orchestration между новым graph path и legacy `main.py`.
-Для управляемого продукта нужен один pipeline и один entry point.
+В проекте было дублирование orchestration между graph path и legacy runtime.
 
 ### Consequences
-`main.py` удалён из поддерживаемого runtime.
-Вся новая логика должна встраиваться только в canonical graph pipeline.
+Вся новая логика встраивается только в canonical graph pipeline.
+
+---
 
 ## 2026-04-10
 ### Decision
 Сохраняем Lua target path logic как обязательную бизнес-функцию.
 
 ### Why
-Система должна уметь писать Lua-скрипты в нужное место, создавать папки и переиспользовать активный target в рамках чата.
-Это часть продуктовой логики, а не legacy baggage.
+Система должна уметь писать Lua-файлы в нужный путь, создавать директории и переиспользовать active target.
 
 ### Consequences
-Target resolution и save flow встроены в canonical runtime.
-Cleanup не должен удалять explicit path / directory behavior.
+`resolve_target` и `save_code` остаются core-частью runtime.
+
+---
 
 ## 2026-04-10
 ### Decision
-Удаляем generic README/text artifact orchestration из продуктового runtime.
+Исключаем generic README/text artifact orchestration из продуктового runtime.
 
 ### Why
-Продуктовый scope проекта — LocalScript / Lua generation pipeline.
-Generic text/document logic усложняла архитектуру и создавала второй продукт внутри одного репозитория.
+Product scope — Lua-centric pipeline, а не универсальный редактор артефактов.
 
 ### Consequences
-Canonical runtime теперь Lua-only.
-README остаётся документацией репозитория, а не целевым artifact type приложения.
+Runtime остается Lua-only, README — документация репозитория.
+
+---
 
 ## 2026-04-10
 ### Decision
-Generation, refine, fix и verification должны идти через один LLM abstraction layer.
+Generation/refine/fix/verify/e2e-suite используют единый LLM provider (`src/core/llm.py`).
 
 ### Why
-Ранее в проекте были разрозненные direct client paths и legacy verification path, что создавало дублирование и делало runtime неочевидным.
+Разрозненные direct client paths приводят к дублированию и нестабильному runtime.
 
 ### Consequences
-Canonical runtime использует единый provider из `src/core/llm.py`.
-Legacy direct LLM client modules удалены.
+Один abstraction layer для всех LLM-шагов pipeline.
+
+---
 
 ## 2026-04-10
 ### Decision
-Текущий dev-runtime может использовать local OpenAI-compatible endpoint, но финальная хакатонная конфигурация должна быть воспроизводима через Ollama.
+Перед сохранением обязателен отдельный e2e gate:
+`generate_e2e_suite -> run_e2e_suite -> save_code`.
 
 ### Why
-Это прямое требование хакатона.
+По бизнес-требованию система должна делать auto-generated end-to-end проверку до записи финального файла.
 
 ### Consequences
-Docs и README должны честно различать:
-- что уже работает в canonical runtime сейчас;
-- что ещё нужно довести до финального Ollama-target.
+`save_code` вызывается только при успешном e2e.
+При провале e2e pipeline возвращается в fix-loop (если еще не исчерпан лимит итераций).
+
+---
+
+## 2026-04-10
+### Decision
+После успешного сохранения система обязана возвращать объяснение решения и следующий шаг для пользователя.
+
+### Why
+Нужно не только выдать код, но и объяснить реализацию, предложить улучшения и задать уточняющие вопросы.
+
+### Consequences
+Добавлен `explain_solution` и хранение `suggested_changes`/`clarifying_questions` в chat state.
+Follow-up вида `примени предложение N` поддерживается в следующем turn.
+
+---
+
+## 2026-04-10
+### Decision
+Текущий dev-runtime может использовать local OpenAI-compatible endpoint, но финальный hackathon target — Ollama.
+
+### Why
+Это прямое требование условий хакатона.
+
+### Consequences
+Docs должны явно различать текущее dev-state и финальный целевой runtime.

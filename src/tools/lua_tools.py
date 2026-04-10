@@ -13,18 +13,30 @@ from typing import Any
 import structlog
 
 from src.core.llm import LLMProvider
-from src.tools.local_runtime import check_lua_file, run_lua_file
+from src.tools.local_runtime import (
+    check_lua_file,
+    run_lua_file,
+    run_lua_file_with_input,
+)
 
 logger = structlog.get_logger(__name__)
 
 DEFAULT_LUA_BIN = "lua"
 DEFAULT_LUACHECK_BIN = "luacheck"
 DEFAULT_STARTUP_TIMEOUT = 3.0
+DEFAULT_E2E_TIMEOUT = 8.0
+DEFAULT_MAX_E2E_CASES = 3
 DEFAULT_VERIFICATION_TEMPERATURE = 0.0
 DEFAULT_VERIFICATION_SYSTEM_PROMPT = (
     "You review whether a Lua solution fully satisfies the user's request. "
     "Return strict JSON only with the keys: passed, score, summary, missing_requirements, warnings. "
     "Use passed=true only if all important requirements are satisfied."
+)
+DEFAULT_E2E_SYSTEM_PROMPT = (
+    "You design deterministic end-to-end tests for a single Lua CLI file. "
+    "Return strict JSON only with key: tests. "
+    "Each test must contain: name, stdin, expected_stdout_contains, expected_stdout_not_contains, expected_exit_code. "
+    "Use concise assertions and keep at most 3 tests."
 )
 
 ZERO_WIDTH_PATTERN = re.compile(r"[\u200b\u200c\u200d\ufeff]")
@@ -508,6 +520,232 @@ async def async_verify_requirements(
     if not normalized["summary"]:
         normalized["summary"] = "Verification completed."
     return normalized
+
+
+def _normalize_e2e_case(index: int, raw_case: object) -> dict[str, Any]:
+    if not isinstance(raw_case, dict):
+        return {}
+
+    name = str(raw_case.get("name") or f"case_{index + 1}").strip() or f"case_{index + 1}"
+    stdin_text = str(raw_case.get("stdin", "") or "")
+    expected_contains = _ensure_string_list(raw_case.get("expected_stdout_contains"))
+    expected_not_contains = _ensure_string_list(raw_case.get("expected_stdout_not_contains"))
+
+    expected_exit_code = raw_case.get("expected_exit_code", 0)
+    try:
+        expected_exit_code = int(expected_exit_code)
+    except (TypeError, ValueError):
+        expected_exit_code = 0
+
+    return {
+        "name": name[:120],
+        "stdin": stdin_text[:4000],
+        "expected_stdout_contains": expected_contains[:6],
+        "expected_stdout_not_contains": expected_not_contains[:6],
+        "expected_exit_code": expected_exit_code,
+    }
+
+
+def _normalize_e2e_suite(data: dict[str, Any]) -> dict[str, Any]:
+    raw_tests = data.get("tests")
+    if not isinstance(raw_tests, list):
+        raw_tests = []
+
+    tests: list[dict[str, Any]] = []
+    for index, raw_case in enumerate(raw_tests[:DEFAULT_MAX_E2E_CASES]):
+        normalized = _normalize_e2e_case(index, raw_case)
+        if normalized:
+            tests.append(normalized)
+
+    return {"tests": tests}
+
+
+async def async_generate_e2e_suite(
+    llm: LLMProvider,
+    prompt: str,
+    code: str,
+    target_path: str = "",
+) -> dict[str, Any]:
+    """Generate a compact JSON e2e test suite for the Lua file."""
+    location = target_path or "(not set)"
+    messages = [
+        {"role": "system", "content": DEFAULT_E2E_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"User request:\n{prompt}\n\n"
+                f"Target path:\n{location}\n\n"
+                "Produce tests for user-visible behavior only. "
+                "Avoid brittle exact full-output matches."
+            ),
+        },
+        {"role": "assistant", "content": code},
+        {
+            "role": "user",
+            "content": (
+                "Return strict JSON only in this shape:\n"
+                '{'
+                '"tests": ['
+                '{'
+                '"name": "test name", '
+                '"stdin": "", '
+                '"expected_stdout_contains": [], '
+                '"expected_stdout_not_contains": [], '
+                '"expected_exit_code": 0'
+                '}'
+                "]"
+                "}"
+            ),
+        },
+    ]
+
+    raw = await llm.chat(messages, temperature=0.0)
+    parsed = _extract_json_block(raw)
+    normalized = _normalize_e2e_suite(parsed)
+    if not normalized["tests"]:
+        raise RuntimeError("LLM returned an empty e2e suite.")
+    return normalized
+
+
+def _sync_run_e2e_suite(
+    lua_code: str,
+    suite: dict[str, Any],
+    lua_bin: str = DEFAULT_LUA_BIN,
+    timeout_seconds: float = DEFAULT_E2E_TIMEOUT,
+) -> dict[str, Any]:
+    tests = suite.get("tests", []) if isinstance(suite, dict) else []
+    if not tests:
+        return {
+            "passed": False,
+            "summary": "E2E suite is empty.",
+            "cases": [],
+            "failed_cases": [],
+            "retryable": False,
+        }
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".lua",
+        delete=False,
+        mode="w",
+        encoding="utf-8",
+    ) as file:
+        file.write(lua_code)
+        temp_path = file.name
+
+    case_results: list[dict[str, Any]] = []
+    retryable = True
+    try:
+        for index, case in enumerate(tests):
+            case_name = str(case.get("name", f"case_{index + 1}"))
+            stdin_text = str(case.get("stdin", "") or "")
+            expect_contains = _ensure_string_list(case.get("expected_stdout_contains"))
+            expect_not_contains = _ensure_string_list(case.get("expected_stdout_not_contains"))
+
+            expected_exit_code = case.get("expected_exit_code", 0)
+            try:
+                expected_exit_code = int(expected_exit_code)
+            except (TypeError, ValueError):
+                expected_exit_code = 0
+
+            try:
+                run_result = run_lua_file_with_input(
+                    temp_path,
+                    stdin_text=stdin_text,
+                    lua_bin=lua_bin,
+                    timeout_seconds=timeout_seconds,
+                )
+            except (FileNotFoundError, RuntimeError) as exc:
+                retryable = False
+                case_results.append(
+                    {
+                        "name": case_name,
+                        "passed": False,
+                        "reason": str(exc),
+                        "timed_out": False,
+                        "returncode": -1,
+                        "output": "",
+                    }
+                )
+                break
+
+            output = repair_mojibake(
+                merge_process_output(run_result.get("stdout", ""), run_result.get("stderr", ""))
+            )
+            timed_out = bool(run_result.get("timed_out", False))
+            returncode = int(run_result.get("returncode", 0))
+
+            reason_parts: list[str] = []
+            passed = True
+
+            if timed_out:
+                passed = False
+                reason_parts.append("timed_out")
+            if returncode != expected_exit_code:
+                passed = False
+                reason_parts.append(
+                    f"unexpected_exit_code(expected={expected_exit_code}, actual={returncode})"
+                )
+
+            for expected in expect_contains:
+                if expected not in output:
+                    passed = False
+                    reason_parts.append(f"missing_output_fragment: {expected}")
+
+            for forbidden in expect_not_contains:
+                if forbidden and forbidden in output:
+                    passed = False
+                    reason_parts.append(f"forbidden_output_fragment: {forbidden}")
+
+            case_results.append(
+                {
+                    "name": case_name,
+                    "passed": passed,
+                    "reason": "; ".join(reason_parts),
+                    "timed_out": timed_out,
+                    "returncode": returncode,
+                    "output": output[:3000],
+                }
+            )
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+    failed_cases = [case for case in case_results if not case.get("passed")]
+    passed = bool(case_results) and not failed_cases
+    if passed:
+        summary = f"E2E passed ({len(case_results)}/{len(case_results)})."
+    else:
+        summary = f"E2E failed ({len(case_results) - len(failed_cases)}/{len(case_results)})."
+
+    return {
+        "passed": passed,
+        "summary": summary,
+        "cases": case_results,
+        "failed_cases": failed_cases,
+        "retryable": retryable,
+    }
+
+
+async def async_run_e2e_suite(
+    lua_code: str,
+    suite: dict[str, Any],
+    lua_bin: str = DEFAULT_LUA_BIN,
+    timeout_seconds: float = DEFAULT_E2E_TIMEOUT,
+) -> dict[str, Any]:
+    """Run generated e2e test cases against the current Lua code."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        partial(
+            _sync_run_e2e_suite,
+            lua_code,
+            suite,
+            lua_bin,
+            timeout_seconds,
+        ),
+    )
 
 
 def extract_function_names(code: str) -> list[str]:

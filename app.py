@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sqlite3
 import threading
 import webbrowser
@@ -46,6 +47,10 @@ def _empty_state_dict(workspace_root: str | None = None) -> dict:
         "workspace_root": normalized_workspace,
         "last_intent": "",
         "last_saved_path": "",
+        "last_suggested_changes": [],
+        "last_clarifying_questions": [],
+        "last_explanation": {},
+        "last_e2e_summary": "",
     }
 
 
@@ -83,6 +88,19 @@ def _normalize_state_dict(state_dict: dict | None, workspace_root: str | None = 
         or target_path
         or ""
     ).strip()
+    normalized["last_suggested_changes"] = [
+        str(item).strip()
+        for item in state_dict.get("last_suggested_changes", [])
+        if str(item).strip()
+    ]
+    normalized["last_clarifying_questions"] = [
+        str(item).strip()
+        for item in state_dict.get("last_clarifying_questions", [])
+        if str(item).strip()
+    ]
+    explanation = state_dict.get("last_explanation", {})
+    normalized["last_explanation"] = explanation if isinstance(explanation, dict) else {}
+    normalized["last_e2e_summary"] = str(state_dict.get("last_e2e_summary", "") or "").strip()
     return normalized
 
 
@@ -94,6 +112,61 @@ def _derive_title(base_prompt: str, fallback: str = "Новый чат") -> str:
     if len(single_line) <= MAX_CHAT_TITLE_LENGTH:
         return single_line
     return f"{single_line[: MAX_CHAT_TITLE_LENGTH - 3].rstrip()}..."
+
+
+def _extract_suggestion_indexes(text: str) -> list[int]:
+    lowered = text.lower()
+    indexes: set[int] = set()
+
+    for match in re.finditer(r"(?:предложени[ея]|suggestion)\s*#?\s*(\d+)", lowered):
+        try:
+            value = int(match.group(1))
+        except ValueError:
+            continue
+        if value > 0:
+            indexes.add(value - 1)
+
+    if not indexes and ("все предложения" in lowered or "all suggestions" in lowered):
+        return [-1]
+    return sorted(indexes)
+
+
+def _expand_suggestion_followup(text: str, suggestions: list[str]) -> str:
+    if not suggestions:
+        return text
+
+    indexes = _extract_suggestion_indexes(text)
+    selected: list[str] = []
+    if indexes == [-1]:
+        selected = suggestions
+    else:
+        for idx in indexes:
+            if 0 <= idx < len(suggestions):
+                selected.append(suggestions[idx])
+
+    lowered = text.lower()
+    weak_apply_signal = any(
+        token in lowered
+        for token in (
+            "примени предложение",
+            "применяй предложение",
+            "согласен с предложением",
+            "apply suggestion",
+        )
+    )
+    if not selected and weak_apply_signal and len(suggestions) == 1:
+        selected = [suggestions[0]]
+
+    if not selected:
+        return text
+
+    merged = "\n".join(f"- {item}" for item in selected)
+    return (
+        f"{text}\n\n"
+        "Считай, что я согласовал следующие улучшения и их нужно применить:\n"
+        f"{merged}\n"
+        "Выполни изменения в текущем Lua-файле и сохрани в тот же target."
+    )
 
 
 class ChatStore:
@@ -1251,6 +1324,9 @@ class AppRuntime:
             "last_intent": sd.get("last_intent", ""),
             "last_saved_path": sd.get("last_saved_path", ""),
             "change_requests_count": len(sd.get("change_requests", [])),
+            "suggested_changes": sd.get("last_suggested_changes", []),
+            "clarifying_questions": sd.get("last_clarifying_questions", []),
+            "last_e2e_summary": sd.get("last_e2e_summary", ""),
         }
 
     def build_full_payload(self) -> dict:
@@ -1316,12 +1392,16 @@ class AppRuntime:
     def _process_via_pipeline(self, text: str) -> str:
         """Run the LangGraph pipeline for user text and return response."""
         sd = self.state_dict
+        effective_text = _expand_suggestion_followup(
+            text,
+            sd.get("last_suggested_changes", []),
+        )
 
         try:
             result = self._run_async(
                 self.engine.process_message(
                     chat_id=self.current_chat_id,
-                    user_input=text,
+                    user_input=effective_text,
                     current_code=sd.get("current_code", ""),
                     base_prompt=sd.get("base_prompt", ""),
                     change_requests=sd.get("change_requests", []),
@@ -1342,6 +1422,24 @@ class AppRuntime:
         sd["target_path"] = result.get("target_path", sd.get("target_path", ""))
         if result.get("saved_to", "").strip():
             sd["last_saved_path"] = result["saved_to"].strip()
+        if result.get("response_type") == "code":
+            sd["last_suggested_changes"] = [
+                str(item).strip()
+                for item in result.get("suggested_changes", [])
+                if str(item).strip()
+            ]
+            sd["last_clarifying_questions"] = [
+                str(item).strip()
+                for item in result.get("clarifying_questions", [])
+                if str(item).strip()
+            ]
+            explanation = result.get("explanation", {})
+            sd["last_explanation"] = explanation if isinstance(explanation, dict) else {}
+            e2e_results = result.get("e2e_results", {})
+            if isinstance(e2e_results, dict):
+                sd["last_e2e_summary"] = str(e2e_results.get("summary", "")).strip()
+            else:
+                sd["last_e2e_summary"] = ""
 
         return result.get("response", "")
 
@@ -1365,6 +1463,9 @@ class AppRuntime:
                 f"Активный Lua target: {sd.get('target_path', '(не выбран)') or '(не выбран)'}",
                 f"Workspace: {sd.get('workspace_root', self.default_workspace)}",
                 f"Последнее сохранение: {sd.get('last_saved_path', '(ещё не было)') or '(ещё не было)'}",
+                f"Последний e2e: {sd.get('last_e2e_summary', '(нет данных)') or '(нет данных)'}",
+                f"Предложений от системы: {len(sd.get('last_suggested_changes', []))}",
+                f"Уточняющих вопросов: {len(sd.get('last_clarifying_questions', []))}",
                 f"Последний intent: {sd.get('last_intent', '(не определён)')}",
             ]
             return "\n".join(lines)
@@ -1387,6 +1488,8 @@ class AppRuntime:
             lines = [f"Задача: {sd.get('base_prompt', '(не задана)')}"]
             for i, cr in enumerate(sd.get("change_requests", []), 1):
                 lines.append(f"Правка {i}: {cr}")
+            for i, suggestion in enumerate(sd.get("last_suggested_changes", []), 1):
+                lines.append(f"Предложение {i}: {suggestion}")
             return "\n".join(lines)
 
         if command == "/new":
@@ -1398,6 +1501,10 @@ class AppRuntime:
             self.state_dict["change_requests"] = []
             self.state_dict["target_path"] = ""
             self.state_dict["last_saved_path"] = ""
+            self.state_dict["last_suggested_changes"] = []
+            self.state_dict["last_clarifying_questions"] = []
+            self.state_dict["last_explanation"] = {}
+            self.state_dict["last_e2e_summary"] = ""
             self.state_dict["workspace_root"] = self.default_workspace
             return self._process_via_pipeline(argument)
 
@@ -1410,8 +1517,8 @@ class AppRuntime:
             if not self.state_dict.get("current_code", "").strip():
                 return "Нет текущего Lua-кода для повторной проверки."
             retry_request = (
-                "Проверь текущий Lua код ещё раз, исправь найденные проблемы и сохрани "
-                "его в тот же целевой файл."
+                "Проверь текущий Lua код ещё раз, исправь найденные проблемы, прогони e2e сценарии "
+                "и сохрани его в тот же целевой файл только если проверки пройдены."
             )
             return self._process_via_pipeline(retry_request)
 
@@ -1426,7 +1533,8 @@ class AppRuntime:
                 "  /status — статус\n"
                 "  /prompt — текущее задание\n"
                 "  /help — эта справка\n\n"
-                "Обычный текст можно дополнять путём к .lua файлу или директорией, где нужно создать проект."
+                "Обычный текст можно дополнять путём к .lua файлу или директорией, где нужно создать проект.\n"
+                "Если система предложила улучшения, можно написать: «примени предложение 1»."
             )
 
         return "Неизвестная команда. Используй /help."

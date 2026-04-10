@@ -28,17 +28,26 @@ class PipelineState(TypedDict):
     generated_code: str
 
     # Validation / fix loop
+    failure_stage: str
     diagnostics: dict[str, Any]
     validation_passed: bool
     fix_iterations: int
     max_fix_iterations: int
 
-    # Verification / save state
+    # Verification / e2e / save state
     verification: dict[str, Any]
     verification_passed: bool
+    e2e_suite: dict[str, Any]
+    e2e_results: dict[str, Any]
+    e2e_passed: bool
     save_success: bool
     save_error: str
     saved_to: str
+
+    # Explanation for user
+    explanation: dict[str, Any]
+    suggested_changes: list[str]
+    clarifying_questions: list[str]
 
     # User-visible output
     response: str
