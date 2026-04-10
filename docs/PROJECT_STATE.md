@@ -1,59 +1,68 @@
-# "Текущее состояние"
+# Текущее состояние
 
 # Project state
 
 ## Current status
-Репозиторий очищен до одного канонического runtime: `app.py + src/graph`.
-Система теперь умеет не только генерировать и дорабатывать Lua-код, но и работать с путями:
-- принимать explicit `.lua` path;
-- принимать директорию и создавать внутри неё slug-based папку/файл;
-- переиспользовать активный Lua target в рамках чата;
-- сохранять итоговый Lua-файл на диск после успешного прохода pipeline.
+Репозиторий работает в одном каноническом runtime (`app.py + src/graph`) и поддерживает полный цикл:
 
-## What works
-- единый LangGraph pipeline без второго orchestration path
-- web UI через `app.py`
-- chat persistence через SQLite
-- target resolution для Lua file / directory / active target / fallback slug target
-- generate
-- refine
-- local validate через `lua` + `luacheck`
-- fix loop
-- requirement verification через тот же LLM provider
-- сохранение результата в целевой `.lua` файл
+`generate/refine -> local validate -> fix -> requirement verify -> generated e2e -> run e2e -> save -> explain/respond`
+
+Сохранение итогового `.lua` файла происходит только после успешного e2e этапа.
+
+## Что работает
+- единый LangGraph pipeline без дублирующего orchestration path
+- path-aware Lua target logic:
+  - explicit `.lua` path;
+  - директория -> slug-папка + slug.lua;
+  - active target в рамках чата
+- генерация Lua-кода
+- refine существующего Lua-кода
+- локальная валидация (`lua` + `luacheck`)
+- fix loop по стадиям ошибок
+- LLM verification требований
+- agent-generated e2e suite (JSON)
+- запуск e2e кейсов с поддержкой `stdin`
+- post-save объяснение решения:
+  - что в коде;
+  - как работает;
+  - предложения улучшений;
+  - уточняющие вопросы
+- follow-up вида `примени предложение N` в следующем цикле
 - команды `/path`, `/status`, `/code`, `/prompt`, `/new`, `/edit`, `/retry`
 
-## What was removed
-- `main.py` как второй runtime
-- `edit_file.py`
-- generic README/text artifact orchestration
-- прямые LLM client paths через legacy root-level модули
+## Что удалено/не используется
+- второй runtime (`main.py`)
+- legacy standalone editor path
+- generic README/text artifact orchestration в продуктовой логике
+- direct legacy LLM client path
 
-## What is still incomplete
-- финальная Ollama-конфигурация под требования хакатона
-- фиксация exact demo-scenario для жюри
-- подтверждение VRAM-лимита `<= 8 GB`
-- автоматизированные regression tests
+## Что еще не закрыто
+- migration на Ollama как финальный runtime
+- фиксация финального demo flow под жюри
+- подтверждение VRAM-лимита `<= 8 GB` на целевом конфиге
+- автоматизированные regression tests (пока только smoke/manual checks)
 
 ## Runtime status
-- текущий runtime локальный и OpenAI-compatible
-- по умолчанию ориентирован на `http://127.0.0.1:1234/v1`
-- это dev/runtime-состояние, а не финальный Ollama-target
+- локальный OpenAI-compatible endpoint
+- default `base_url`: `http://127.0.0.1:1234/v1`
+- текущий runtime валиден как dev-state, но не как финальный Ollama-target
 
 ## Demo reproducibility
-- README теперь описывает запуск canonical runtime
-- для реального воспроизведения всё ещё нужны локально установленные зависимости:
-  - Python packages из `requirements.txt`
-  - `lua`
-  - `luacheck`
-  - локальный OpenAI-compatible runtime
+README описывает канонический запуск через `app.py` и текущий pipeline.
+Для воспроизведения нужны:
+- Python deps из `requirements.txt`
+- `lua`
+- `luacheck`
+- доступный локальный LLM endpoint
 
 ## Open risks
-- path heuristics зависят от формулировки prompt и пока не покрыты автоматическими тестами
-- если local LLM runtime недоступен, generation/refine/verify path не работает
-- статус Ollama для хакатона пока не закрыт
+- генерация e2e suite зависит от доступности/стабильности local LLM
+- эвристики path resolution пока не покрыты автоматическими тестами
+- при недоступности LLM часть шагов (generate/verify/e2e suite/explain) недоступна
 
 ## Next tasks
-- перевести canonical runtime с текущего local OpenAI-compatible endpoint на Ollama
-- зафиксировать demo-scenario и smoke-check команды для жюри
-- добавить хотя бы базовые automated regression checks для target resolution и pipeline flow
+- перевести canonical runtime на Ollama-конфигурацию хакатона
+- добавить автотесты для:
+  - target resolution;
+  - e2e gate;
+  - follow-up применения предложений

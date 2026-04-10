@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import os
-from typing import Callable
+from typing import Any, Callable
 
 import structlog
 
 from src.core.llm import LLMProvider
 from src.core.state import PipelineState
 from src.tools.lua_tools import (
+    async_generate_e2e_suite,
     async_run_diagnostics,
+    async_run_e2e_suite,
     async_verify_requirements,
     extract_function_names,
     restore_lost_functions,
@@ -28,7 +30,7 @@ logger = structlog.get_logger(__name__)
 _ROUTE_SYSTEM = (
     "You are an intent classifier for a Lua code assistant. "
     "Classify the user message into exactly one category. "
-    "Return JSON only: {\"intent\": \"<category>\", \"confidence\": <float>}."
+    'Return JSON only: {"intent": "<category>", "confidence": <float>}.'
 )
 
 _ROUTE_USER = """Categories:
@@ -39,10 +41,10 @@ _ROUTE_USER = """Categories:
 - general: greeting or casual text
 
 Decision rules:
-1. If previous code exists AND the message contains change signals → change
-2. If the message includes error text or asks to fix the current code → change
-3. If the message asks for new code unrelated to previous code → create
-4. Otherwise → question or general
+1. If previous code exists AND the message contains change signals -> change
+2. If the message includes error text or asks to fix/apply improvements -> change
+3. If the message asks for new code unrelated to previous code -> create
+4. Otherwise -> question or general
 
 Previous code exists: {has_code}
 User message: {user_input}
@@ -82,21 +84,39 @@ _FIX_SYSTEM = (
 
 _FIX_USER = """Primary target file: {target_path}
 Original task: {base_prompt}
+Current failure stage: {failure_stage}
 
-Failure kind: {failure_kind}
-Runtime error: {run_error}
-Luacheck error: {luacheck_error}
-Runtime output: {run_output}
-Luacheck output: {luacheck_output}
+Validation diagnostics:
+- Failure kind: {failure_kind}
+- Runtime error: {run_error}
+- Luacheck error: {luacheck_error}
+- Runtime output: {run_output}
+- Luacheck output: {luacheck_output}
+
+Requirement verification:
+- Summary: {verification_summary}
+- Missing requirements: {missing_requirements}
+
+E2E diagnostics:
+- Summary: {e2e_summary}
+- Failed cases: {e2e_failures}
 
 Current code:
 {code}
 
-Fix the code. Return only the full corrected Lua file."""
+Fix the code so it satisfies the original task and passes validation + e2e checks.
+Return only the full corrected Lua file."""
 
 _ANSWER_SYSTEM = (
     "You are a helpful Lua programming assistant. "
     "Answer in the same language as the user's message."
+)
+
+_EXPLAIN_SYSTEM = (
+    "You explain generated Lua code for the user. "
+    "Return strict JSON only with keys: summary, what_is_in_code, how_it_works, "
+    "suggested_changes, clarifying_questions. "
+    "Keep suggested_changes and clarifying_questions short lists (1-3 items each)."
 )
 
 
@@ -109,6 +129,28 @@ def _target_context(state: PipelineState) -> str:
     except ValueError:
         relative = target_path
     return f"Primary target Lua file: {relative}"
+
+
+def _normalize_string_list(value: object, limit: int = 3) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    normalized = [str(item).strip() for item in value if str(item).strip()]
+    return normalized[:limit]
+
+
+def _summarize_failed_e2e_cases(e2e_results: dict[str, Any], limit: int = 3) -> str:
+    failed_cases = e2e_results.get("failed_cases", [])
+    if not isinstance(failed_cases, list) or not failed_cases:
+        return "none"
+
+    chunks: list[str] = []
+    for case in failed_cases[:limit]:
+        if not isinstance(case, dict):
+            continue
+        name = str(case.get("name", "unnamed"))
+        reason = str(case.get("reason", "")).strip() or "no details"
+        chunks.append(f"{name}: {reason}")
+    return " | ".join(chunks) if chunks else "none"
 
 
 def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
@@ -227,9 +269,18 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             "target_path": target_path,
             "target_directory": target_directory,
             "target_explicit": target_explicit,
+            "failure_stage": "",
+            "verification": {},
+            "verification_passed": False,
+            "e2e_suite": {},
+            "e2e_results": {},
+            "e2e_passed": False,
             "save_success": False,
             "save_error": "",
             "saved_to": "",
+            "explanation": {},
+            "suggested_changes": [],
+            "clarifying_questions": [],
         }
 
     async def refine_code(state: PipelineState) -> dict:
@@ -265,18 +316,35 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         return {
             "generated_code": code,
             "change_requests": changes,
-            "fix_iterations": 0,
+            "failure_stage": "",
+            "verification": {},
+            "verification_passed": False,
+            "e2e_suite": {},
+            "e2e_results": {},
+            "e2e_passed": False,
             "save_success": False,
             "save_error": "",
             "saved_to": "",
+            "explanation": {},
+            "suggested_changes": [],
+            "clarifying_questions": [],
         }
 
     async def validate_code(state: PipelineState) -> dict:
         code = state.get("generated_code", "")
         if not code.strip():
+            diagnostics = {
+                "success": False,
+                "failure_kind": "empty",
+                "run_error": "Empty code",
+                "luacheck_error": "",
+                "run_output": "",
+                "luacheck_output": "",
+            }
             return {
                 "validation_passed": False,
-                "diagnostics": {"success": False, "run_error": "Empty code"},
+                "failure_stage": "validation",
+                "diagnostics": diagnostics,
             }
 
         diagnostics = await async_run_diagnostics(code)
@@ -288,22 +356,30 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         )
         return {
             "validation_passed": passed,
+            "failure_stage": "" if passed else "validation",
             "diagnostics": diagnostics,
         }
 
     async def fix_code(state: PipelineState) -> dict:
         code = state.get("generated_code", "")
         diagnostics = state.get("diagnostics", {})
+        verification = state.get("verification", {})
+        e2e_results = state.get("e2e_results", {})
         base_prompt = state.get("base_prompt", "") or state.get("user_input", "")
         fix_iter = state.get("fix_iterations", 0)
         prompt = _FIX_USER.format(
             target_path=state.get("target_path", "(not set)"),
             base_prompt=base_prompt,
+            failure_stage=state.get("failure_stage", "unknown"),
             failure_kind=diagnostics.get("failure_kind", "unknown"),
             run_error=diagnostics.get("run_error", "none"),
             luacheck_error=diagnostics.get("luacheck_error", "none"),
             run_output=diagnostics.get("run_output", "none"),
             luacheck_output=diagnostics.get("luacheck_output", "none"),
+            verification_summary=verification.get("summary", "none"),
+            missing_requirements=", ".join(verification.get("missing_requirements", [])) or "none",
+            e2e_summary=e2e_results.get("summary", "none"),
+            e2e_failures=_summarize_failed_e2e_cases(e2e_results),
             code=code,
         )
 
@@ -322,9 +398,16 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         return {
             "generated_code": fixed,
             "fix_iterations": fix_iter + 1,
+            "failure_stage": "",
+            "validation_passed": False,
+            "verification_passed": False,
+            "e2e_passed": False,
             "save_success": False,
             "save_error": "",
             "saved_to": "",
+            "explanation": {},
+            "suggested_changes": [],
+            "clarifying_questions": [],
         }
 
     async def verify_requirements(state: PipelineState) -> dict:
@@ -351,12 +434,108 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 "error": True,
             }
 
-        passed = verification.get("passed", False)
-        score = verification.get("score", 0)
-        logger.info("verify_done", passed=passed, score=score)
+        passed = bool(verification.get("passed")) or int(verification.get("score", 0) or 0) >= 70
+        diagnostics_updated = dict(diagnostics)
+        diagnostics_updated["verification_summary"] = verification.get("summary", "")
+        diagnostics_updated["verification_checked"] = not verification.get("error", False)
+        diagnostics_updated["verification_passed"] = passed
+
+        logger.info("verify_done", passed=passed, score=verification.get("score", 0))
         return {
             "verification": verification,
-            "verification_passed": passed or score >= 70,
+            "verification_passed": passed,
+            "failure_stage": "" if (passed or verification.get("error")) else "requirements",
+            "diagnostics": diagnostics_updated,
+        }
+
+    async def generate_e2e_suite(state: PipelineState) -> dict:
+        code = state.get("generated_code", "")
+        if not code.strip():
+            return {
+                "e2e_suite": {},
+                "e2e_results": {
+                    "passed": False,
+                    "summary": "E2E suite skipped: empty code.",
+                    "cases": [],
+                    "failed_cases": [],
+                    "retryable": False,
+                    "error": True,
+                },
+                "e2e_passed": False,
+                "failure_stage": "e2e",
+            }
+
+        base_prompt = state.get("base_prompt", "") or state.get("user_input", "")
+        try:
+            suite = await async_generate_e2e_suite(
+                llm=llm,
+                prompt=base_prompt,
+                code=code,
+                target_path=state.get("target_path", ""),
+            )
+        except Exception as exc:
+            logger.warning("e2e_suite_generation_failed", error=str(exc))
+            return {
+                "e2e_suite": {},
+                "e2e_results": {
+                    "passed": False,
+                    "summary": f"E2E suite generation failed: {exc}",
+                    "cases": [],
+                    "failed_cases": [],
+                    "retryable": False,
+                    "error": True,
+                },
+                "e2e_passed": False,
+                "failure_stage": "e2e",
+            }
+
+        logger.info("e2e_suite_generated", cases=len(suite.get("tests", [])))
+        return {
+            "e2e_suite": suite,
+            "e2e_results": {},
+            "e2e_passed": False,
+        }
+
+    async def run_e2e_suite(state: PipelineState) -> dict:
+        code = state.get("generated_code", "")
+        suite = state.get("e2e_suite", {})
+        if not code.strip():
+            return {
+                "e2e_results": {
+                    "passed": False,
+                    "summary": "E2E execution skipped: empty code.",
+                    "cases": [],
+                    "failed_cases": [],
+                    "retryable": False,
+                },
+                "e2e_passed": False,
+                "failure_stage": "e2e",
+            }
+        if not suite:
+            return {
+                "e2e_results": {
+                    "passed": False,
+                    "summary": "E2E execution skipped: suite is missing.",
+                    "cases": [],
+                    "failed_cases": [],
+                    "retryable": False,
+                },
+                "e2e_passed": False,
+                "failure_stage": "e2e",
+            }
+
+        results = await async_run_e2e_suite(code, suite)
+        passed = bool(results.get("passed", False))
+        logger.info(
+            "e2e_done",
+            passed=passed,
+            cases=len(results.get("cases", [])),
+            failed=len(results.get("failed_cases", [])),
+        )
+        return {
+            "e2e_results": results,
+            "e2e_passed": passed,
+            "failure_stage": "" if passed else "e2e",
         }
 
     async def save_code(state: PipelineState) -> dict:
@@ -386,6 +565,55 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             "saved_to": target_path,
         }
 
+    async def explain_solution(state: PipelineState) -> dict:
+        code = state.get("generated_code", "").strip()
+        if not code:
+            return {"explanation": {}, "suggested_changes": [], "clarifying_questions": []}
+
+        diagnostics = state.get("diagnostics", {})
+        verification = state.get("verification", {})
+        e2e_results = state.get("e2e_results", {})
+        base_prompt = state.get("base_prompt", "") or state.get("user_input", "")
+
+        explain_prompt = (
+            f"User request:\n{base_prompt}\n\n"
+            f"Runtime validation summary:\n"
+            f"- run_error: {diagnostics.get('run_error', 'none')}\n"
+            f"- luacheck_error: {diagnostics.get('luacheck_error', 'none')}\n"
+            f"- verification_summary: {verification.get('summary', 'none')}\n"
+            f"- e2e_summary: {e2e_results.get('summary', 'none')}\n\n"
+            "Code:\n"
+            f"{code}\n\n"
+            "Respond with JSON only."
+        )
+
+        try:
+            raw = await llm.generate_json(explain_prompt, system=_EXPLAIN_SYSTEM, temperature=0.1)
+        except Exception as exc:
+            logger.warning("explain_failed", error=str(exc))
+            raw = {}
+
+        explanation = {
+            "summary": str(raw.get("summary", "")).strip(),
+            "what_is_in_code": _normalize_string_list(raw.get("what_is_in_code"), limit=5),
+            "how_it_works": _normalize_string_list(raw.get("how_it_works"), limit=5),
+        }
+        suggested_changes = _normalize_string_list(raw.get("suggested_changes"), limit=3)
+        clarifying_questions = _normalize_string_list(raw.get("clarifying_questions"), limit=3)
+
+        if not explanation["summary"]:
+            explanation["summary"] = "Код сохранен и готов к следующей итерации."
+        if not explanation["what_is_in_code"]:
+            explanation["what_is_in_code"] = ["Основная логика задачи реализована в одном Lua-файле."]
+        if not explanation["how_it_works"]:
+            explanation["how_it_works"] = ["Логика выполняется последовательно через функции и условия Lua."]
+
+        return {
+            "explanation": explanation,
+            "suggested_changes": suggested_changes,
+            "clarifying_questions": clarifying_questions,
+        }
+
     async def answer_question(state: PipelineState) -> dict:
         user_input = state["user_input"]
         existing = state.get("current_code", "")
@@ -405,11 +633,15 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
 
     async def prepare_response(state: PipelineState) -> dict:
         code = state.get("generated_code", "")
-        passed = state.get("validation_passed", False)
         diagnostics = state.get("diagnostics", {})
         verification = state.get("verification", {})
+        e2e_results = state.get("e2e_results", {})
         saved_to = state.get("saved_to", "")
         save_error = state.get("save_error", "")
+        explanation = state.get("explanation", {})
+        suggested_changes = state.get("suggested_changes", [])
+        clarifying_questions = state.get("clarifying_questions", [])
+        failure_stage = state.get("failure_stage", "")
 
         if not code.strip():
             return {
@@ -418,21 +650,35 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             }
 
         lines: list[str] = []
-        if passed:
-            if verification.get("error"):
-                lines.append("Код прошёл локальную валидацию, но LLM-проверка требований была недоступна.\n")
-            elif verification.get("passed", False) or verification.get("score", 0) >= 70:
-                lines.append("Код сгенерирован и прошёл валидацию.\n")
-            else:
-                lines.append("Код сгенерирован. Локальная валидация пройдена, но проверка требований частичная.\n")
+        if state.get("save_success", False) and state.get("e2e_passed", False):
+            lines.append("Код сгенерирован, прошел проверки и сохранен.\n")
         else:
-            lines.append("Код сгенерирован, но содержит предупреждения/ошибки. Файл не был сохранён.\n")
-            run_err = diagnostics.get("run_error", "")
-            luacheck_err = diagnostics.get("luacheck_error", "")
-            if run_err:
-                lines.append(f"Ошибка выполнения: {run_err}\n")
-            if luacheck_err:
-                lines.append(f"Luacheck: {luacheck_err}\n")
+            lines.append("Код подготовлен, но финальные условия сохранения не выполнены.\n")
+            if failure_stage:
+                lines.append(f"Этап с проблемой: {failure_stage}\n")
+
+        if diagnostics.get("run_error"):
+            lines.append(f"Runtime error: {diagnostics.get('run_error')}\n")
+        if diagnostics.get("luacheck_error"):
+            lines.append(f"Luacheck error: {diagnostics.get('luacheck_error')}\n")
+
+        verification_summary = str(verification.get("summary", "")).strip()
+        if verification_summary:
+            lines.append(f"Проверка требований: {verification_summary}\n")
+
+        e2e_summary = str(e2e_results.get("summary", "")).strip()
+        if e2e_summary:
+            lines.append(f"E2E: {e2e_summary}\n")
+        failed_cases = e2e_results.get("failed_cases", [])
+        if isinstance(failed_cases, list) and failed_cases:
+            lines.append("Проваленные e2e-кейсы:")
+            for case in failed_cases[:3]:
+                if not isinstance(case, dict):
+                    continue
+                name = str(case.get("name", "unnamed"))
+                reason = str(case.get("reason", "no details")).strip() or "no details"
+                lines.append(f"- {name}: {reason}")
+            lines.append("")
 
         if saved_to:
             lines.append(f"Сохранено в: `{saved_to}`\n")
@@ -440,9 +686,43 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             lines.append(f"Сохранение не удалось: {save_error}\n")
 
         lines.append(f"```lua\n{code}\n```")
+
         run_output = diagnostics.get("run_output", "").strip()
-        if run_output and passed:
+        if run_output:
             lines.append(f"\nВывод программы:\n```\n{run_output}\n```")
+
+        if isinstance(explanation, dict):
+            summary = str(explanation.get("summary", "")).strip()
+            what_is_in_code = explanation.get("what_is_in_code", [])
+            how_it_works = explanation.get("how_it_works", [])
+            if summary:
+                lines.append(f"\nЧто сделано: {summary}")
+            if isinstance(what_is_in_code, list) and what_is_in_code:
+                lines.append("\nЧто есть в коде:")
+                for item in what_is_in_code[:5]:
+                    item_text = str(item).strip()
+                    if item_text:
+                        lines.append(f"- {item_text}")
+            if isinstance(how_it_works, list) and how_it_works:
+                lines.append("\nКак это работает:")
+                for item in how_it_works[:5]:
+                    item_text = str(item).strip()
+                    if item_text:
+                        lines.append(f"- {item_text}")
+
+        if isinstance(suggested_changes, list) and suggested_changes:
+            lines.append("\nЧто можно улучшить:")
+            for index, suggestion in enumerate(suggested_changes[:3], 1):
+                suggestion_text = str(suggestion).strip()
+                if suggestion_text:
+                    lines.append(f"{index}. {suggestion_text}")
+
+        if isinstance(clarifying_questions, list) and clarifying_questions:
+            lines.append("\nУточняющие вопросы:")
+            for index, question in enumerate(clarifying_questions[:3], 1):
+                question_text = str(question).strip()
+                if question_text:
+                    lines.append(f"{index}. {question_text}")
 
         return {
             "response": "\n".join(lines),
@@ -458,7 +738,10 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         "validate_code": validate_code,
         "fix_code": fix_code,
         "verify_requirements": verify_requirements,
+        "generate_e2e_suite": generate_e2e_suite,
+        "run_e2e_suite": run_e2e_suite,
         "save_code": save_code,
+        "explain_solution": explain_solution,
         "answer_question": answer_question,
         "prepare_response": prepare_response,
     }

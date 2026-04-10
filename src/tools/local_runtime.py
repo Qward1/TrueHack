@@ -247,3 +247,47 @@ def run_lua_file(
         "stdout": decode_process_bytes(stdout),
         "stderr": decode_process_bytes(stderr),
     }
+
+
+def run_lua_file_with_input(
+    lua_file: str,
+    stdin_text: str,
+    lua_bin: str = DEFAULT_LUA_BIN,
+    timeout_seconds: float | None = None,
+) -> LuaRunResult:
+    """Run a Lua file with predefined stdin text and capture its output."""
+    if not os.path.exists(lua_file):
+        raise FileNotFoundError(f"Lua file not found: {lua_file}")
+
+    command = [lua_bin, to_cmd_path(lua_file)]
+    input_bytes = (stdin_text or "").encode("utf-8")
+
+    try:
+        try:
+            completed = subprocess.run(
+                command,
+                input=input_bytes,
+                capture_output=True,
+                text=False,
+                timeout=timeout_seconds,
+                check=False,
+            )
+            timed_out = False
+            returncode = completed.returncode
+            stdout = completed.stdout
+            stderr = completed.stderr
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            returncode = 0
+            stdout = exc.stdout or b""
+            stderr = exc.stderr or b""
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Lua interpreter '{lua_bin}' not found or unavailable.") from exc
+
+    return {
+        "success": timed_out or returncode == 0,
+        "timed_out": timed_out,
+        "returncode": returncode,
+        "stdout": decode_process_bytes(stdout),
+        "stderr": decode_process_bytes(stderr),
+    }

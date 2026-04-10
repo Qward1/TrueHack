@@ -1,67 +1,76 @@
-# "Общий контекст проекта"
+# Общий контекст проекта
 
 # LocalScript / Lua Console Builder
 
 ## Canonical runtime
 - Единственный пользовательский entry point: `app.py`
-- `app.py` поднимает локальный web UI, хранит чаты в SQLite и на каждый user turn вызывает `PipelineEngine.process_message()`
-- `src/graph/` содержит единственный orchestration pipeline
-- `src/core/llm.py` — единый async provider для локального OpenAI-compatible runtime
+- Веб-рантайм хранит чаты в SQLite и на каждый turn вызывает `PipelineEngine.process_message()`
+- Единственный orchestration path: `src/graph/*`
+- Единый LLM abstraction layer: `src/core/llm.py`
 
-## Pipeline
-`resolve_target -> route_intent -> generate|refine|answer -> validate -> verify|fix -> save -> respond`
+## Канонический pipeline
+`resolve_target -> route_intent -> generate|refine|answer -> validate -> verify -> generate_e2e_suite -> run_e2e_suite -> save -> explain_solution -> respond`
 
-### Что делает pipeline
-- `resolve_target` выбирает активный Lua target:
-  - explicit `.lua` path из prompt;
-  - директорию из prompt, внутри которой создается slug-based папка и `.lua` файл;
-  - уже активный target текущего чата;
-  - fallback target по slug, если это новая генерация без пути
-- `route_intent` различает create/change/question-like сценарии
-- `generate_code` делает первичную генерацию Lua
-- `refine_code` меняет существующий Lua-файл, сохраняя функции, если их не просили удалить
-- `validate_code` запускает локальные проверки через `lua` и `luacheck`
-- `fix_code` делает LLM-driven fix loop по диагностике
-- `verify_requirements` проверяет соответствие исходной задаче через тот же LLM provider
-- `save_code` пишет итоговый Lua-файл на диск только после успешного прохода по “хорошей” ветке
-- `prepare_response` собирает ответ пользователю и показывает статус/путь сохранения
+### Поведение pipeline
+- `resolve_target`:
+  - explicit `.lua` path;
+  - директория -> slug-папка + slug.lua;
+  - active target текущего чата;
+  - fallback target для нового create turn без пути.
+- `generate_code` / `refine_code` возвращают полный Lua-файл.
+- `validate_code` запускает локальную диагностику (`lua` + `luacheck`).
+- `fix_code` выполняет итеративные правки по стадии ошибки:
+  - validation;
+  - requirements;
+  - e2e.
+- `verify_requirements` — семантическая LLM-проверка соответствия исходному запросу.
+- `generate_e2e_suite` генерирует e2e-набор (JSON) через того же LLM provider.
+- `run_e2e_suite` исполняет e2e-кейсы на временном Lua-файле.
+- `save_code` выполняется только после успешного `run_e2e_suite`.
+- `explain_solution` формирует:
+  - краткое объяснение;
+  - что есть в коде;
+  - как работает;
+  - 1-3 предложения улучшений;
+  - 1-3 уточняющих вопроса.
+- `prepare_response` собирает финальный ответ для чата с кодом, статусами проверок и объяснением.
+
+## Chat-level поведение
+- `app.py` сохраняет:
+  - `target_path`, `workspace_root`, `current_code`, `base_prompt`, `change_requests`;
+  - `last_suggested_changes`, `last_clarifying_questions`, `last_e2e_summary`.
+- Follow-up поддерживает ссылки на предложения:
+  - пример: `примени предложение 1`;
+  - система разворачивает это в явный change request и запускает следующий refine-cycle.
 
 ## Ownership по модулям
-- `app.py`
-  - web UI
-  - chat store
-  - командный слой `/new`, `/edit`, `/retry`, `/code`, `/path`, `/status`, `/prompt`
-  - хранение active target path и workspace root в chat state
-- `src/core/llm.py`
-  - единая конфигурация `model/base_url/timeout`
-  - все LLM-вызовы идут через этот provider
-- `src/graph/`
-  - узлы pipeline и edge conditions
-  - единственная поддерживаемая orchestration логика
-- `src/tools/target_tools.py`
-  - разбор путей из prompt
-  - slug generation
-  - target resolution
-  - чтение/сохранение Lua-файла
-- `src/tools/lua_tools.py`
-  - нормализация Lua output
-  - локальная диагностика
-  - verification helper
-  - preservation guard
-- `src/tools/local_runtime.py`
-  - низкоуровневые wrappers для `lua` и `luacheck`
+- `app.py`:
+  - web UI;
+  - chat persistence;
+  - команды `/new`, `/edit`, `/retry`, `/code`, `/path`, `/status`, `/prompt`;
+  - state bridge между UI и pipeline.
+- `src/core/llm.py`:
+  - конфигурация local OpenAI-compatible endpoint;
+  - единые методы generate/chat/json.
+- `src/graph/`:
+  - состояние, узлы, условия переходов и компоновка pipeline.
+- `src/tools/target_tools.py`:
+  - path parsing/resolution и сохранение Lua-файла.
+- `src/tools/lua_tools.py`:
+  - нормализация Lua-ответа;
+  - локальная диагностика;
+  - verification helper;
+  - e2e suite generation/execution.
+- `src/tools/local_runtime.py`:
+  - низкоуровневые wrappers для `lua` и `luacheck`;
+  - запуск с stdin для e2e.
 
-## Product boundaries
-- Продуктовый scope — только Lua-oriented сценарии
-- Generic README/text artifact generation удалена из runtime
-- Generic file editor и второй orchestration path удалены
-- `main.py` больше не является рабочим entry point
-
-## Runtime dependencies
-- Windows / Python 3.12+
-- локальный OpenAI-compatible endpoint по умолчанию: `http://127.0.0.1:1234/v1`
+## Runtime зависимости
+- Python 3.12+
 - `lua` в PATH
 - `luacheck` в PATH
+- локальный OpenAI-compatible endpoint (по умолчанию `http://127.0.0.1:1234/v1`)
 
-## Important note
-- Текущий canonical runtime локальный и единый, но это ещё не финальный Ollama-target для хакатона
+## Важно
+- Ollama migration под финальные требования хакатона пока не завершен.
+- Текущий runtime локальный и единый, но это dev-state, а не финальный Ollama-target.

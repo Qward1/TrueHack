@@ -1,4 +1,4 @@
-# "Бизнес-сценарии и проверки"
+# Бизнес-сценарии и проверки
 
 # Test scenarios
 
@@ -6,90 +6,89 @@
 ### Prompt
 `Создай Lua-скрипт калькулятора с консольным вводом`
 
-### Expected path behavior
-- если в чате ещё нет active target, система строит fallback slug target в текущем workspace root
-
 ### Expected pipeline
-`resolve_target -> route_intent(create) -> generate -> validate -> verify -> save -> respond`
+`resolve_target -> route_intent(create) -> generate -> validate -> verify -> generate_e2e_suite -> run_e2e_suite -> save -> explain_solution -> respond`
 
 ### Pass criteria
-- код сгенерирован
-- файл сохранён на диск
-- `/path` показывает fallback target
+- fallback target создан в workspace
+- код сохранен на диск
+- в ответе есть код, e2e summary и объяснение
 
 ## 2. New Lua in explicit directory
 ### Prompt
 `Создай текстовую игру в папке C:\Work\LuaProjects`
 
 ### Expected path behavior
-- система создаёт slug-based подпапку внутри `C:\Work\LuaProjects`
-- внутри неё создаётся итоговый `.lua` файл
-
-### Expected pipeline
-`resolve_target(directory) -> route_intent(create) -> generate -> validate -> verify -> save -> respond`
+- создается `C:\Work\LuaProjects\<slug>\<slug>.lua`
 
 ### Pass criteria
-- нужная директория создана
-- итоговый `.lua` файл создан внутри неё
-- ответ показывает фактический путь сохранения
+- директория создана
+- файл создан и сохранен только после e2e pass
 
-## 3. Create or update explicit Lua file by path
+## 3. Create/update explicit Lua file by path
 ### Prompt
 `Сделай скрипт заметок в C:\Work\LuaProjects\notes_app.lua`
 
-### Expected path behavior
-- система использует именно указанный `.lua` path
-- если файл уже существует, его содержимое доступно для refine/inspect flow
-
-### Expected pipeline
-`resolve_target(file) -> route_intent(create|change) -> generate|refine -> validate -> verify -> save -> respond`
-
 ### Pass criteria
-- запись идёт именно в named file
-- `/path` возвращает этот же путь
+- используется именно указанный `.lua` path
+- follow-up turn сохраняет изменения в тот же файл
 
 ## 4. Refine active target in same chat
-### Prompt
+### Prompt sequence
 1. `Создай калькулятор в C:\Work\LuaProjects\calc.lua`
 2. `Добавь историю последних операций`
 
-### Expected path behavior
-- второй prompt переиспользует active target из того же чата
+### Expected behavior
+- turn 2 переиспользует active target
+- проходит полный цикл validate/verify/e2e
 
-### Expected pipeline
-- turn 1: `resolve_target -> create -> generate -> validate -> verify -> save -> respond`
-- turn 2: `resolve_target(active target) -> change -> refine -> validate -> verify|fix -> save -> respond`
+## 5. Validation failure -> fix loop
+### Prompt
+`Создай интерактивный Lua-скрипт с обработкой ввода`
 
 ### Pass criteria
-- второй turn не теряет active target
-- изменения сохраняются в тот же файл
+- при провале валидации запускается минимум одна итерация `fix_code`
+- после исчерпания лимита итераций файл не сохраняется
 
-## 5. Failed validation triggers fix loop
+## 6. Verification failure -> fix loop
 ### Prompt
-`Создай интерактивный Lua-скрипт с несколькими функциями и обработкой ввода`
-
-### Expected pipeline
-`resolve_target -> create -> generate -> validate(fail) -> fix -> validate -> ...`
+`Сделай калькулятор с историей и экспортом истории в файл`
 
 ### Pass criteria
-- минимум одна fix iteration происходит при диагностике ошибки
-- если валидация в итоге не пройдена, файл не записывается как финальный результат
-- пользователь получает diagnostics в ответе
+- если verification вернул недостающие требования, pipeline уходит в fix-loop
+- после фикса снова идут validate -> verify -> e2e
 
-## 6. Question or inspect without file rewrite
+## 7. E2E failure -> fix loop
 ### Prompt
+`Сделай CLI-скрипт, который принимает имя и печатает приветствие`
+
+### Pass criteria
+- e2e suite генерируется агентом
+- при провале e2e pipeline идет в fix-loop
+- сохранение блокируется до успешного e2e pass
+
+## 8. Explanation and follow-up suggestions
+### Prompt sequence
+1. `Создай todo-менеджер в C:\Work\LuaProjects\todo.lua`
+2. `Примени предложение 1`
+
+### Pass criteria
+- в turn 1 ответ содержит:
+  - explanation summary;
+  - список suggested changes;
+  - clarifying questions
+- в turn 2 система распознает ссылку на предложение и применяет правку в refine-cycle
+
+## 9. Question/inspect without file rewrite
+### Prompt sequence
 1. `Создай игру в C:\Work\LuaProjects\game.lua`
 2. `Объясни, как работает этот код`
 
-### Expected pipeline
-- turn 1: create/save flow
-- turn 2: `resolve_target(active target) -> route_intent(inspect|question) -> answer -> end`
-
 ### Pass criteria
-- второй turn возвращает текстовый ответ
+- turn 2 идет по answer path
 - файл не перезаписывается
 
-## 7. Command-level checks
+## 10. Command checks
 ### Commands
 - `/path`
 - `/status`
@@ -98,8 +97,6 @@
 - `/retry`
 
 ### Pass criteria
-- `/path` показывает active target и workspace
-- `/status` показывает current task, target и last save
-- `/code` показывает текущий Lua-код
-- `/prompt` показывает base prompt и accumulated change requests
-- `/retry` повторно гоняет pipeline для текущего кода
+- `/status` показывает last e2e summary и количество предложений/вопросов
+- `/prompt` показывает базовый prompt, правки и последние предложения
+- `/retry` повторно запускает полный цикл с e2e gate
