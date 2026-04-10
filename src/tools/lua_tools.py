@@ -21,7 +21,7 @@ from src.tools.local_runtime import (
 
 logger = structlog.get_logger(__name__)
 
-DEFAULT_LUA_BIN = "lua"
+DEFAULT_LUA_BIN = os.getenv("LUA_BIN", "lua55")
 DEFAULT_STARTUP_TIMEOUT = 3.0
 DEFAULT_E2E_TIMEOUT = 8.0
 DEFAULT_MAX_E2E_CASES = 3
