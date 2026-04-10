@@ -1,14 +1,14 @@
 # LocalScript / Lua Console Builder
 
-Локальный web runtime для генерации, доработки, валидации и e2e-проверки Lua-скриптов.
+Локальный web runtime для генерации, доработки, валидации и сохранения Lua-скриптов.
 
 ## Что делает проект
 - принимает задачу на естественном языке;
 - генерирует или дорабатывает Lua-код;
-- запускает локальные проверки (`lua` + `luacheck`);
+- запускает локальную проверку через `lua`;
 - делает fix loop при ошибках;
-- генерирует e2e-сценарии агентом и исполняет их;
-- сохраняет код в целевой `.lua` файл только после e2e pass;
+- выполняет LLM-проверку соответствия исходному запросу;
+- сохраняет код в целевой `.lua` файл после успешной локальной валидации и проверки требований;
 - возвращает:
   - код;
   - путь сохранения;
@@ -27,7 +27,6 @@ python app.py
 - Python 3.12+
 - локальный OpenAI-compatible LLM runtime
 - `lua` в PATH
-- `luacheck` в PATH
 
 ## Установка
 ```powershell
@@ -76,6 +75,8 @@ python app.py --url http://127.0.0.1:1234/v1 --model local-model
 C:\Work\LuaProjects\<slug>\<slug>.lua
 ```
 
+Если в указанном пути есть невалидные для Windows символы в имени папки или файла, runtime автоматически санитизирует их перед сохранением.
+
 ### 3. Follow-up в том же чате
 После первого turn можно писать:
 
@@ -89,17 +90,17 @@ C:\Work\LuaProjects\<slug>\<slug>.lua
 Основная ветка:
 
 ```text
-resolve_target -> route_intent -> generate/refine -> validate -> verify -> generate_e2e_suite -> run_e2e_suite -> save -> explain_solution -> respond
+resolve_target -> route_intent -> generate/refine -> validate -> verify -> save -> explain_solution -> respond
 ```
 
-Если проваливается validation/verify/e2e:
+Если проваливается validation/verify:
 - запускается `fix_code`;
 - затем pipeline повторяет цикл проверок;
 - если лимит fix-итераций исчерпан, файл не сохраняется.
 
 ## Что видно в ответе
 - итоговый Lua-код;
-- статус local validation / verification / e2e;
+- статус local validation / verification;
 - путь сохранения;
 - объяснение (что есть в коде и как работает);
 - предложения улучшений;
@@ -117,7 +118,7 @@ resolve_target -> route_intent -> generate/refine -> validate -> verify -> gener
 ## Команды UI
 - `/new <задача>` — новый проект в текущем чате
 - `/edit <изменение>` — доработать текущий код
-- `/retry` — повторить полный цикл проверок (включая e2e)
+- `/retry` — повторить полный цикл проверок
 - `/code` — показать текущий Lua-код
 - `/path` — показать active Lua target и workspace
 - `/status` — показать статус чата
@@ -131,4 +132,7 @@ resolve_target -> route_intent -> generate/refine -> validate -> verify -> gener
 
 Важно:
 - это еще не финальная Ollama-конфигурация для хакатона;
+- `e2e`-агент и e2e-gate сейчас временно отключены;
+- `luacheck` сейчас не используется в каноническом runtime;
+- naming для auto-created folder/file и title чата строится из очищенного prompt и санитизируется под Windows;
 - README фиксирует текущее состояние кода, а не желаемое будущее.

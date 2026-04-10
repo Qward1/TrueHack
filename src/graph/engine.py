@@ -63,7 +63,7 @@ class PipelineEngine:
             "verification": {},
             "verification_passed": False,
             "e2e_suite": {},
-            "e2e_results": {},
+            "e2e_results": {"summary": "E2E-проверка временно отключена."},
             "e2e_passed": False,
             "save_success": False,
             "save_error": "",
@@ -76,7 +76,8 @@ class PipelineEngine:
         }
 
         logger.info("pipeline_start", chat_id=chat_id, msg_len=len(user_input))
-        result: PipelineState = await self._graph.ainvoke(initial_state)
+        graph_config = {"recursion_limit": 80}
+        result: PipelineState = await self._graph.ainvoke(initial_state, config=graph_config)
 
         output = {
             "response": result.get("response", ""),
@@ -106,7 +107,6 @@ class PipelineEngine:
             intent=output["intent"],
             response_type=output["response_type"],
             validation_passed=output["validation_passed"],
-            e2e_passed=output["e2e_results"].get("passed", False),
             target_path=output["target_path"],
             save_success=output["save_success"],
         )

@@ -14,7 +14,6 @@ import structlog
 
 from src.core.llm import LLMProvider
 from src.tools.local_runtime import (
-    check_lua_file,
     run_lua_file,
     run_lua_file_with_input,
 )
@@ -22,7 +21,6 @@ from src.tools.local_runtime import (
 logger = structlog.get_logger(__name__)
 
 DEFAULT_LUA_BIN = "lua"
-DEFAULT_LUACHECK_BIN = "luacheck"
 DEFAULT_STARTUP_TIMEOUT = 3.0
 DEFAULT_E2E_TIMEOUT = 8.0
 DEFAULT_MAX_E2E_CASES = 3
@@ -176,15 +174,11 @@ def infer_program_mode(lua_code: str) -> str:
 
 def is_tooling_problem(diagnostics: dict[str, Any]) -> bool:
     """Detect environment/tooling failures that are not fixable in Lua."""
-    combined = f"{diagnostics.get('run_error', '')}\n{diagnostics.get('luacheck_error', '')}".lower()
+    combined = str(diagnostics.get("run_error", "")).lower()
     tooling_markers = (
         "not found",
         "не является внутренней",
         "lua interpreter",
-        "luacheck exited with code 9009",
-        "module 'luacheck.main' not found",
-        "missing argument 'files'",
-        "usage: luacheck",
         "unavailable in the current environment",
     )
     return any(marker in combined for marker in tooling_markers) and "unexpected symbol" not in combined
@@ -199,7 +193,6 @@ def classify_failure_kind(diagnostics: dict[str, Any]) -> str:
     combined = "\n".join(
         part for part in (
             diagnostics.get("run_error", ""),
-            diagnostics.get("luacheck_error", ""),
             diagnostics.get("verification_summary", ""),
         )
         if part
@@ -213,24 +206,18 @@ def classify_failure_kind(diagnostics: dict[str, Any]) -> str:
         return "requirements"
     if diagnostics.get("run_error"):
         return "runtime"
-    if diagnostics.get("luacheck_error"):
-        return "lint"
     return "unknown"
 
 
 def _sync_run_diagnostics(
     lua_file: str,
     lua_bin: str = DEFAULT_LUA_BIN,
-    luacheck_bin: str = DEFAULT_LUACHECK_BIN,
     startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
 ) -> dict[str, Any]:
-    """Run Lua + luacheck and return a diagnostics dict for the graph."""
+    """Run Lua runtime validation and return a diagnostics dict for the graph."""
     run_error = ""
     run_warning = ""
-    luacheck_error = ""
-    luacheck_warning = ""
     run_output = ""
-    luacheck_output = ""
     started_ok = False
     timed_out = False
     program_mode = "batch"
@@ -273,37 +260,17 @@ def _sync_run_diagnostics(
     except (FileNotFoundError, RuntimeError) as exc:
         run_error = repair_mojibake(str(exc))
 
-    try:
-        luacheck_result = check_lua_file(lua_file, luacheck_bin)
-        raw_luacheck_output = merge_process_output(
-            luacheck_result["stdout"],
-            luacheck_result["stderr"],
-        )
-        luacheck_output = repair_mojibake(raw_luacheck_output)
-        if not luacheck_result["success"]:
-            luacheck_error = (
-                luacheck_output or f"luacheck exited with code {luacheck_result['returncode']}."
-            )
-        elif contains_mojibake(raw_luacheck_output) or contains_mojibake(luacheck_output):
-            luacheck_warning = (
-                "Luacheck output looks garbled in Windows cmd. "
-                "Review console encoding if this keeps happening.\n"
-                f"{luacheck_output}"
-            )
-    except (FileNotFoundError, RuntimeError) as exc:
-        luacheck_error = repair_mojibake(str(exc))
-
     diagnostics = {
-        "success": started_ok or (not run_error and not luacheck_error),
+        "success": started_ok or not run_error,
         "started_ok": started_ok,
         "timed_out": timed_out,
         "program_mode": program_mode,
         "run_output": run_output,
         "run_error": run_error,
         "run_warning": run_warning,
-        "luacheck_output": luacheck_output,
-        "luacheck_error": luacheck_error,
-        "luacheck_warning": luacheck_warning,
+        "luacheck_output": "",
+        "luacheck_error": "",
+        "luacheck_warning": "",
     }
     diagnostics["failure_kind"] = classify_failure_kind(diagnostics)
     return diagnostics
@@ -312,10 +279,9 @@ def _sync_run_diagnostics(
 async def async_run_diagnostics(
     lua_code: str,
     lua_bin: str = DEFAULT_LUA_BIN,
-    luacheck_bin: str = DEFAULT_LUACHECK_BIN,
     startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
 ) -> dict[str, Any]:
-    """Validate + execute Lua code and return the full diagnostics dict."""
+    """Validate by running the Lua code and return the full diagnostics dict."""
     with tempfile.NamedTemporaryFile(
         suffix=".lua",
         delete=False,
@@ -333,7 +299,6 @@ async def async_run_diagnostics(
                 _sync_run_diagnostics,
                 temp_path,
                 lua_bin,
-                luacheck_bin,
                 startup_timeout,
             ),
         )
@@ -478,21 +443,17 @@ async def async_verify_requirements(
     prompt: str,
     code: str,
     run_output: str = "",
-    luacheck_output: str = "",
 ) -> dict[str, Any]:
     """Run requirement verification using the same local LLM provider as the graph."""
     messages = [
         {"role": "system", "content": DEFAULT_VERIFICATION_SYSTEM_PROMPT},
         {"role": "user", "content": f"User request:\n{prompt}"},
     ]
-    if run_output.strip() or luacheck_output.strip():
+    if run_output.strip():
         messages.append(
             {
                 "role": "user",
-                "content": (
-                    f"Runtime output:\n{run_output or 'none'}\n\n"
-                    f"Luacheck output:\n{luacheck_output or 'none'}"
-                ),
+                "content": f"Runtime output:\n{run_output or 'none'}",
             }
         )
     messages.extend(

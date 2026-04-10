@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ntpath
 import os
 import re
 from typing import TypedDict
@@ -155,6 +156,74 @@ CYRILLIC_TO_LATIN = {
     "ю": "yu",
     "я": "ya",
 }
+WINDOWS_INVALID_COMPONENT_PATTERN = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+}
+GENERIC_ACTION_TOKENS = {
+    "add",
+    "change",
+    "create",
+    "fix",
+    "generate",
+    "implement",
+    "improve",
+    "refactor",
+    "refine",
+    "update",
+    "uluchshi",
+    "uluchshit",
+    "izmeni",
+    "izmenit",
+    "dobav",
+    "dobavit",
+    "ispravi",
+    "ispravit",
+}
+CHAT_TITLE_ACTION_PREFIX = re.compile(
+    r"^(?:создай|сделай|напиши|сгенерируй|улучши|доработай|исправь|добавь|реализуй|"
+    r"create|make|build|generate|improve|refine|fix|add|implement|update)\b[\s:,\-.]*",
+    re.IGNORECASE,
+)
+CHAT_TITLE_TRAILING_FILLER = {
+    "в",
+    "во",
+    "на",
+    "по",
+    "для",
+    "and",
+    "at",
+    "for",
+    "in",
+    "to",
+    "with",
+}
+LOCATION_CLAUSE_PATTERN = re.compile(
+    r"\b(?:в\s+папке|в\s+папку|в\s+директории|в\s+директорию|в\s+каталоге|в\s+каталог|"
+    r"по\s+пути|save\s+to|save\s+in|save\s+under|in\s+folder|in\s+directory|under\s+path)\b.*$",
+    re.IGNORECASE,
+)
 
 
 def clean_path_candidate(candidate: str) -> str:
@@ -263,22 +332,131 @@ def _strip_requested_paths(prompt: str) -> str:
     return cleaned
 
 
+def _strip_location_clause(prompt: str) -> str:
+    """Remove trailing location phrases after path candidates are stripped."""
+    return LOCATION_CLAUSE_PATTERN.sub("", prompt).strip()
+
+
+def sanitize_windows_component(
+    component: str,
+    *,
+    fallback: str = "item",
+    lowercase: bool = False,
+) -> str:
+    """Normalize a single Windows path segment into a safe filesystem name."""
+    cleaned = WINDOWS_INVALID_COMPONENT_PATTERN.sub("_", component.strip())
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    cleaned = re.sub(r"[_-]{2,}", "_", cleaned)
+    cleaned = cleaned.strip(" ._-")
+
+    if lowercase:
+        cleaned = cleaned.lower()
+
+    if not cleaned:
+        cleaned = fallback.lower() if lowercase else fallback
+
+    root, extension = os.path.splitext(cleaned)
+    root = root.rstrip(" .")
+    extension = extension.rstrip(" .")
+    if not root:
+        root = fallback.lower() if lowercase else fallback
+    if root.upper() in WINDOWS_RESERVED_NAMES:
+        root = f"{root}_item"
+
+    normalized = f"{root}{extension}"
+    normalized = normalized.strip(" .")
+    return normalized[:80].rstrip(" .") or (fallback.lower() if lowercase else fallback)
+
+
+def sanitize_creation_path(path: str) -> str:
+    """Sanitize a user-provided Windows-style path before creating folders/files."""
+    if not path:
+        return path
+
+    drive, tail = ntpath.splitdrive(path)
+    is_windows_like = bool(drive) or "\\" in path
+    if not is_windows_like and os.name != "nt":
+        return path
+
+    absolute = tail.startswith(("\\", "/"))
+    parts = [part for part in re.split(r"[\\/]+", tail) if part]
+    sanitized_parts: list[str] = []
+    for index, part in enumerate(parts):
+        if part in (".", ".."):
+            sanitized_parts.append(part)
+            continue
+        fallback = "folder" if index < len(parts) - 1 else "item"
+        sanitized_parts.append(sanitize_windows_component(part, fallback=fallback))
+
+    rebuilt = "\\".join(sanitized_parts)
+    if drive:
+        return f"{drive}\\{rebuilt}" if rebuilt else f"{drive}\\"
+    if absolute:
+        return f"\\{rebuilt}" if rebuilt else "\\"
+    return rebuilt
+
+
+def _collect_prompt_tokens(prompt: str) -> list[str]:
+    cleaned_prompt = _strip_location_clause(_strip_requested_paths(prompt))
+    transliterated = transliterate_for_slug(cleaned_prompt)
+    raw_tokens = re.findall(r"[a-z0-9]+", transliterated)
+
+    filtered: list[str] = []
+    seen: set[str] = set()
+    for token in raw_tokens:
+        if token in SLUG_STOP_WORDS or token in GENERIC_ACTION_TOKENS:
+            continue
+        if token in {"dd", "hh", "mm", "yyyy", "yy"}:
+            continue
+        if not token.isdigit() and len(token) < 2:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        filtered.append(token)
+    return filtered
+
+
 def build_task_slug(prompt: str) -> str:
     """Build a deterministic, filesystem-friendly slug from the prompt."""
-    cleaned_prompt = _strip_requested_paths(prompt)
-    transliterated = transliterate_for_slug(cleaned_prompt)
-    tokens = re.findall(r"[a-z0-9]+", transliterated)
-    filtered = [
-        token
-        for token in tokens
-        if token.isdigit() or (len(token) > 1 and token not in SLUG_STOP_WORDS)
-    ]
-    if not filtered:
-        filtered = [token for token in tokens if token != "lua"]
+    filtered = _collect_prompt_tokens(prompt)
     if not filtered:
         return "lua_project"
-    slug = "_".join(filtered[:2]).strip("_")
-    return slug[:80].rstrip("_") or "lua_project"
+    slug = "_".join(filtered[:3]).strip("_")
+    return sanitize_windows_component(slug, fallback="lua_project", lowercase=True)
+
+
+def humanize_identifier(value: str) -> str:
+    """Convert a slug/file stem into a compact human-readable label."""
+    if not value:
+        return ""
+    normalized = re.sub(r"[_\-.]+", " ", value).strip()
+    normalized = re.sub(r"\s+", " ", normalized)
+    if not normalized:
+        return ""
+    return normalized[0].upper() + normalized[1:]
+
+
+def build_chat_title(prompt: str, target_path: str = "", fallback: str = "Новый чат") -> str:
+    """Build a compact chat title from a cleaned prompt and optional target path."""
+    cleaned_prompt = _strip_location_clause(_strip_requested_paths(prompt))
+    single_line = " ".join(cleaned_prompt.split())
+    single_line = CHAT_TITLE_ACTION_PREFIX.sub("", single_line).strip(" -:,.")
+
+    title_tokens = single_line.split()
+    while title_tokens and title_tokens[-1].lower() in CHAT_TITLE_TRAILING_FILLER:
+        title_tokens.pop()
+    title = " ".join(title_tokens).strip(" -:,.")
+
+    if not title and target_path:
+        title = humanize_identifier(os.path.splitext(os.path.basename(target_path))[0])
+    if not title:
+        title = fallback
+    elif title:
+        title = title[0].upper() + title[1:]
+    if len(title) <= 72:
+        return title
+    return f"{title[:69].rstrip()}..."
 
 
 def resolve_lua_target(
@@ -291,7 +469,9 @@ def resolve_lua_target(
     effective_workspace = os.path.abspath(workspace_root or os.getcwd())
     explicit_candidate = extract_explicit_lua_path_candidate(prompt)
     if explicit_candidate:
-        target_path = resolve_prompt_path(explicit_candidate, effective_workspace)
+        target_path = sanitize_creation_path(
+            resolve_prompt_path(explicit_candidate, effective_workspace)
+        )
         target_directory = os.path.dirname(target_path) or effective_workspace
         return {
             "workspace_root": target_directory,
@@ -302,6 +482,7 @@ def resolve_lua_target(
 
     requested_directory = extract_requested_output_directory(prompt, effective_workspace)
     if requested_directory:
+        requested_directory = sanitize_creation_path(requested_directory)
         slug = build_task_slug(prompt)
         target_directory = os.path.join(requested_directory, slug)
         target_path = os.path.join(target_directory, f"{slug}.lua")
@@ -313,7 +494,7 @@ def resolve_lua_target(
         }
 
     if current_target_path:
-        normalized_target = os.path.abspath(current_target_path)
+        normalized_target = sanitize_creation_path(os.path.abspath(current_target_path))
         target_directory = os.path.dirname(normalized_target) or effective_workspace
         return {
             "workspace_root": target_directory,

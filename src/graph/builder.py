@@ -7,7 +7,6 @@ from langgraph.graph import END, START, StateGraph
 from src.core.llm import LLMProvider
 from src.core.state import PipelineState
 from src.graph.conditions import (
-    check_e2e,
     check_validation,
     check_verification,
     route_by_intent,
@@ -25,9 +24,7 @@ def build_graph(llm: LLMProvider):
         generate_code -> validate_code
         refine_code -> validate_code
         validate_code -> [verify_requirements | fix_code | prepare_response(force)]
-        verify_requirements -> [generate_e2e_suite | fix_code | prepare_response(force)]
-        generate_e2e_suite -> run_e2e_suite
-        run_e2e_suite -> [save_code | fix_code | prepare_response(force)]
+        verify_requirements -> [save_code | fix_code | prepare_response(force)]
         fix_code -> validate_code (loop)
         save_code -> explain_solution -> prepare_response
         answer_question -> END
@@ -68,17 +65,6 @@ def build_graph(llm: LLMProvider):
     graph.add_conditional_edges(
         "verify_requirements",
         check_verification,
-        {
-            "e2e": "generate_e2e_suite",
-            "fix": "fix_code",
-            "force_respond": "prepare_response",
-        },
-    )
-
-    graph.add_edge("generate_e2e_suite", "run_e2e_suite")
-    graph.add_conditional_edges(
-        "run_e2e_suite",
-        check_e2e,
         {
             "save": "save_code",
             "fix": "fix_code",

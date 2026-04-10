@@ -1,4 +1,4 @@
-"""Local Lua execution and luacheck helpers used by the canonical runtime."""
+"""Local Lua execution helpers plus optional luacheck wrappers."""
 
 from __future__ import annotations
 

@@ -5,9 +5,9 @@
 ## Current status
 Репозиторий работает в одном каноническом runtime (`app.py + src/graph`) и поддерживает полный цикл:
 
-`generate/refine -> local validate -> fix -> requirement verify -> generated e2e -> run e2e -> save -> explain/respond`
+`generate/refine -> local validate -> fix -> requirement verify -> save -> explain/respond`
 
-Сохранение итогового `.lua` файла происходит только после успешного e2e этапа.
+Сохранение итогового `.lua` файла происходит после успешной локальной валидации и проверки требований.
 
 ## Что работает
 - единый LangGraph pipeline без дублирующего orchestration path
@@ -15,13 +15,15 @@
   - explicit `.lua` path;
   - директория -> slug-папка + slug.lua;
   - active target в рамках чата
+  - санитизация невалидных Windows-сегментов пути перед созданием файлов и папок
 - генерация Lua-кода
 - refine существующего Lua-кода
-- локальная валидация (`lua` + `luacheck`)
+- локальная валидация через `lua`
 - fix loop по стадиям ошибок
 - LLM verification требований
-- agent-generated e2e suite (JSON)
-- запуск e2e кейсов с поддержкой `stdin`
+- улучшенный naming:
+  - более информативный slug для auto-created project folder / Lua file;
+  - очищенный title чата без сырого пути из prompt
 - post-save объяснение решения:
   - что в коде;
   - как работает;
@@ -40,6 +42,7 @@
 - migration на Ollama как финальный runtime
 - фиксация финального demo flow под жюри
 - подтверждение VRAM-лимита `<= 8 GB` на целевом конфиге
+- возврат e2e-gate после отдельного решения по нему
 - автоматизированные regression tests (пока только smoke/manual checks)
 
 ## Runtime status
@@ -52,17 +55,18 @@ README описывает канонический запуск через `app.
 Для воспроизведения нужны:
 - Python deps из `requirements.txt`
 - `lua`
-- `luacheck`
 - доступный локальный LLM endpoint
 
 ## Open risks
-- генерация e2e suite зависит от доступности/стабильности local LLM
 - эвристики path resolution пока не покрыты автоматическими тестами
-- при недоступности LLM часть шагов (generate/verify/e2e suite/explain) недоступна
+- при недоступности LLM часть шагов (generate/verify/explain) недоступна
+- без e2e-gate сохранение теперь опирается только на локальную валидацию и LLM verification
+- без `luacheck` lint-класс проблем сейчас не отлавливается отдельным шагом
+- naming эвристики остаются rule-based и могут потребовать дальнейшей подстройки под реальные prompt patterns
 
 ## Next tasks
 - перевести canonical runtime на Ollama-конфигурацию хакатона
 - добавить автотесты для:
   - target resolution;
-  - e2e gate;
+  - save gate без e2e;
   - follow-up применения предложений
