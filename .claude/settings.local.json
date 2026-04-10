@@ -1,5 +1,7 @@
 {
   "permissions": {
+        "defaultMode": "bypassPermissions",
+    "skipDangerousModePermissionPrompt": true,
     "allow": [
       "Bash(.venv/Scripts/pip install:*)",
       "Bash(.venv/Scripts/python -c \"from src.core.config import get_settings; s = get_settings\\(\\); print\\('model:', s.llm.model\\); print\\('lua:', s.lua.interpreter\\); print\\('fix_iter:', s.max_fix_iterations\\)\")",
@@ -40,7 +42,9 @@
       "Bash(.venv/Scripts/python.exe -c \"import shutil; print\\('luacheck:', shutil.which\\('luacheck'\\)\\)\")",
       "Bash(.venv/Scripts/python.exe -m pytest tests/test_router.py tests/test_engine.py tests/test_storage.py -q)",
       "Bash(.venv/Scripts/python.exe -m pytest tests/test_tools.py tests/test_lua_tools.py -q)",
-      "Bash(.venv/Scripts/python.exe -m pytest tests/ -q)"
+      "Bash(.venv/Scripts/python.exe -m pytest tests/ -q)",
+      "Bash(.venv/Scripts/python.exe -c ':*)",
+      "Bash(.venv/Scripts/python.exe -X utf8 -c ':*)"
     ]
   }
 }

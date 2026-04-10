@@ -63,3 +63,58 @@ def extract_lua_code(response: str) -> str:
         return generic_fence.group(1).strip()
 
     return response.strip()
+
+
+# ── Lua function analysis ────────────────────────────────────────────────
+
+# Matches a full function definition (local + global + M.name + obj:method) up
+# to its closing ``end``. Uses the non-greedy "[\s\S]*?end" tail which works
+# for reasonably well-formatted Lua (the same heuristic the planner uses for
+# dedup in assemble()).
+_LUA_FUNC_DEF_RE = re.compile(
+    r"(?:local\s+)?function\s+"
+    r"([A-Za-z_][A-Za-z_0-9]*(?:[.:][A-Za-z_][A-Za-z_0-9]*)?)"
+    r"\s*\([^)]*\)[\s\S]*?\bend\b",
+    re.MULTILINE,
+)
+
+# Matches just the header, used to pull out the function name cheaply.
+_LUA_FUNC_NAME_RE = re.compile(
+    r"(?:local\s+)?function\s+"
+    r"([A-Za-z_][A-Za-z_0-9]*(?:[.:][A-Za-z_][A-Za-z_0-9]*)?)"
+)
+
+
+def extract_lua_function_names(code: str) -> list[str]:
+    """Return the list of function names declared in *code*, in order.
+
+    Handles ``local function foo``, ``function foo``, ``function M.bar``,
+    and ``function Obj:method``. Duplicates are removed while preserving
+    the first-occurrence order so the output is stable for diffing.
+    """
+    if not code:
+        return []
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for m in _LUA_FUNC_NAME_RE.finditer(code):
+        name = m.group(1)
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
+
+
+def extract_lua_function_bodies(code: str) -> dict[str, str]:
+    """Return a mapping ``function_name -> full source`` for every function
+    declared in *code*. Useful for reconstructing a function that the LLM
+    accidentally dropped during a refine.
+    """
+    if not code:
+        return {}
+    bodies: dict[str, str] = {}
+    for m in _LUA_FUNC_DEF_RE.finditer(code):
+        header = m.group(0)
+        name_match = _LUA_FUNC_NAME_RE.match(header)
+        if name_match:
+            bodies.setdefault(name_match.group(1), header)
+    return bodies

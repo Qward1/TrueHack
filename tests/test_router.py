@@ -137,3 +137,148 @@ class TestPlannerAgent:
         # helper should appear only once
         assembled = result["assembled_code"]
         assert assembled.count("function helper") == 1
+
+
+# ── Refine preservation guard ───────────────────────────────────────────
+
+_QUEUE_ORIGINAL = """local M = {}
+
+local function isEmpty(queue)
+    return #queue == 0
+end
+
+function M.enqueue(queue, value)
+    table.insert(queue, value)
+end
+
+function M.dequeue(queue)
+    if isEmpty(queue) then error("empty") end
+    return table.remove(queue, 1)
+end
+
+function M.peek(queue)
+    if isEmpty(queue) then error("empty") end
+    return queue[1]
+end
+
+return M
+"""
+
+# The LLM's broken refined output: dropped M.peek even though the user
+# never asked to remove it.
+_QUEUE_REFINED_MISSING_PEEK = """local M = {}
+
+function M.new()
+    return {}
+end
+
+function M.is_empty(queue)
+    return #queue == 0
+end
+
+function M.enqueue(queue, value)
+    table.insert(queue, value)
+end
+
+function M.dequeue(queue)
+    if M.is_empty(queue) then error("empty") end
+    return table.remove(queue, 1)
+end
+
+return M
+"""
+
+
+class TestRefinePreservation:
+    @pytest.mark.asyncio
+    async def test_refine_restores_silently_dropped_function(self, settings):
+        """The LLM drops M.peek; the preservation guard must add it back."""
+        from src.agents.coder import CoderAgent
+
+        class StubRAG:
+            async def search(self, *a, **kw):
+                return []
+
+        llm = FakeLLMProvider(text_response=_QUEUE_REFINED_MISSING_PEEK)
+        agent = CoderAgent(llm=llm, settings=settings, rag=StubRAG())
+
+        state = _state(
+            "поправки: добавь M.new() и сделай is_empty публичной",
+            assembled_code=_QUEUE_ORIGINAL,
+            generated_code=_QUEUE_ORIGINAL,
+        )
+        result = await agent.refine(state)
+        code = result["generated_code"]
+
+        # The user-requested additions should be present…
+        assert "M.new" in code
+        assert "is_empty" in code
+        # …and the silently-dropped M.peek MUST be restored.
+        assert "M.peek" in code or "peek" in code
+        # The module must still end with `return M` (not after the restored
+        # block appended naively at the bottom).
+        assert code.rstrip().endswith("return M")
+
+    @pytest.mark.asyncio
+    async def test_refine_does_not_restore_explicitly_removed_function(self, settings):
+        """When the user says "убери peek", the guard must NOT restore it."""
+        from src.agents.coder import CoderAgent
+
+        class StubRAG:
+            async def search(self, *a, **kw):
+                return []
+
+        llm = FakeLLMProvider(text_response=_QUEUE_REFINED_MISSING_PEEK)
+        agent = CoderAgent(llm=llm, settings=settings, rag=StubRAG())
+
+        state = _state(
+            "убери peek, он не нужен",
+            assembled_code=_QUEUE_ORIGINAL,
+            generated_code=_QUEUE_ORIGINAL,
+        )
+        result = await agent.refine(state)
+        code = result["generated_code"]
+
+        # User explicitly asked to delete peek → must stay gone.
+        assert "M.peek" not in code
+        assert "function peek" not in code
+
+    @pytest.mark.asyncio
+    async def test_refine_without_existing_code_falls_back_to_generate(self, settings):
+        """Empty existing_code → must not hallucinate a diff, fall through."""
+        from src.agents.coder import CoderAgent
+
+        class StubRAG:
+            async def search(self, *a, **kw):
+                return []
+
+        llm = FakeLLMProvider(text_response='local function foo() return 1 end')
+        agent = CoderAgent(llm=llm, settings=settings, rag=StubRAG())
+
+        state = _state("make it faster", assembled_code="", generated_code="")
+        result = await agent.refine(state)
+        # Should produce *some* code via generate fallback.
+        assert "foo" in result["generated_code"]
+
+
+class TestExtractLuaFunctionNames:
+    def test_local_function(self):
+        from src.core.utils import extract_lua_function_names
+        names = extract_lua_function_names("local function foo(x) return x end")
+        assert names == ["foo"]
+
+    def test_module_function(self):
+        from src.core.utils import extract_lua_function_names
+        code = "local M = {}\nfunction M.bar() end\nfunction M.baz(x) end\nreturn M"
+        names = extract_lua_function_names(code)
+        assert names == ["M.bar", "M.baz"]
+
+    def test_method_syntax(self):
+        from src.core.utils import extract_lua_function_names
+        code = "function Obj:greet(who) end"
+        assert extract_lua_function_names(code) == ["Obj:greet"]
+
+    def test_dedup_preserves_order(self):
+        from src.core.utils import extract_lua_function_names
+        code = "function f() end\nfunction g() end\nfunction f() end"
+        assert extract_lua_function_names(code) == ["f", "g"]

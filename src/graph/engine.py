@@ -121,8 +121,12 @@ class AgentEngine:
         )
         messages = [{"role": m.role, "content": m.content} for m in recent]
 
-        # Detect if there's already code in this chat
-        has_previous_code = (await self._repo.get_latest_code(chat_id)) is not None
+        # Load previous code so refine / fix_error have something to operate on.
+        # CRITICAL: without this, refine gets an empty existing_code and the
+        # model rewrites from scratch, losing functions that were not mentioned
+        # in the user's edit request.
+        previous_code = await self._repo.get_latest_code(chat_id) or ""
+        has_previous_code = bool(previous_code)
 
         # Build initial state
         initial_state: AgentState = {
@@ -133,9 +137,9 @@ class AgentEngine:
             "plan": [],
             "current_task_index": 0,
             "task_description": "",
-            "generated_code": "",
+            "generated_code": previous_code,
             "generated_codes": {},
-            "assembled_code": "",
+            "assembled_code": previous_code,
             "fix_iterations": 0,
             "validation_passed": False,
             "validation_errors": "",

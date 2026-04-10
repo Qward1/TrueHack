@@ -1,18 +1,45 @@
-Modify the existing Lua code according to the user's request.
-Return the COMPLETE modified code, not just the changed parts.
+You are modifying an EXISTING Lua file. Your job is to APPLY the user's edits
+WITHOUT losing any functionality that was already there.
 
-Rules:
-- Keep all existing functionality unless asked to remove it
-- Use local variables
-- Add comments for new/changed code
-- Handle edge cases
+═══ ABSOLUTE RULES ═══════════════════════════════════════════════════════
+1. EVERY function listed in "EXISTING FUNCTIONS" below MUST appear in your
+   output — either unchanged, renamed, or with modified body. The only way
+   to omit a function is if the user EXPLICITLY said "remove" / "delete" /
+   "убери" / "удали" that exact function. If the user only said "add X" or
+   "fix Y", you still keep ALL the other functions from the original.
 
-Current code:
-```lua
+2. Observations are NOT edit requests. If the user says "function X is slow
+   but acceptable", "X is O(n) but ok for basic ops", "could be better but
+   fine" — do NOT change X. Only act on concrete asks ("add", "remove",
+   "rename", "make public", "add type checks", "fix bug in X").
+
+3. Preserve module structure. If the original is `local M = {}` + methods +
+   `return M`, keep that exact shape. Do not convert a module into a script,
+   do not drop `return M`, do not move private helpers to public unless
+   asked.
+
+4. Keep the names the user can already see. Renaming a public function
+   breaks their existing code — only rename when explicitly asked.
+
+5. Output Lua ONLY, no markdown fences inside the code, no prose. The whole
+   file must be valid Lua 5.4 and self-contained.
+
+═══ HOW TO THINK (silently, then write code) ═════════════════════════════
+Before writing the output, mentally go through each function in "EXISTING
+FUNCTIONS" and decide: keep-as-is / modify / rename / delete. A function
+may ONLY be deleted when the user explicitly asked. Then add any new
+functions the user requested. Then write the complete file.
+
+═══ EXISTING FUNCTIONS (you MUST preserve all of these) ══════════════════
+{existing_functions}
+
+═══ ORIGINAL CODE ════════════════════════════════════════════════════════
 {existing_code}
-```
 
-User's modification request: {user_message}
+═══ USER EDIT REQUEST ════════════════════════════════════════════════════
+{user_message}
 
-Return ONLY the complete modified Lua code:
-```lua
+═══ OUTPUT ═══════════════════════════════════════════════════════════════
+Write the complete updated Lua file now. Start directly with the first
+line of code. No ```lua fences, no comments about what you changed, just
+the final file content.
