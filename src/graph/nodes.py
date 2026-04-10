@@ -27,6 +27,21 @@ from src.tools.target_tools import (
 
 logger = structlog.get_logger(__name__)
 
+# ── Agent names ─────────────────────────────────────────────────────────────
+_AGENT_RESOLVE_TARGET = "TargetResolver"
+_AGENT_ROUTE_INTENT = "IntentRouter"
+_AGENT_GENERATE_CODE = "CodeGenerator"
+_AGENT_REFINE_CODE = "CodeRefiner"
+_AGENT_VALIDATE_CODE = "CodeValidator"
+_AGENT_FIX_CODE = "CodeFixer"
+_AGENT_VERIFY_REQUIREMENTS = "RequirementsVerifier"
+_AGENT_GENERATE_E2E = "E2ESuiteBuilder"
+_AGENT_RUN_E2E = "E2ERunner"
+_AGENT_SAVE_CODE = "CodeSaver"
+_AGENT_EXPLAIN = "SolutionExplainer"
+_AGENT_ANSWER = "QuestionAnswerer"
+_AGENT_PREPARE_RESPONSE = "ResponseAssembler"
+
 _ROUTE_SYSTEM = (
     "You are an intent classifier for a Lua code assistant. "
     "Classify the user message into exactly one category. "
@@ -116,7 +131,9 @@ _EXPLAIN_SYSTEM = (
     "You explain generated Lua code for the user. "
     "Return strict JSON only with keys: summary, what_is_in_code, how_it_works, "
     "suggested_changes, clarifying_questions. "
-    "Keep suggested_changes and clarifying_questions short lists (1-3 items each)."
+    "Keep suggested_changes and clarifying_questions short lists (1-3 items each). "
+    "IMPORTANT: write all text values in the same language as the user_request field "
+    "(if the request is in Russian — answer in Russian; if in English — answer in English)."
 )
 
 
@@ -157,7 +174,21 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
     """Build node callables from a pre-constructed LLM provider."""
 
     async def resolve_target(state: PipelineState) -> dict:
+        logger.info(
+            f"[{_AGENT_RESOLVE_TARGET}] started",
+            user_input_len=len(state["user_input"]),
+            previous_target=state.get("target_path", ""),
+            workspace_root=state.get("workspace_root", ""),
+        )
         previous_target = os.path.abspath(state.get("target_path", "")) if state.get("target_path") else ""
+
+        logger.info(
+            f"[{_AGENT_RESOLVE_TARGET}/resolve_lua_target] calling",
+            user_input=state["user_input"][:80],
+            workspace_root=state.get("workspace_root", ""),
+            current_target_path=previous_target,
+            allow_fallback=False,
+        )
         resolved = resolve_lua_target(
             state["user_input"],
             workspace_root=state.get("workspace_root", ""),
@@ -165,19 +196,34 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             allow_fallback=False,
         )
         target_path = resolved["target_path"]
-        current_code = state.get("current_code", "")
+        logger.info(
+            f"[{_AGENT_RESOLVE_TARGET}/resolve_lua_target] done",
+            target_path=target_path,
+            explicit=resolved["target_explicit"],
+        )
 
+        current_code = state.get("current_code", "")
         if target_path:
             same_target = bool(previous_target and previous_target == os.path.abspath(target_path))
             if not same_target or not current_code.strip():
+                logger.info(
+                    f"[{_AGENT_RESOLVE_TARGET}/load_target_code] calling",
+                    target_path=target_path,
+                    reason="new_target" if not same_target else "code_missing",
+                )
                 current_code = load_target_code(target_path)
+                logger.info(
+                    f"[{_AGENT_RESOLVE_TARGET}/load_target_code] done",
+                    code_len=len(current_code),
+                )
         elif not previous_target:
             current_code = ""
 
         logger.info(
-            "resolve_target",
+            f"[{_AGENT_RESOLVE_TARGET}] completed",
             target_path=target_path,
             explicit=resolved["target_explicit"],
+            code_loaded=bool(current_code.strip()),
         )
         return {
             "workspace_root": resolved["workspace_root"],
@@ -189,13 +235,28 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
 
     async def route_intent(state: PipelineState) -> dict:
         has_code = bool(state.get("current_code", "").strip())
+        logger.info(
+            f"[{_AGENT_ROUTE_INTENT}] started",
+            user_input=state["user_input"][:80],
+            has_existing_code=has_code,
+        )
         prompt = _ROUTE_USER.format(
             has_code=str(has_code).lower(),
             user_input=state["user_input"],
         )
+
+        logger.info(
+            f"[{_AGENT_ROUTE_INTENT}/llm.generate_json] calling",
+            prompt_len=len(prompt),
+        )
         result = await llm.generate_json(prompt, system=_ROUTE_SYSTEM)
         intent = result.get("intent", "create")
         confidence = float(result.get("confidence", 0.5))
+        logger.info(
+            f"[{_AGENT_ROUTE_INTENT}/llm.generate_json] done",
+            raw_intent=intent,
+            confidence=confidence,
+        )
 
         if has_code and confidence < 0.5:
             intent = "change"
@@ -204,7 +265,11 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         if intent not in valid_intents:
             intent = "change" if has_code else "create"
 
-        logger.info("route_intent", intent=intent, confidence=confidence)
+        logger.info(
+            f"[{_AGENT_ROUTE_INTENT}] completed",
+            intent=intent,
+            confidence=confidence,
+        )
         return {"intent": intent}
 
     async def generate_code(state: PipelineState) -> dict:
@@ -214,7 +279,19 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         target_directory = state.get("target_directory", state.get("workspace_root", ""))
         target_explicit = state.get("target_explicit", False)
 
+        logger.info(
+            f"[{_AGENT_GENERATE_CODE}] started",
+            user_input=user_input[:80],
+            base_prompt_len=len(base_prompt),
+            target_path=target_path,
+        )
+
         if not target_path:
+            logger.info(
+                f"[{_AGENT_GENERATE_CODE}/resolve_lua_target] calling (fallback)",
+                workspace_root=state.get("workspace_root", ""),
+                allow_fallback=True,
+            )
             fallback = resolve_lua_target(
                 user_input,
                 workspace_root=state.get("workspace_root", ""),
@@ -223,6 +300,10 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             target_path = fallback["target_path"]
             target_directory = fallback["target_directory"]
             target_explicit = fallback["target_explicit"]
+            logger.info(
+                f"[{_AGENT_GENERATE_CODE}/resolve_lua_target] done",
+                target_path=target_path,
+            )
 
         target_context = _target_context(
             {
@@ -236,12 +317,26 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         if target_context:
             prompt = f"{user_input}\n\n{target_context}\nGenerate only the code for this Lua file."
 
+        logger.info(
+            f"[{_AGENT_GENERATE_CODE}/llm.generate] calling",
+            prompt_len=len(prompt),
+            target_path=target_path,
+        )
         raw = await llm.generate(prompt=prompt, system=_GENERATE_SYSTEM)
         analysis = validate_lua_response(raw)
         code = analysis["normalized"]
+        logger.info(
+            f"[{_AGENT_GENERATE_CODE}/llm.generate] done",
+            raw_len=len(raw),
+            valid=analysis["valid"],
+            reason=analysis.get("reason", ""),
+        )
 
         if not analysis["valid"]:
-            logger.warning("generate_not_lua_retrying", reason=analysis["reason"])
+            logger.warning(
+                f"[{_AGENT_GENERATE_CODE}/llm.generate] response not valid Lua, retrying",
+                reason=analysis["reason"],
+            )
             strict_prompt = (
                 f"{prompt}\n\n"
                 f"Previous response issue: {analysis['reason']}\n"
@@ -251,17 +346,29 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 f"{_GENERATE_SYSTEM} "
                 "The first non-whitespace character must be valid Lua code."
             )
+            logger.info(
+                f"[{_AGENT_GENERATE_CODE}/llm.generate] retry calling",
+                temperature=0.05,
+            )
             raw_retry = await llm.generate(
                 prompt=strict_prompt,
                 system=strict_system,
                 temperature=0.05,
             )
             code = smart_normalize(raw_retry)
+            logger.info(
+                f"[{_AGENT_GENERATE_CODE}/llm.generate] retry done",
+                code_len=len(code),
+            )
 
         if not code:
             code = smart_normalize(raw)
 
-        logger.info("generate_code_done", code_len=len(code), target_path=target_path)
+        logger.info(
+            f"[{_AGENT_GENERATE_CODE}] completed",
+            code_len=len(code),
+            target_path=target_path,
+        )
         return {
             "generated_code": code,
             "base_prompt": base_prompt,
@@ -286,33 +393,78 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
     async def refine_code(state: PipelineState) -> dict:
         existing = state.get("current_code", "")
         user_input = state["user_input"]
+        target_path = state.get("target_path", "(not set)")
+
+        logger.info(
+            f"[{_AGENT_REFINE_CODE}] started",
+            user_input=user_input[:80],
+            existing_code_len=len(existing),
+            target_path=target_path,
+        )
 
         if not existing.strip():
-            logger.warning("refine_no_existing_code_fallback_generate")
+            logger.warning(
+                f"[{_AGENT_REFINE_CODE}] no existing code — falling back to generate_code",
+            )
             return await generate_code(state)
 
+        logger.info(
+            f"[{_AGENT_REFINE_CODE}/extract_function_names] calling",
+            code_len=len(existing),
+        )
         func_names = extract_function_names(existing)
+        logger.info(
+            f"[{_AGENT_REFINE_CODE}/extract_function_names] done",
+            function_count=len(func_names),
+            functions=func_names,
+        )
+
         func_list = "\n".join(f"  - {name}" for name in func_names) or "  (none)"
-        target_path = state.get("target_path", "(not set)")
         prompt = _REFINE_USER.format(
             target_path=target_path,
             function_list=func_list,
             code=existing,
             user_input=user_input,
         )
+
+        logger.info(
+            f"[{_AGENT_REFINE_CODE}/llm.generate] calling",
+            prompt_len=len(prompt),
+            target_path=target_path,
+        )
         raw = await llm.generate(prompt=prompt, system=_REFINE_SYSTEM)
         code = smart_normalize(raw)
+        logger.info(
+            f"[{_AGENT_REFINE_CODE}/llm.generate] done",
+            raw_len=len(raw),
+            normalized_len=len(code),
+        )
         if not code:
             code = existing
 
+        logger.info(
+            f"[{_AGENT_REFINE_CODE}/restore_lost_functions] calling",
+            original_len=len(existing),
+            refined_len=len(code),
+        )
         code, restored = restore_lost_functions(existing, code, user_input)
         if restored:
-            logger.info("refine_restored_functions", restored=restored)
+            logger.info(
+                f"[{_AGENT_REFINE_CODE}/restore_lost_functions] functions restored",
+                restored=restored,
+            )
+        else:
+            logger.info(f"[{_AGENT_REFINE_CODE}/restore_lost_functions] done, no functions lost")
 
         changes = list(state.get("change_requests") or [])
         changes.append(user_input)
 
-        logger.info("refine_code_done", code_len=len(code), target_path=target_path)
+        logger.info(
+            f"[{_AGENT_REFINE_CODE}] completed",
+            code_len=len(code),
+            target_path=target_path,
+            total_change_requests=len(changes),
+        )
         return {
             "generated_code": code,
             "change_requests": changes,
@@ -332,7 +484,13 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
 
     async def validate_code(state: PipelineState) -> dict:
         code = state.get("generated_code", "")
+        logger.info(
+            f"[{_AGENT_VALIDATE_CODE}] started",
+            code_len=len(code),
+        )
+
         if not code.strip():
+            logger.warning(f"[{_AGENT_VALIDATE_CODE}] code is empty — skipping diagnostics")
             diagnostics = {
                 "success": False,
                 "failure_kind": "empty",
@@ -347,12 +505,25 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 "diagnostics": diagnostics,
             }
 
+        logger.info(
+            f"[{_AGENT_VALIDATE_CODE}/async_run_diagnostics] calling",
+            code_len=len(code),
+        )
         diagnostics = await async_run_diagnostics(code)
         passed = diagnostics.get("success", False)
         logger.info(
-            "validate_code_done",
+            f"[{_AGENT_VALIDATE_CODE}/async_run_diagnostics] done",
             passed=passed,
+            program_mode=diagnostics.get("program_mode", ""),
             failure_kind=diagnostics.get("failure_kind", ""),
+            run_error=diagnostics.get("run_error", "") or "none",
+            luacheck_error=diagnostics.get("luacheck_error", "") or "none",
+            timed_out=diagnostics.get("timed_out", False),
+        )
+        logger.info(
+            f"[{_AGENT_VALIDATE_CODE}] completed",
+            passed=passed,
+            failure_stage="" if passed else "validation",
         )
         return {
             "validation_passed": passed,
@@ -367,10 +538,21 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         e2e_results = state.get("e2e_results", {})
         base_prompt = state.get("base_prompt", "") or state.get("user_input", "")
         fix_iter = state.get("fix_iterations", 0)
+        failure_stage = state.get("failure_stage", "unknown")
+
+        logger.info(
+            f"[{_AGENT_FIX_CODE}] started",
+            iteration=fix_iter + 1,
+            failure_stage=failure_stage,
+            failure_kind=diagnostics.get("failure_kind", "unknown"),
+            code_len=len(code),
+            target_path=state.get("target_path", "(not set)"),
+        )
+
         prompt = _FIX_USER.format(
             target_path=state.get("target_path", "(not set)"),
             base_prompt=base_prompt,
-            failure_stage=state.get("failure_stage", "unknown"),
+            failure_stage=failure_stage,
             failure_kind=diagnostics.get("failure_kind", "unknown"),
             run_error=diagnostics.get("run_error", "none"),
             luacheck_error=diagnostics.get("luacheck_error", "none"),
@@ -389,12 +571,27 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             {"role": "assistant", "content": code},
             {"role": "user", "content": prompt},
         ]
+        logger.info(
+            f"[{_AGENT_FIX_CODE}/llm.chat] calling",
+            temperature=0.05,
+            messages_count=len(messages),
+            failure_stage=failure_stage,
+        )
         raw = await llm.chat(messages, temperature=0.05)
         fixed = smart_normalize(raw)
+        logger.info(
+            f"[{_AGENT_FIX_CODE}/llm.chat] done",
+            raw_len=len(raw),
+            fixed_len=len(fixed),
+        )
         if not fixed:
             fixed = code
 
-        logger.info("fix_code_done", iteration=fix_iter + 1, code_len=len(fixed))
+        logger.info(
+            f"[{_AGENT_FIX_CODE}] completed",
+            iteration=fix_iter + 1,
+            code_len=len(fixed),
+        )
         return {
             "generated_code": fixed,
             "fix_iterations": fix_iter + 1,
@@ -415,7 +612,19 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         base_prompt = state.get("base_prompt", "") or state.get("user_input", "")
         diagnostics = state.get("diagnostics", {})
 
+        logger.info(
+            f"[{_AGENT_VERIFY_REQUIREMENTS}] started",
+            code_len=len(code),
+            base_prompt_len=len(base_prompt),
+        )
+
         try:
+            logger.info(
+                f"[{_AGENT_VERIFY_REQUIREMENTS}/async_verify_requirements] calling",
+                prompt_len=len(base_prompt),
+                has_run_output=bool(diagnostics.get("run_output", "")),
+                has_luacheck_output=bool(diagnostics.get("luacheck_output", "")),
+            )
             verification = await async_verify_requirements(
                 llm,
                 prompt=base_prompt,
@@ -423,8 +632,17 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 run_output=diagnostics.get("run_output", ""),
                 luacheck_output=diagnostics.get("luacheck_output", ""),
             )
+            logger.info(
+                f"[{_AGENT_VERIFY_REQUIREMENTS}/async_verify_requirements] done",
+                passed=verification.get("passed"),
+                score=verification.get("score", 0),
+                missing=verification.get("missing_requirements", []),
+            )
         except Exception as exc:
-            logger.warning("verify_failed", error=str(exc))
+            logger.warning(
+                f"[{_AGENT_VERIFY_REQUIREMENTS}/async_verify_requirements] failed",
+                error=str(exc),
+            )
             verification = {
                 "passed": False,
                 "score": 0,
@@ -440,7 +658,12 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         diagnostics_updated["verification_checked"] = not verification.get("error", False)
         diagnostics_updated["verification_passed"] = passed
 
-        logger.info("verify_done", passed=passed, score=verification.get("score", 0))
+        logger.info(
+            f"[{_AGENT_VERIFY_REQUIREMENTS}] completed",
+            passed=passed,
+            score=verification.get("score", 0),
+            failure_stage="" if (passed or verification.get("error")) else "requirements",
+        )
         return {
             "verification": verification,
             "verification_passed": passed,
@@ -450,7 +673,17 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
 
     async def generate_e2e_suite(state: PipelineState) -> dict:
         code = state.get("generated_code", "")
+        base_prompt = state.get("base_prompt", "") or state.get("user_input", "")
+        target_path = state.get("target_path", "")
+
+        logger.info(
+            f"[{_AGENT_GENERATE_E2E}] started",
+            code_len=len(code),
+            target_path=target_path,
+        )
+
         if not code.strip():
+            logger.warning(f"[{_AGENT_GENERATE_E2E}] code is empty — skipping suite generation")
             return {
                 "e2e_suite": {},
                 "e2e_results": {
@@ -465,16 +698,28 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 "failure_stage": "e2e",
             }
 
-        base_prompt = state.get("base_prompt", "") or state.get("user_input", "")
         try:
+            logger.info(
+                f"[{_AGENT_GENERATE_E2E}/async_generate_e2e_suite] calling",
+                base_prompt_len=len(base_prompt),
+                target_path=target_path,
+            )
             suite = await async_generate_e2e_suite(
                 llm=llm,
                 prompt=base_prompt,
                 code=code,
-                target_path=state.get("target_path", ""),
+                target_path=target_path,
+            )
+            logger.info(
+                f"[{_AGENT_GENERATE_E2E}/async_generate_e2e_suite] done",
+                cases_count=len(suite.get("tests", [])),
+                case_names=[t.get("name", "") for t in suite.get("tests", [])],
             )
         except Exception as exc:
-            logger.warning("e2e_suite_generation_failed", error=str(exc))
+            logger.warning(
+                f"[{_AGENT_GENERATE_E2E}/async_generate_e2e_suite] failed",
+                error=str(exc),
+            )
             return {
                 "e2e_suite": {},
                 "e2e_results": {
@@ -489,7 +734,10 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 "failure_stage": "e2e",
             }
 
-        logger.info("e2e_suite_generated", cases=len(suite.get("tests", [])))
+        logger.info(
+            f"[{_AGENT_GENERATE_E2E}] completed",
+            cases_count=len(suite.get("tests", [])),
+        )
         return {
             "e2e_suite": suite,
             "e2e_results": {},
@@ -499,7 +747,15 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
     async def run_e2e_suite(state: PipelineState) -> dict:
         code = state.get("generated_code", "")
         suite = state.get("e2e_suite", {})
+
+        logger.info(
+            f"[{_AGENT_RUN_E2E}] started",
+            code_len=len(code),
+            suite_cases=len(suite.get("tests", [])) if suite else 0,
+        )
+
         if not code.strip():
+            logger.warning(f"[{_AGENT_RUN_E2E}] code is empty — skipping e2e execution")
             return {
                 "e2e_results": {
                     "passed": False,
@@ -512,6 +768,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 "failure_stage": "e2e",
             }
         if not suite:
+            logger.warning(f"[{_AGENT_RUN_E2E}] suite is missing — skipping e2e execution")
             return {
                 "e2e_results": {
                     "passed": False,
@@ -524,13 +781,25 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 "failure_stage": "e2e",
             }
 
+        logger.info(
+            f"[{_AGENT_RUN_E2E}/async_run_e2e_suite] calling",
+            cases_count=len(suite.get("tests", [])),
+            case_names=[t.get("name", "") for t in suite.get("tests", [])],
+        )
         results = await async_run_e2e_suite(code, suite)
         passed = bool(results.get("passed", False))
+        failed_cases = results.get("failed_cases", [])
         logger.info(
-            "e2e_done",
+            f"[{_AGENT_RUN_E2E}/async_run_e2e_suite] done",
             passed=passed,
-            cases=len(results.get("cases", [])),
-            failed=len(results.get("failed_cases", [])),
+            total_cases=len(results.get("cases", [])),
+            failed_cases=len(failed_cases),
+            failed_names=[c.get("name", "") for c in failed_cases],
+        )
+        logger.info(
+            f"[{_AGENT_RUN_E2E}] completed",
+            passed=passed,
+            failure_stage="" if passed else "e2e",
         )
         return {
             "e2e_results": results,
@@ -541,15 +810,37 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
     async def save_code(state: PipelineState) -> dict:
         code = state.get("generated_code", "")
         target_path = state.get("target_path", "")
+
+        logger.info(
+            f"[{_AGENT_SAVE_CODE}] started",
+            code_len=len(code),
+            target_path=target_path,
+        )
+
         if not code.strip():
+            logger.warning(f"[{_AGENT_SAVE_CODE}] code is empty — cannot save")
             return {"save_success": False, "save_error": "Empty code cannot be saved.", "saved_to": ""}
         if not target_path:
+            logger.warning(f"[{_AGENT_SAVE_CODE}] target_path is not set — cannot save")
             return {"save_success": False, "save_error": "Target path is not set.", "saved_to": ""}
 
         try:
+            logger.info(
+                f"[{_AGENT_SAVE_CODE}/save_final_output] calling",
+                target_path=target_path,
+                code_len=len(code),
+            )
             save_final_output(target_path, code)
+            logger.info(
+                f"[{_AGENT_SAVE_CODE}/save_final_output] done",
+                target_path=target_path,
+            )
         except OSError as exc:
-            logger.error("save_code_failed", target_path=target_path, error=str(exc))
+            logger.error(
+                f"[{_AGENT_SAVE_CODE}/save_final_output] failed",
+                target_path=target_path,
+                error=str(exc),
+            )
             return {
                 "current_code": code,
                 "save_success": False,
@@ -557,7 +848,10 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 "saved_to": "",
             }
 
-        logger.info("save_code_done", target_path=target_path)
+        logger.info(
+            f"[{_AGENT_SAVE_CODE}] completed",
+            target_path=target_path,
+        )
         return {
             "current_code": code,
             "save_success": True,
@@ -567,16 +861,25 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
 
     async def explain_solution(state: PipelineState) -> dict:
         code = state.get("generated_code", "").strip()
+        user_input = state.get("user_input", "")
+
+        logger.info(
+            f"[{_AGENT_EXPLAIN}] started",
+            code_len=len(code),
+            user_input=user_input[:80],
+        )
+
         if not code:
+            logger.warning(f"[{_AGENT_EXPLAIN}] code is empty — skipping explanation")
             return {"explanation": {}, "suggested_changes": [], "clarifying_questions": []}
 
         diagnostics = state.get("diagnostics", {})
         verification = state.get("verification", {})
         e2e_results = state.get("e2e_results", {})
-        base_prompt = state.get("base_prompt", "") or state.get("user_input", "")
+        base_prompt = state.get("base_prompt", "") or user_input
 
         explain_prompt = (
-            f"User request:\n{base_prompt}\n\n"
+            f"user_request: {base_prompt}\n\n"
             f"Runtime validation summary:\n"
             f"- run_error: {diagnostics.get('run_error', 'none')}\n"
             f"- luacheck_error: {diagnostics.get('luacheck_error', 'none')}\n"
@@ -584,13 +887,27 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             f"- e2e_summary: {e2e_results.get('summary', 'none')}\n\n"
             "Code:\n"
             f"{code}\n\n"
-            "Respond with JSON only."
+            "Respond with JSON only. Write all text values in the same language as user_request."
         )
 
         try:
+            logger.info(
+                f"[{_AGENT_EXPLAIN}/llm.generate_json] calling",
+                prompt_len=len(explain_prompt),
+                temperature=0.1,
+            )
             raw = await llm.generate_json(explain_prompt, system=_EXPLAIN_SYSTEM, temperature=0.1)
+            logger.info(
+                f"[{_AGENT_EXPLAIN}/llm.generate_json] done",
+                has_summary=bool(raw.get("summary")),
+                suggested_changes_count=len(raw.get("suggested_changes") or []),
+                clarifying_questions_count=len(raw.get("clarifying_questions") or []),
+            )
         except Exception as exc:
-            logger.warning("explain_failed", error=str(exc))
+            logger.warning(
+                f"[{_AGENT_EXPLAIN}/llm.generate_json] failed",
+                error=str(exc),
+            )
             raw = {}
 
         explanation = {
@@ -608,6 +925,12 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         if not explanation["how_it_works"]:
             explanation["how_it_works"] = ["Логика выполняется последовательно через функции и условия Lua."]
 
+        logger.info(
+            f"[{_AGENT_EXPLAIN}] completed",
+            summary_len=len(explanation["summary"]),
+            suggested_changes_count=len(suggested_changes),
+            clarifying_questions_count=len(clarifying_questions),
+        )
         return {
             "explanation": explanation,
             "suggested_changes": suggested_changes,
@@ -617,6 +940,13 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
     async def answer_question(state: PipelineState) -> dict:
         user_input = state["user_input"]
         existing = state.get("current_code", "")
+
+        logger.info(
+            f"[{_AGENT_ANSWER}] started",
+            user_input=user_input[:80],
+            has_existing_code=bool(existing.strip()),
+        )
+
         prompt = user_input
         if existing.strip():
             context = _target_context(state)
@@ -625,7 +955,16 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             else:
                 prompt = f"Current code:\n```lua\n{existing}\n```\n\n{user_input}"
 
+        logger.info(
+            f"[{_AGENT_ANSWER}/llm.generate] calling",
+            prompt_len=len(prompt),
+        )
         answer = await llm.generate(prompt=prompt, system=_ANSWER_SYSTEM)
+        logger.info(
+            f"[{_AGENT_ANSWER}/llm.generate] done",
+            answer_len=len(answer),
+        )
+        logger.info(f"[{_AGENT_ANSWER}] completed")
         return {
             "response": answer,
             "response_type": "text",
@@ -642,6 +981,16 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         suggested_changes = state.get("suggested_changes", [])
         clarifying_questions = state.get("clarifying_questions", [])
         failure_stage = state.get("failure_stage", "")
+
+        logger.info(
+            f"[{_AGENT_PREPARE_RESPONSE}] started",
+            code_len=len(code),
+            save_success=state.get("save_success", False),
+            e2e_passed=state.get("e2e_passed", False),
+            failure_stage=failure_stage,
+            suggested_changes_count=len(suggested_changes),
+            clarifying_questions_count=len(clarifying_questions),
+        )
 
         if not code.strip():
             return {
@@ -724,8 +1073,14 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 if question_text:
                     lines.append(f"{index}. {question_text}")
 
+        response_text = "\n".join(lines)
+        logger.info(
+            f"[{_AGENT_PREPARE_RESPONSE}] completed",
+            response_len=len(response_text),
+            response_type="code",
+        )
         return {
-            "response": "\n".join(lines),
+            "response": response_text,
             "response_type": "code",
             "current_code": code,
         }

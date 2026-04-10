@@ -27,7 +27,7 @@ class PipelineEngine:
         self._llm = llm or LLMProvider()
         self._max_fix = max_fix_iterations
         self._graph = build_graph(self._llm)
-        logger.info("pipeline_engine_created")
+        logger.info("[PipelineEngine] created", max_fix_iterations=max_fix_iterations)
 
     async def process_message(
         self,
@@ -75,7 +75,13 @@ class PipelineEngine:
             "response_type": "text",
         }
 
-        logger.info("pipeline_start", chat_id=chat_id, msg_len=len(user_input))
+        logger.info(
+            "[PipelineEngine] pipeline_start",
+            chat_id=chat_id,
+            msg_len=len(user_input),
+            has_code=bool(current_code.strip()),
+            target_path=initial_target or "(none)",
+        )
         result: PipelineState = await self._graph.ainvoke(initial_state)
 
         output = {
@@ -101,7 +107,7 @@ class PipelineEngine:
         }
 
         logger.info(
-            "pipeline_done",
+            "[PipelineEngine] pipeline_done",
             chat_id=chat_id,
             intent=output["intent"],
             response_type=output["response_type"],
@@ -109,5 +115,7 @@ class PipelineEngine:
             e2e_passed=output["e2e_results"].get("passed", False),
             target_path=output["target_path"],
             save_success=output["save_success"],
+            save_error=output["save_error"] or "none",
+            response_len=len(output["response"]),
         )
         return output
