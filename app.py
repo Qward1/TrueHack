@@ -1,55 +1,30 @@
 #!/usr/bin/env python3
 import argparse
+import asyncio
 import json
 import os
 import sqlite3
 import threading
 import webbrowser
-from contextlib import closing, redirect_stderr, redirect_stdout
+from contextlib import closing
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from io import StringIO
 
-from auto_fix_lua import (
-    DEFAULT_LUA_BIN,
-    DEFAULT_LUACHECK_BIN,
-    DEFAULT_MAX_ATTEMPTS,
-    DEFAULT_REQUEST_TIMEOUT,
-    DEFAULT_STARTUP_TIMEOUT,
-    DEFAULT_TEMPERATURE,
-)
+import structlog
+
 from console_utils import configure_console_utf8
-from main import (
-    DEFAULT_MODEL,
-    DEFAULT_OUTPUT,
-    DEFAULT_URL,
-    apply_change_request,
-    build_chat_title_from_prompt,
-    build_working_path,
-    deserialize_artifact_ref,
-    deserialize_report,
-    deserialize_resolution_result,
-    empty_diagnostics,
-    get_active_directory_artifact,
-    get_active_target_artifact,
-    load_session_state,
-    new_chat_id,
-    print_code,
-    print_help,
-    print_paths,
-    print_prompt,
-    print_report,
-    print_status,
-    resolve_output_paths,
-    resolve_workspace_root,
-    retry_current_project,
-    serialize_artifact_ref,
-    serialize_report,
-    serialize_resolution_result,
-    start_new_project,
-    sync_current_code_from_active_target,
-    SessionState,
-)
+from src.core.llm import LLMProvider
+from src.graph.engine import PipelineEngine
+
+logger = structlog.get_logger(__name__)
+
+# ── Defaults (kept compatible with CLI args) ─────────────────────────
+DEFAULT_URL = "http://127.0.0.1:1234/v1"
+DEFAULT_MODEL = "local-model"
+DEFAULT_OUTPUT = "generated.lua"
+DEFAULT_MAX_ATTEMPTS = 5
+DEFAULT_TEMPERATURE = 0.2
+DEFAULT_REQUEST_TIMEOUT = 600.0
 
 
 CHAT_DB_NAME = ".lua_console_chats.db"
@@ -62,113 +37,30 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def build_empty_state(args: argparse.Namespace) -> SessionState:
-    workspace_root = resolve_workspace_root(args, "")
-    output_path = os.path.abspath(args.output)
-    working_path = os.path.abspath(build_working_path(output_path))
-    return SessionState(
-        workspace_root=workspace_root,
-        context_path=os.path.abspath(os.path.join(workspace_root, ".lua_console_chat.json")),
-        output_path=output_path,
-        working_path=working_path,
-        chat_id=new_chat_id(),
-        base_prompt="",
-        change_requests=[],
-        artifacts=[],
-        active_target_id="",
-        active_directory_id="",
-        current_content="",
-        current_code="",
-        last_report=None,
-        last_resolution=None,
-        managed_files=[],
-        current_target_path="",
-    )
-
-
-def serialize_state_snapshot(state: SessionState) -> dict:
+def _empty_state_dict() -> dict:
+    """Return a fresh empty state dict for serialization."""
     return {
-        "workspace_root": state.workspace_root,
-        "context_path": state.context_path,
-        "output_path": state.output_path,
-        "working_path": state.working_path,
-        "chat_id": state.chat_id or new_chat_id(),
-        "base_prompt": state.base_prompt,
-        "change_requests": list(state.change_requests),
-        "artifacts": [serialize_artifact_ref(artifact) for artifact in state.artifacts],
-        "active_target_id": state.active_target_id,
-        "active_directory_id": state.active_directory_id,
-        "current_content": state.current_content,
-        "current_code": state.current_code,
-        "last_report": serialize_report(state.last_report),
-        "last_resolution": serialize_resolution_result(state.last_resolution),
-        "managed_files": list(state.managed_files),
-        "current_target_path": state.current_target_path,
-        "artifact_type": state.artifact_type,
-        "last_route_intent": state.last_route_intent,
+        "base_prompt": "",
+        "change_requests": [],
+        "current_code": "",
+        "output_path": DEFAULT_OUTPUT,
+        "last_intent": "",
     }
 
 
-def deserialize_state_snapshot(payload: dict, args: argparse.Namespace) -> SessionState:
-    if not isinstance(payload, dict):
-        return build_empty_state(args)
-
-    workspace_root = os.path.abspath(payload.get("workspace_root") or resolve_workspace_root(args, ""))
-    output_path = os.path.abspath(payload.get("output_path") or os.path.abspath(args.output))
-    working_path = os.path.abspath(payload.get("working_path") or build_working_path(output_path))
-    return SessionState(
-        workspace_root=workspace_root,
-        context_path=os.path.abspath(payload.get("context_path") or os.path.join(workspace_root, ".lua_console_chat.json")),
-        output_path=output_path,
-        working_path=working_path,
-        chat_id=str(payload.get("chat_id", "")) or new_chat_id(),
-        base_prompt=str(payload.get("base_prompt", "")),
-        change_requests=[str(item) for item in payload.get("change_requests", []) if str(item).strip()],
-        artifacts=[
-            artifact
-            for artifact in (
-                deserialize_artifact_ref(item, workspace_root)
-                for item in payload.get("artifacts", [])
-            )
-            if artifact is not None
-        ],
-        active_target_id=str(payload.get("active_target_id", "")),
-        active_directory_id=str(payload.get("active_directory_id", "")),
-        current_content=str(payload.get("current_content", payload.get("current_code", ""))),
-        current_code=str(payload.get("current_code", "")),
-        last_report=deserialize_report(payload.get("last_report")),
-        last_resolution=deserialize_resolution_result(payload.get("last_resolution")),
-        managed_files=[os.path.abspath(str(item)) for item in payload.get("managed_files", []) if str(item).strip()],
-        current_target_path=os.path.abspath(payload.get("current_target_path", "")) if payload.get("current_target_path") else "",
-        artifact_type=str(payload.get("artifact_type", "lua") or "lua"),
-        last_route_intent=str(payload.get("last_route_intent", "create") or "create"),
-    )
-
-
-def derive_chat_title_from_state(state: SessionState, fallback: str = "Новый чат") -> str:
-    active_target = get_active_target_artifact(state)
-    if (
-        active_target and active_target.path
-        and state.base_prompt.strip()
-        and state.last_route_intent in {"inspect", "change"}
-    ):
-        base_name = os.path.splitext(os.path.basename(active_target.path))[0]
-        title = build_chat_title_from_prompt(base_name.replace("_", " ").replace("-", " "), fallback)
-    elif state.base_prompt.strip():
-        title = build_chat_title_from_prompt(state.base_prompt, fallback)
-    elif active_target and active_target.path:
-        base_name = os.path.splitext(os.path.basename(active_target.path))[0]
-        title = build_chat_title_from_prompt(base_name.replace("_", " ").replace("-", " "), fallback)
-    else:
-        title = fallback
-
-    single_line = " ".join(title.split())
+def _derive_title(base_prompt: str, fallback: str = "Новый чат") -> str:
+    """Build a short chat title from the base prompt."""
+    if not base_prompt.strip():
+        return fallback
+    single_line = " ".join(base_prompt.split())
     if len(single_line) <= MAX_CHAT_TITLE_LENGTH:
-        return single_line or fallback
+        return single_line
     return f"{single_line[: MAX_CHAT_TITLE_LENGTH - 3].rstrip()}..."
 
 
 class ChatStore:
+    """SQLite storage for chats and messages (kept from original, simplified state)."""
+
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         self._init_db()
@@ -214,15 +106,12 @@ class ChatStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def create_chat(self, state: SessionState, title: str = "Новый чат") -> int:
-        snapshot = json.dumps(serialize_state_snapshot(state), ensure_ascii=False)
+    def create_chat(self, state_dict: dict, title: str = "Новый чат") -> int:
+        snapshot = json.dumps(state_dict, ensure_ascii=False)
         now = utc_now_iso()
         with closing(self._connect()) as connection, connection:
             cursor = connection.execute(
-                """
-                INSERT INTO chats (title, state_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?)
-                """,
+                "INSERT INTO chats (title, state_json, created_at, updated_at) VALUES (?, ?, ?, ?)",
                 (title, snapshot, now, now),
             )
             return int(cursor.lastrowid)
@@ -235,48 +124,39 @@ class ChatStore:
             ).fetchone()
         return dict(row) if row else None
 
-    def load_state(self, chat_id: int, args: argparse.Namespace) -> SessionState:
+    def load_state_dict(self, chat_id: int) -> dict:
         chat = self.get_chat(chat_id)
         if not chat:
             raise KeyError(f"Chat {chat_id} not found.")
-        return deserialize_state_snapshot(json.loads(chat["state_json"]), args)
+        try:
+            return json.loads(chat["state_json"])
+        except (json.JSONDecodeError, TypeError):
+            return _empty_state_dict()
 
     def load_messages(self, chat_id: int) -> list[dict]:
         with closing(self._connect()) as connection:
             rows = connection.execute(
-                """
-                SELECT role, title, content, created_at
-                FROM chat_messages
-                WHERE chat_id = ?
-                ORDER BY id ASC
-                """,
+                "SELECT role, title, content, created_at FROM chat_messages WHERE chat_id = ? ORDER BY id ASC",
                 (chat_id,),
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def save_chat_state(self, chat_id: int, state: SessionState, title: str | None = None) -> None:
+    def save_chat_state(self, chat_id: int, state_dict: dict, title: str | None = None) -> None:
         current = self.get_chat(chat_id)
         if not current:
             raise KeyError(f"Chat {chat_id} not found.")
-        snapshot = json.dumps(serialize_state_snapshot(state), ensure_ascii=False)
-        effective_title = title or current["title"] or derive_chat_title_from_state(state)
+        snapshot = json.dumps(state_dict, ensure_ascii=False)
+        effective_title = title or current["title"]
         with closing(self._connect()) as connection, connection:
             connection.execute(
-                """
-                UPDATE chats
-                SET title = ?, state_json = ?, updated_at = ?
-                WHERE id = ?
-                """,
+                "UPDATE chats SET title = ?, state_json = ?, updated_at = ? WHERE id = ?",
                 (effective_title, snapshot, utc_now_iso(), chat_id),
             )
 
     def add_message(self, chat_id: int, role: str, title: str, content: str) -> None:
         with closing(self._connect()) as connection, connection:
             connection.execute(
-                """
-                INSERT INTO chat_messages (chat_id, role, title, content, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
+                "INSERT INTO chat_messages (chat_id, role, title, content, created_at) VALUES (?, ?, ?, ?, ?)",
                 (chat_id, role, title, content, utc_now_iso()),
             )
             connection.execute(
@@ -1236,106 +1116,73 @@ HTML_PAGE = """<!doctype html>
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Local Russian web UI for Lua Console Builder.")
+    parser = argparse.ArgumentParser(description="Lua Console Builder — LangGraph edition.")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind the local web UI.")
     parser.add_argument("--port", type=int, default=8765, help="Port for the local web UI.")
     parser.add_argument("--no-browser", action="store_true", help="Do not auto-open the browser.")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Fallback output Lua file path.")
     parser.add_argument("--model", default=os.getenv("LMSTUDIO_MODEL", DEFAULT_MODEL), help="Model name loaded in LM Studio.")
-    parser.add_argument("--verify-model", default="", help="Model name for the requirements-check step.")
-    parser.add_argument("--url", default=os.getenv("LMSTUDIO_URL", DEFAULT_URL), help="LM Studio chat completions endpoint.")
-    parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE, help="Sampling temperature.")
-    parser.add_argument("--lua-bin", default=DEFAULT_LUA_BIN, help="Lua interpreter executable name or path.")
-    parser.add_argument("--luacheck-bin", default=DEFAULT_LUACHECK_BIN, help="luacheck executable name or path.")
-    parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS, help="Maximum validation/fix iterations per request.")
-    parser.add_argument("--startup-timeout", type=float, default=DEFAULT_STARTUP_TIMEOUT, help="Seconds to wait for Lua startup.")
+    parser.add_argument("--url", default=os.getenv("LMSTUDIO_URL", DEFAULT_URL), help="LM Studio base URL.")
+    parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS, help="Max validation/fix iterations.")
     parser.add_argument("--request-timeout", type=float, default=DEFAULT_REQUEST_TIMEOUT, help="Seconds to wait for LM Studio.")
-    parser.add_argument("--skip-verification", action="store_true", help="Skip the LLM requirements-check step.")
     return parser.parse_args()
 
 
-def output_argument_was_provided() -> bool:
-    return any(argument == "--output" or argument.startswith("--output=") for argument in os.sys.argv[1:])
-
-
 class AppRuntime:
+    """Web UI runtime backed by the LangGraph PipelineEngine."""
+
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.lock = threading.Lock()
         self.store = ChatStore(os.path.join(os.getcwd(), CHAT_DB_NAME))
-        self.state = build_empty_state(args)
-        sync_current_code_from_active_target(self.state)
+
+        # Create the async event loop for the engine
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(target=self._loop.run_forever, daemon=True)
+        self._loop_thread.start()
+
+        # LangGraph pipeline engine
+        llm = LLMProvider(
+            base_url=getattr(args, "url", DEFAULT_URL),
+            model=getattr(args, "model", DEFAULT_MODEL),
+            timeout=getattr(args, "request_timeout", DEFAULT_REQUEST_TIMEOUT),
+        )
+        self.engine = PipelineEngine(
+            llm=llm,
+            max_fix_iterations=getattr(args, "max_attempts", DEFAULT_MAX_ATTEMPTS),
+        )
+
+        # Chat state (simple dict now)
+        self.state_dict: dict = _empty_state_dict()
         chats = self.store.list_chats()
         if chats:
             self.current_chat_id = int(chats[0]["id"])
-            self.state = self.store.load_state(self.current_chat_id, self.args)
-            sync_current_code_from_active_target(self.state)
+            self.state_dict = self.store.load_state_dict(self.current_chat_id)
         else:
-            self.current_chat_id = self.store.create_chat(
-                self.state,
-                derive_chat_title_from_state(self.state),
-            )
-            self.store.save_chat_state(self.current_chat_id, self.state, derive_chat_title_from_state(self.state))
+            self.current_chat_id = self.store.create_chat(self.state_dict, "Новый чат")
 
-    def capture_output(self, fn) -> str:
-        stdout_buffer = StringIO()
-        stderr_buffer = StringIO()
-        with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
-            fn()
-        combined = stdout_buffer.getvalue()
-        stderr_text = stderr_buffer.getvalue()
-        if stderr_text:
-            combined = f"{combined}\n{stderr_text}".strip()
-        return combined.strip()
+    def _run_async(self, coro) -> any:
+        """Run an async coroutine from sync context via the background event loop."""
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=660)  # generous timeout
 
-    def chat_title(self) -> str:
-        return derive_chat_title_from_state(self.state)
-
-    def save_current_chat(self) -> None:
-        self.store.save_chat_state(self.current_chat_id, self.state, self.chat_title())
+    def _save_current_chat(self, title: str | None = None) -> None:
+        effective_title = title or _derive_title(self.state_dict.get("base_prompt", ""))
+        self.store.save_chat_state(self.current_chat_id, self.state_dict, effective_title)
 
     def build_messages_payload(self) -> list[dict]:
         return self.store.load_messages(self.current_chat_id)
 
     def build_state_payload(self) -> dict:
-        state = self.state
-        last_report = state.last_report
-        last_report_summary = ""
-        if last_report:
-            last_report_summary = self.capture_output(lambda: print_report(last_report, self.args.lua_bin))
-
-        active_target = get_active_target_artifact(state)
-        active_directory = get_active_directory_artifact(state)
-        resolution = state.last_resolution
-
+        sd = self.state_dict
         return {
-            "workspace_root": state.workspace_root,
-            "chat_id": state.chat_id,
-            "has_project": state.has_project(),
-            "artifact_type": state.artifact_type,
-            "active_target": (active_target.path if active_target else (state.current_target_path or state.output_path)) if state.has_project() else "",
-            "active_target_id": state.active_target_id,
-            "active_directory": active_directory.path if active_directory else state.workspace_root,
-            "active_directory_id": state.active_directory_id,
-            "output_path": state.output_path if state.has_project() else "",
-            "managed_files_count": len(state.managed_files),
-            "artifacts_count": len(state.artifacts),
-            "change_requests_count": len(state.change_requests),
-            "base_prompt": state.base_prompt,
-            "change_requests": state.change_requests,
-            "current_content": state.current_content,
-            "current_code": state.current_code,
-            "last_resolution": {
-                "target_id": resolution.target_id,
-                "target_path": resolution.target_path,
-                "intent": resolution.intent,
-                "confidence": resolution.confidence,
-                "source": resolution.source,
-                "reasons": list(resolution.reasons),
-                "requested_artifact_kind": resolution.requested_artifact_kind,
-            } if resolution else None,
-            "last_resolution_reasons": list(resolution.reasons) if resolution else [],
-            "last_report_summary": last_report_summary,
+            "has_project": bool(sd.get("current_code", "").strip() or sd.get("base_prompt", "").strip()),
+            "base_prompt": sd.get("base_prompt", ""),
+            "change_requests": sd.get("change_requests", []),
+            "current_code": sd.get("current_code", ""),
+            "output_path": sd.get("output_path", DEFAULT_OUTPUT),
+            "last_intent": sd.get("last_intent", ""),
+            "change_requests_count": len(sd.get("change_requests", [])),
         }
 
     def build_full_payload(self) -> dict:
@@ -1348,45 +1195,26 @@ class AppRuntime:
 
     def create_new_chat(self) -> dict:
         with self.lock:
-            self.state = build_empty_state(self.args)
-            sync_current_code_from_active_target(self.state)
-            self.current_chat_id = self.store.create_chat(
-                self.state,
-                derive_chat_title_from_state(self.state),
-            )
-            self.save_current_chat()
+            self.state_dict = _empty_state_dict()
+            self.current_chat_id = self.store.create_chat(self.state_dict, "Новый чат")
             return self.build_full_payload()
 
     def switch_chat(self, chat_id: int) -> dict:
         with self.lock:
             self.current_chat_id = chat_id
-            self.state = self.store.load_state(chat_id, self.args)
-            sync_current_code_from_active_target(self.state)
-            self.save_current_chat()
+            self.state_dict = self.store.load_state_dict(chat_id)
             return self.build_full_payload()
 
     def delete_chat(self, chat_id: int) -> dict:
         with self.lock:
-            existing = self.store.get_chat(chat_id)
-            if not existing:
-                raise KeyError(f"Chat {chat_id} not found.")
-
             self.store.delete_chat(chat_id)
             chats = self.store.list_chats()
             if not chats:
-                self.state = build_empty_state(self.args)
-                sync_current_code_from_active_target(self.state)
-                self.current_chat_id = self.store.create_chat(
-                    self.state,
-                    derive_chat_title_from_state(self.state),
-                )
-                self.save_current_chat()
+                self.state_dict = _empty_state_dict()
+                self.current_chat_id = self.store.create_chat(self.state_dict, "Новый чат")
                 return self.build_full_payload()
-
             self.current_chat_id = int(chats[0]["id"])
-            self.state = self.store.load_state(self.current_chat_id, self.args)
-            sync_current_code_from_active_target(self.state)
-            self.save_current_chat()
+            self.state_dict = self.store.load_state_dict(self.current_chat_id)
             return self.build_full_payload()
 
     def handle_message(self, message: str) -> dict:
@@ -1395,62 +1223,111 @@ class AppRuntime:
             return self.build_full_payload()
 
         with self.lock:
-            if text.startswith("/"):
-                log = self.handle_command(text)
-                title = "Команда"
-            else:
-                report = self.capture_action(lambda: self.apply_text(text))
-                log = report
-                title = "Пользователь"
+            # Save user message
+            self.store.add_message(self.current_chat_id, "user", "Пользователь", text)
 
-            self.store.add_message(self.current_chat_id, "user", title, text)
-            if log.strip():
-                self.store.add_message(self.current_chat_id, "assistant", "Лог Выполнения", log.strip())
-            self.save_current_chat()
+            if text.startswith("/"):
+                response_text = self._handle_command(text)
+            else:
+                response_text = self._process_via_pipeline(text)
+
+            # Save assistant response
+            if response_text.strip():
+                self.store.add_message(
+                    self.current_chat_id, "assistant", "Ответ", response_text.strip()
+                )
+            self._save_current_chat()
             return self.build_full_payload()
 
-    def capture_action(self, action_fn) -> str:
-        stdout_buffer = StringIO()
-        stderr_buffer = StringIO()
-        with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
-            report = action_fn()
-            print_report(report, self.args.lua_bin)
-        combined = stdout_buffer.getvalue()
-        stderr_text = stderr_buffer.getvalue()
-        if stderr_text:
-            combined = f"{combined}\n{stderr_text}".strip()
-        return combined.strip()
+    def _process_via_pipeline(self, text: str) -> str:
+        """Run the LangGraph pipeline for user text and return response."""
+        sd = self.state_dict
 
-    def apply_text(self, text: str):
-        if not self.state.has_project():
-            return start_new_project(self.args, self.state, text)
-        return apply_change_request(self.args, self.state, text)
+        # Build message history for context
+        raw_messages = self.store.load_messages(self.current_chat_id)
+        messages = [
+            {"role": m["role"], "content": m["content"]}
+            for m in raw_messages[-10:]  # last 10 messages for context
+        ]
 
-    def handle_command(self, text: str) -> str:
+        try:
+            result = self._run_async(
+                self.engine.process_message(
+                    chat_id=self.current_chat_id,
+                    user_input=text,
+                    current_code=sd.get("current_code", ""),
+                    base_prompt=sd.get("base_prompt", ""),
+                    change_requests=sd.get("change_requests", []),
+                    messages=messages,
+                    output_path=sd.get("output_path", DEFAULT_OUTPUT),
+                )
+            )
+        except Exception as exc:
+            logger.error("pipeline_error", error=str(exc))
+            return f"Ошибка: {exc}"
+
+        # Update state from pipeline result
+        sd["current_code"] = result.get("current_code", sd.get("current_code", ""))
+        sd["base_prompt"] = result.get("base_prompt", sd.get("base_prompt", ""))
+        sd["change_requests"] = result.get("change_requests", sd.get("change_requests", []))
+        sd["last_intent"] = result.get("intent", "")
+
+        return result.get("response", "")
+
+    def _handle_command(self, text: str) -> str:
         command, _, argument = text.partition(" ")
         argument = argument.strip()
         command = command.lower()
 
-        if command == "/retry":
-            return self.capture_action(lambda: retry_current_project(self.args, self.state))
-        if command == "/status":
-            return self.capture_output(lambda: print_status(self.state))
-        if command == "/path":
-            return self.capture_output(lambda: print_paths(self.state))
-        if command == "/prompt":
-            return self.capture_output(lambda: print_prompt(self.state))
         if command in ("/code", "/show"):
-            return self.capture_output(lambda: print_code(self.state))
-        if command == "/help":
-            return self.capture_output(print_help)
+            code = self.state_dict.get("current_code", "")
+            if code.strip():
+                return f"```lua\n{code}\n```"
+            return "Нет сгенерированного кода."
+
+        if command == "/status":
+            sd = self.state_dict
+            lines = [
+                f"Задача: {sd.get('base_prompt', '(не задана)')}",
+                f"Правки: {len(sd.get('change_requests', []))}",
+                f"Код: {'есть' if sd.get('current_code', '').strip() else 'нет'}",
+                f"Последний intent: {sd.get('last_intent', '(не определён)')}",
+            ]
+            return "\n".join(lines)
+
+        if command == "/prompt":
+            sd = self.state_dict
+            lines = [f"Задача: {sd.get('base_prompt', '(не задана)')}"]
+            for i, cr in enumerate(sd.get("change_requests", []), 1):
+                lines.append(f"Правка {i}: {cr}")
+            return "\n".join(lines)
+
         if command == "/new":
             if not argument:
                 return "Использование: /new <задача>"
-            return self.capture_action(lambda: start_new_project(self.args, self.state, argument))
+            # Force intent to "create" by clearing current code
+            self.state_dict["current_code"] = ""
+            self.state_dict["base_prompt"] = ""
+            self.state_dict["change_requests"] = []
+            return self._process_via_pipeline(argument)
+
         if command == "/edit":
             if not argument:
                 return "Использование: /edit <изменение>"
-            return self.capture_action(lambda: apply_change_request(self.args, self.state, argument))
+            return self._process_via_pipeline(argument)
+
+        if command == "/help":
+            return (
+                "Команды:\n"
+                "  /new <задача> — новый проект\n"
+                "  /edit <изменение> — изменить текущий код\n"
+                "  /code — показать текущий код\n"
+                "  /status — статус\n"
+                "  /prompt — текущее задание\n"
+                "  /help — эта справка\n\n"
+                "Или просто напиши задачу / правки обычным текстом."
+            )
+
         return "Неизвестная команда. Используй /help."
 
 
@@ -1535,14 +1412,13 @@ def make_handler(runtime: AppRuntime):
 def main() -> int:
     configure_console_utf8()
     args = parse_args()
-    args.output_explicit = output_argument_was_provided()
     if args.max_attempts < 1:
         raise SystemExit("--max-attempts must be at least 1")
 
     runtime = AppRuntime(args)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(runtime))
     url = f"http://{args.host}:{args.port}/"
-    print(f"Локальный UI запущен: {url}")
+    print(f"Lua Console Builder (LangGraph) запущен: {url}")
     print("Для остановки нажми Ctrl+C")
 
     if not args.no_browser:

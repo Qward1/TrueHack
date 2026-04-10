@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash",
+      "Bash(.venv/Scripts/python.exe -c \"from langgraph.graph import StateGraph, START, END; print\\('LangGraph OK'\\)\")"
+    ],
+    "defaultMode": "bypassPermissions",
+    "skipDangerousModePermissionPrompt": true
+  }
+}
