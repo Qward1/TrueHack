@@ -229,6 +229,26 @@ SOFT_VERIFICATION_PASS_SCORE = 70
 MAX_REQUIREMENT_FIX_ATTEMPTS = 2
 MIN_REQUIREMENT_SCORE_IMPROVEMENT = 5
 SCAN_SKIP_DIRS = {".git", "__pycache__", ".venv", "venv"}
+TEXT_ARTIFACT_EXTENSIONS = {".lua", ".md", ".markdown", ".json", ".txt"}
+TEXT_SCAN_EXTENSION_HINTS = {
+    ".cfg",
+    ".conf",
+    ".csv",
+    ".env",
+    ".ini",
+    ".log",
+    ".lua",
+    ".md",
+    ".markdown",
+    ".json",
+    ".toml",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
+GENERIC_TEXT_FILE_NAMES = {"readme", "notes", "todo", "changelog"}
+MAX_TEXT_SNIFF_BYTES = 4096
 CREATE_INTENT_MARKERS = (
     "создай",
     "сделай",
@@ -330,6 +350,22 @@ DOCUMENT_EXPLAIN_SYSTEM_PROMPT = (
     "Summarize the purpose of the document, its structure, the key sections, and any obvious gaps or inaccuracies. "
     "Do not invent content that is not present in the file."
 )
+TEXT_ARTIFACT_GENERATE_SYSTEM_PROMPT = (
+    "You write a single text file for a local project workspace. "
+    "The target can be README, Markdown, JSON, TXT, INI, YAML, TOML, LOG, or another text file. "
+    "Return only the full final file content without markdown fences, explanations, or extra text outside the file."
+)
+TEXT_ARTIFACT_EDIT_SYSTEM_PROMPT = (
+    "You update one existing text file in a local project workspace. "
+    "Preserve correct structure for the file type. "
+    "Return only the full updated file content without markdown fences, explanations, or extra text."
+)
+TEXT_ARTIFACT_EXPLAIN_SYSTEM_PROMPT = (
+    "You explain what an existing text file contains. "
+    "Reply in Russian. "
+    "Summarize the file purpose, the main sections or keys, and any obvious gaps or risks visible in the content. "
+    "Do not invent content that is not present in the file."
+)
 REQUEST_ROUTE_SYSTEM_PROMPT = (
     "You classify the user's request for a local coding assistant. "
     "Return only one JSON object and nothing else. "
@@ -341,6 +377,25 @@ REQUEST_ROUTE_SYSTEM_PROMPT = (
     "If the chat already has an active project and the new message is a follow-up modification, prefer intent=change. "
     "If the user asks to write or update README or documentation, prefer artifact_type=readme and preferred_filename=README.md. "
     "Required JSON keys: intent, artifact_type, expects_existing_target, preferred_filename, reason."
+)
+REQUEST_SEMANTICS_SYSTEM_PROMPT = (
+    "You parse a user's request for a local workspace assistant. "
+    "Return only one JSON object and nothing else. "
+    "Do not resolve filesystem state. Only extract the user's semantic intent. "
+    "Valid intent values: create, change, inspect. "
+    "Valid requested_entity_type values: file, directory, project, unknown. "
+    "Valid requested_artifact_kind values: lua, readme, json, txt, markdown, generic_file, directory, unknown. "
+    "Set follow_active_context=true when the request is a follow-up that should continue working with the current active target or directory. "
+    "Set expects_existing_target=true when the request logically refers to an existing artifact that should be inspected or changed. "
+    "Set create_if_missing=true only when it is acceptable to create a new target if none exists. "
+    "If the request names README, prefer requested_artifact_kind=readme and requested_entity_type=file. "
+    "If the request names a generic file like settings.ini or schema.yaml, use requested_artifact_kind=generic_file. "
+    "If the request is about creating a directory/folder, use requested_entity_type=directory and requested_artifact_kind=directory. "
+    "If the user asks to create a program, script, calculator, implementation, README, config, or file in a folder/path, "
+    "that folder is target_directory scope, not the deliverable itself. "
+    "Example: 'Напиши инженерный калькулятор в папке C:\\\\Test' means create a file/project inside C:\\\\Test, not create the folder as the main target. "
+    "Example: 'Создай папку C:\\\\Test123' means requested_entity_type=directory. "
+    "Required JSON keys: intent, requested_entity_type, requested_artifact_kind, target_directory, follow_active_context, expects_existing_target, create_if_missing, reason."
 )
 LUA_PATH_CANDIDATE_PATTERN = re.compile(
     r'"([^"\r\n]+?\.lua)"|'
@@ -354,6 +409,8 @@ MARKDOWN_PATH_CANDIDATE_PATTERN = re.compile(
     r"((?:[A-Za-z]:[\\/]|\.{1,2}[\\/]|[\\/]|(?:[A-Za-z0-9_.-]+[\\/])+)[^\s,;]+?\.md)"
 )
 MARKDOWN_FILE_NAME_PATTERN = re.compile(r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+\.md)(?![A-Za-z0-9_.-])")
+GENERIC_FILE_NAME_PATTERN = re.compile(r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,10})(?![A-Za-z0-9_.-])")
+EXTENSION_PATTERN = re.compile(r"(?<![A-Za-z0-9_])(\.[A-Za-z0-9]{1,10})(?![A-Za-z0-9_])")
 MAX_DOCUMENT_CODE_CONTEXT = 4000
 
 
@@ -376,13 +433,18 @@ class SessionState:
     context_path: str
     output_path: str
     working_path: str
+    chat_id: str = ""
     base_prompt: str = ""
     change_requests: list[str] = field(default_factory=list)
+    artifacts: list["ArtifactRef"] = field(default_factory=list)
+    active_target_id: str = ""
+    active_directory_id: str = ""
+    current_content: str = ""
     current_code: str = ""
     last_report: SessionReport | None = None
+    last_resolution: "ResolutionResult | None" = None
     managed_files: list[str] = field(default_factory=list)
     current_target_path: str = ""
-    chat_id: str = ""
     artifact_type: str = "lua"
     last_route_intent: str = "create"
 
@@ -410,7 +472,14 @@ class TargetSelection:
     explicit: bool
     exists: bool
     source: str
+    entity_type: str = "file"
+    artifact_kind: str = "unknown"
     restored_from_context: bool = False
+    artifact_id: str = ""
+    directory_id: str = ""
+    confidence: float = 0.0
+    reasons: list[str] = field(default_factory=list)
+    requested_artifact_kind: str = "unknown"
 
 
 @dataclass
@@ -420,6 +489,52 @@ class RequestRoute:
     expects_existing_target: bool = False
     preferred_filename: str = ""
     reason: str = ""
+
+
+@dataclass
+class ParsedRequestSemantics:
+    intent: str = "create"
+    requested_entity_type: str = "unknown"
+    requested_artifact_kind: str = "unknown"
+    explicit_path: str = ""
+    explicit_filename: str = ""
+    explicit_extension: str = ""
+    target_directory: str = ""
+    follow_active_context: bool = False
+    expects_existing_target: bool = False
+    create_if_missing: bool = False
+    reason: str = ""
+
+
+@dataclass
+class ArtifactRef:
+    id: str
+    entity_type: str
+    artifact_kind: str
+    path: str
+    exists: bool
+    role: str
+    extension: str
+    summary: str = ""
+    pinned: bool = False
+
+
+@dataclass
+class WorkspaceInventory:
+    workspace_root: str
+    artifacts: list[ArtifactRef] = field(default_factory=list)
+    scanned_at: str = ""
+
+
+@dataclass
+class ResolutionResult:
+    target_id: str = ""
+    target_path: str = ""
+    intent: str = "create"
+    confidence: float = 0.0
+    source: str = "fallback"
+    reasons: list[str] = field(default_factory=list)
+    requested_artifact_kind: str = "unknown"
 
 
 def output_argument_was_provided(argv: list[str] | None = None) -> bool:
@@ -526,6 +641,128 @@ def resolve_prompt_path(candidate: str, base_dir: str) -> str:
     if os.path.isabs(expanded):
         return os.path.abspath(expanded)
     return os.path.abspath(os.path.join(base_dir, expanded))
+
+
+def artifact_kind_from_extension(extension: str) -> str:
+    normalized = extension.lower().strip()
+    if not normalized:
+        return "unknown"
+    if not normalized.startswith("."):
+        normalized = f".{normalized}"
+    if normalized == ".lua":
+        return "lua"
+    if normalized == ".md":
+        return "markdown"
+    if normalized == ".markdown":
+        return "markdown"
+    if normalized == ".json":
+        return "json"
+    if normalized == ".txt":
+        return "txt"
+    return "generic_file"
+
+
+def normalize_requested_artifact_kind(kind: str, explicit_filename: str = "", explicit_extension: str = "") -> str:
+    normalized = str(kind or "").strip().lower()
+    if explicit_filename:
+        file_name = os.path.basename(explicit_filename).lower()
+        if file_name == "readme.md":
+            return "readme"
+    if normalized in {"lua", "readme", "json", "txt", "markdown", "generic_file", "directory"}:
+        return normalized
+    if explicit_extension:
+        inferred = artifact_kind_from_extension(explicit_extension)
+        if inferred == "markdown" and explicit_filename and os.path.basename(explicit_filename).lower() == "readme.md":
+            return "readme"
+        return inferred
+    return "unknown"
+
+
+def normalize_requested_entity_type(entity_type: str, artifact_kind: str = "") -> str:
+    normalized = str(entity_type or "").strip().lower()
+    if normalized in {"file", "directory", "project"}:
+        return normalized
+    if artifact_kind == "directory":
+        return "directory"
+    if artifact_kind in {"lua", "readme", "json", "txt", "markdown", "generic_file"}:
+        return "file"
+    return "unknown"
+
+
+def is_text_artifact_kind(artifact_kind: str) -> bool:
+    return artifact_kind in {"readme", "markdown", "json", "txt", "generic_file"}
+
+
+def is_probably_text_file(path: str) -> bool:
+    if not path or not os.path.isfile(path):
+        return False
+    extension = os.path.splitext(path)[1].lower()
+    if extension in TEXT_SCAN_EXTENSION_HINTS:
+        return True
+    try:
+        with open(path, "rb") as file:
+            chunk = file.read(MAX_TEXT_SNIFF_BYTES)
+    except OSError:
+        return False
+    if b"\x00" in chunk:
+        return False
+    if not chunk:
+        return True
+    for encoding in ("utf-8", "cp1251", "latin-1"):
+        try:
+            chunk.decode(encoding)
+            return True
+        except UnicodeDecodeError:
+            continue
+    return False
+
+
+def extract_explicit_path(prompt: str, workspace_root: str) -> str:
+    requested_matches = iter_requested_paths(prompt)
+    if requested_matches:
+        return resolve_prompt_path(requested_matches[0][2], workspace_root)
+    raw_matches = iter_path_candidates(prompt)
+    if len(raw_matches) == 1:
+        return resolve_prompt_path(raw_matches[0][2], workspace_root)
+    return ""
+
+
+def extract_explicit_filename(prompt: str) -> str:
+    candidates: list[str] = []
+    explicit_path = extract_explicit_lua_path_candidate(prompt)
+    if explicit_path:
+        candidates.append(os.path.basename(explicit_path))
+    markdown_path = extract_explicit_markdown_path_candidate(prompt)
+    if markdown_path:
+        candidates.append(os.path.basename(markdown_path))
+    for match in GENERIC_FILE_NAME_PATTERN.finditer(prompt):
+        candidates.append(clean_path_candidate(match.group(1)))
+    seen: set[str] = set()
+    for candidate in candidates:
+        cleaned = os.path.basename(candidate)
+        if not cleaned or cleaned.lower().endswith(".working.lua"):
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        return cleaned
+    return ""
+
+
+def extract_explicit_extension(prompt: str, explicit_filename: str = "", explicit_path: str = "") -> str:
+    if explicit_filename:
+        extension = os.path.splitext(explicit_filename)[1].lower()
+        if extension:
+            return extension
+    if explicit_path:
+        extension = os.path.splitext(explicit_path)[1].lower()
+        if extension:
+            return extension
+    match = EXTENSION_PATTERN.search(prompt)
+    if match:
+        return match.group(1).lower()
+    return ""
 
 
 def extract_explicit_lua_path_candidate(prompt: str) -> str | None:
@@ -763,35 +1000,89 @@ def build_route_context_summary(state: SessionState) -> str:
     return "\n".join(lines)
 
 
-def classify_request_route(
+def build_semantic_parser_context_summary(state: SessionState) -> str:
+    rebuild_state_inventory(state)
+    active_target = get_active_target_artifact(state)
+    active_directory = get_active_directory_artifact(state)
+    lines = [
+        f"Workspace root: {state.workspace_root}",
+        f"Chat has project: {'yes' if state.has_project() else 'no'}",
+    ]
+    if active_target:
+        lines.append(
+            "Active target: "
+            f"{relative_display_path(active_target.path, state.workspace_root)} "
+            f"| entity={active_target.entity_type} kind={active_target.artifact_kind} role={active_target.role}"
+        )
+    else:
+        lines.append("Active target: none")
+    if active_directory and active_directory.path:
+        lines.append(f"Active directory: {relative_display_path(active_directory.path, state.workspace_root)}")
+    lines.append("Known artifacts:")
+    for artifact in state.artifacts[:MAX_CONTEXT_FILE_SUMMARIES]:
+        if artifact.entity_type == "virtual":
+            continue
+        lines.append(
+            f"- {relative_display_path(artifact.path, state.workspace_root)} "
+            f"| entity={artifact.entity_type} kind={artifact.artifact_kind} role={artifact.role}"
+        )
+    return "\n".join(lines)
+
+
+def build_semantics_fallback(prompt: str, state: SessionState) -> ParsedRequestSemantics:
+    explicit_path = extract_explicit_path(prompt, state.workspace_root)
+    explicit_filename = extract_explicit_filename(prompt)
+    explicit_extension = extract_explicit_extension(prompt, explicit_filename, explicit_path)
+    fallback_intent = classify_request_intent(prompt)
+    fallback_artifact = classify_artifact_type(prompt)
+    directory_hint = any(marker in prompt.lower() for marker in ("папк", "директор", "каталог", "folder", "directory"))
+    requested_artifact_kind = normalize_requested_artifact_kind(fallback_artifact, explicit_filename, explicit_extension)
+    if directory_hint and not explicit_extension and fallback_intent == "create":
+        requested_artifact_kind = "directory"
+    requested_entity_type = "directory" if requested_artifact_kind == "directory" else "file"
+    if explicit_path and not explicit_extension and not looks_like_file_path(explicit_path):
+        target_directory = explicit_path
+    else:
+        target_directory = extract_requested_output_directory(prompt) or (
+            os.path.dirname(explicit_path) if explicit_path and looks_like_file_path(explicit_path) else ""
+        )
+    expects_existing = expects_existing_target_for_route(prompt, fallback_intent, fallback_artifact)
+    if requested_entity_type == "directory" and fallback_intent == "create":
+        expects_existing = False
+    return ParsedRequestSemantics(
+        intent=fallback_intent,
+        requested_entity_type=requested_entity_type,
+        requested_artifact_kind=requested_artifact_kind,
+        explicit_path=explicit_path,
+        explicit_filename=explicit_filename,
+        explicit_extension=explicit_extension,
+        target_directory=target_directory,
+        follow_active_context=bool(state.active_target_id),
+        expects_existing_target=expects_existing,
+        create_if_missing=fallback_intent == "create",
+        reason="fallback heuristic",
+    )
+
+
+def parse_request_semantics(
     args: argparse.Namespace,
     state: SessionState,
     prompt: str,
-) -> RequestRoute:
-    fallback_intent = classify_request_intent(prompt)
-    fallback_artifact = classify_artifact_type(prompt)
-    fallback_existing = expects_existing_target_for_route(prompt, fallback_intent, fallback_artifact)
-    fallback_filename = "README.md" if fallback_artifact == "readme" else ""
-
+) -> ParsedRequestSemantics:
+    fallback = build_semantics_fallback(prompt, state)
     normalized_prompt = prompt.strip()
     if not normalized_prompt:
-        return RequestRoute(
-            intent=fallback_intent,
-            artifact_type=fallback_artifact,
-            expects_existing_target=fallback_existing,
-            preferred_filename=fallback_filename,
-            reason="empty prompt fallback",
-        )
+        return fallback
 
     payload = {
         "model": args.model,
         "temperature": 0.0,
         "messages": [
-            {"role": "system", "content": REQUEST_ROUTE_SYSTEM_PROMPT},
+            {"role": "system", "content": REQUEST_SEMANTICS_SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": (
-                    f"Chat context:\n{build_route_context_summary(state)}\n\n"
+                    f"Chat context:\n{build_semantic_parser_context_summary(state)}\n\n"
                     f"User request:\n{normalized_prompt}"
                 ),
             },
@@ -800,44 +1091,103 @@ def classify_request_route(
 
     try:
         raw_response = request_chat_completion(args.url, payload, args.request_timeout)
-        route_data = parse_first_json_object(raw_response)
+        semantics_data = parse_first_json_object(raw_response)
     except RuntimeError:
-        route_data = None
+        semantics_data = None
 
-    if not route_data:
-        return RequestRoute(
-            intent=fallback_intent,
-            artifact_type=fallback_artifact,
-            expects_existing_target=fallback_existing,
-            preferred_filename=fallback_filename,
-            reason="fallback heuristic",
-        )
+    if not semantics_data:
+        return fallback
 
-    intent = str(route_data.get("intent", fallback_intent)).strip().lower()
+    intent = str(semantics_data.get("intent", fallback.intent)).strip().lower()
     if intent not in {"create", "change", "inspect"}:
-        intent = fallback_intent
+        intent = fallback.intent
 
-    artifact_type = str(route_data.get("artifact_type", fallback_artifact)).strip().lower()
-    if artifact_type not in {"lua", "readme"}:
-        artifact_type = fallback_artifact
+    requested_artifact_kind = normalize_requested_artifact_kind(
+        str(semantics_data.get("requested_artifact_kind", fallback.requested_artifact_kind)),
+        fallback.explicit_filename,
+        fallback.explicit_extension,
+    )
+    requested_entity_type = normalize_requested_entity_type(
+        str(semantics_data.get("requested_entity_type", fallback.requested_entity_type)),
+        requested_artifact_kind,
+    )
 
-    expects_existing = route_data.get("expects_existing_target")
-    if not isinstance(expects_existing, bool):
-        expects_existing = expects_existing_target_for_route(prompt, intent, artifact_type)
+    follow_active_context = semantics_data.get("follow_active_context")
+    if not isinstance(follow_active_context, bool):
+        follow_active_context = fallback.follow_active_context
 
-    preferred_filename = str(route_data.get("preferred_filename", "")).strip()
-    if artifact_type == "readme":
-        preferred_filename = "README.md"
-    else:
-        preferred_filename = ""
+    expects_existing_target = semantics_data.get("expects_existing_target")
+    if not isinstance(expects_existing_target, bool):
+        expects_existing_target = fallback.expects_existing_target
 
-    reason = str(route_data.get("reason", "")).strip() or "semantic classifier"
-    return RequestRoute(
+    create_if_missing = semantics_data.get("create_if_missing")
+    if not isinstance(create_if_missing, bool):
+        create_if_missing = intent == "create"
+
+    target_directory = str(semantics_data.get("target_directory", "") or "").strip()
+    if target_directory:
+        target_directory = resolve_prompt_path(target_directory, state.workspace_root)
+    if not target_directory:
+        target_directory = fallback.target_directory
+
+    reason = str(semantics_data.get("reason", "") or "").strip() or "semantic parser"
+    if requested_entity_type == "directory":
+        requested_artifact_kind = "directory"
+    if requested_entity_type == "unknown" and requested_artifact_kind in {"lua", "readme", "json", "txt", "markdown", "generic_file"}:
+        requested_entity_type = "file"
+
+    if (
+        requested_entity_type == "directory"
+        and fallback.requested_entity_type == "file"
+        and fallback.requested_artifact_kind in {"lua", "readme", "json", "txt", "markdown", "generic_file"}
+        and fallback.target_directory
+    ):
+        requested_entity_type = fallback.requested_entity_type
+        requested_artifact_kind = fallback.requested_artifact_kind
+        target_directory = fallback.target_directory
+        reason = f"{reason}; corrected to file deliverable inside requested directory scope"
+
+    explicit_path = fallback.explicit_path
+    if (
+        requested_entity_type == "file"
+        and explicit_path
+        and target_directory
+        and paths_equal(target_directory, explicit_path)
+        and not fallback.explicit_extension
+    ):
+        explicit_path = ""
+
+    return ParsedRequestSemantics(
         intent=intent,
-        artifact_type=artifact_type,
-        expects_existing_target=expects_existing,
-        preferred_filename=preferred_filename,
+        requested_entity_type=requested_entity_type,
+        requested_artifact_kind=requested_artifact_kind,
+        explicit_path=explicit_path,
+        explicit_filename=fallback.explicit_filename,
+        explicit_extension=fallback.explicit_extension,
+        target_directory=target_directory,
+        follow_active_context=follow_active_context,
+        expects_existing_target=expects_existing_target,
+        create_if_missing=create_if_missing,
         reason=reason,
+    )
+
+
+def classify_request_route(
+    args: argparse.Namespace,
+    state: SessionState,
+    prompt: str,
+) -> RequestRoute:
+    semantics = parse_request_semantics(args, state, prompt)
+    artifact_type = semantics.requested_artifact_kind
+    if artifact_type not in {"lua", "readme"}:
+        artifact_type = "readme" if artifact_type in {"markdown", "json", "txt", "generic_file"} else "lua"
+    preferred_filename = "README.md" if semantics.requested_artifact_kind == "readme" else semantics.explicit_filename
+    return RequestRoute(
+        intent=semantics.intent,
+        artifact_type=artifact_type,
+        expects_existing_target=semantics.expects_existing_target,
+        preferred_filename=preferred_filename,
+        reason=semantics.reason,
     )
 
 
@@ -886,8 +1236,18 @@ def relative_display_path(path: str, workspace_root: str) -> str:
     return relative_path
 
 
+def path_is_within(path: str, parent: str) -> bool:
+    if not path or not parent:
+        return False
+    try:
+        relative_path = os.path.relpath(os.path.abspath(path), os.path.abspath(parent))
+    except ValueError:
+        return False
+    return relative_path == "." or not relative_path.startswith("..")
+
+
 def read_text_if_exists(path: str) -> str:
-    if not path or not os.path.exists(path):
+    if not path or not os.path.exists(path) or not os.path.isfile(path):
         return ""
 
     with open(path, "r", encoding="utf-8", errors="replace") as file:
@@ -964,6 +1324,494 @@ def deserialize_report(data: dict | None) -> SessionReport | None:
     )
 
 
+def artifact_id_from_path(entity_type: str, path: str, artifact_kind: str = "") -> str:
+    normalized_path = os.path.abspath(path).lower() if path else ""
+    if entity_type == "virtual":
+        return f"virtual:{artifact_kind or 'node'}:{normalized_path or 'workspace'}"
+    return f"{entity_type}:{normalized_path}"
+
+
+def infer_artifact_kind(path: str, entity_type: str = "file") -> str:
+    if entity_type == "virtual":
+        return "project"
+    if entity_type == "directory":
+        return "directory"
+
+    file_name = os.path.basename(path).lower()
+    extension = os.path.splitext(file_name)[1].lower()
+    if extension == ".lua":
+        return "lua"
+    if file_name == "readme.md":
+        return "readme"
+    if extension == ".md":
+        return "markdown"
+    if extension == ".json":
+        return "json"
+    if extension == ".txt":
+        return "txt"
+    if extension:
+        return "generic_file"
+    return "unknown"
+
+
+def infer_artifact_role(workspace_root: str, path: str, entity_type: str, artifact_kind: str) -> str:
+    if entity_type == "virtual":
+        return "generic"
+    if entity_type == "directory":
+        if path and paths_equal(path, workspace_root):
+            return "workspace_root"
+        return "generic"
+
+    file_name = os.path.basename(path).lower()
+    if artifact_kind == "readme":
+        return "documentation"
+    if artifact_kind == "lua":
+        if file_name in {"main.lua", "init.lua", "app.lua"}:
+            return "entrypoint"
+        if "config" in file_name:
+            return "config"
+        return "entrypoint" if path and os.path.dirname(path) == workspace_root else "generic"
+    if artifact_kind == "json":
+        return "config"
+    if artifact_kind == "txt":
+        return "notes" if file_name in {"notes.txt", "todo.txt"} else "generic"
+    return "generic"
+
+
+def summarize_text_content(content: str) -> str:
+    if not content.strip():
+        return "empty file"
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return truncate_text(stripped, MAX_CONTEXT_FILE_SUMMARY_LENGTH)
+    return "non-empty file"
+
+
+def summarize_artifact_path(path: str, artifact_kind: str, entity_type: str) -> str:
+    if entity_type == "virtual":
+        return "logical project node"
+    if entity_type == "directory":
+        if not path:
+            return "directory"
+        if os.path.isdir(path):
+            try:
+                child_count = len(os.listdir(path))
+            except OSError:
+                child_count = 0
+            return f"directory with {child_count} item(s)"
+        return "directory"
+    if not path or not os.path.exists(path):
+        return "missing file"
+    if artifact_kind == "lua":
+        return summarize_lua_file(path)
+    return summarize_text_content(read_text_if_exists(path))
+
+
+def artifact_kind_display_name(artifact_kind: str, path: str = "") -> str:
+    if artifact_kind == "lua":
+        return "Lua file"
+    if artifact_kind == "readme":
+        return "README file"
+    if artifact_kind == "markdown":
+        return "Markdown file"
+    if artifact_kind == "json":
+        return "JSON file"
+    if artifact_kind == "txt":
+        return "text file"
+    if artifact_kind == "directory":
+        return "directory"
+    if path:
+        extension = os.path.splitext(path)[1].lower()
+        if extension:
+            return f"{extension} file"
+    return "file"
+
+
+def default_extension_for_artifact_kind(artifact_kind: str) -> str:
+    if artifact_kind == "lua":
+        return ".lua"
+    if artifact_kind in {"readme", "markdown"}:
+        return ".md"
+    if artifact_kind == "json":
+        return ".json"
+    if artifact_kind == "txt":
+        return ".txt"
+    return ".txt"
+
+
+def default_filename_for_artifact_kind(artifact_kind: str, prompt: str, explicit_extension: str = "") -> str:
+    if artifact_kind == "readme":
+        return "README.md"
+    if artifact_kind == "json":
+        return "config.json"
+    if artifact_kind == "txt":
+        return "notes.txt"
+    extension = explicit_extension or default_extension_for_artifact_kind(artifact_kind)
+    slug = build_task_slug(prompt) or "document"
+    return f"{slug}{extension}"
+
+
+def build_artifact_ref(
+    workspace_root: str,
+    path: str,
+    entity_type: str = "file",
+    artifact_kind: str | None = None,
+    role: str | None = None,
+    summary: str | None = None,
+    pinned: bool = False,
+    exists: bool | None = None,
+) -> ArtifactRef:
+    normalized_path = os.path.abspath(path) if path else ""
+    effective_kind = artifact_kind or infer_artifact_kind(normalized_path, entity_type)
+    effective_role = role or infer_artifact_role(workspace_root, normalized_path, entity_type, effective_kind)
+    effective_exists = (os.path.exists(normalized_path) if normalized_path else False) if exists is None else bool(exists)
+    extension = "" if entity_type != "file" else os.path.splitext(normalized_path)[1].lower()
+    effective_summary = summary if summary is not None else summarize_artifact_path(normalized_path, effective_kind, entity_type)
+    return ArtifactRef(
+        id=artifact_id_from_path(entity_type, normalized_path, effective_kind),
+        entity_type=entity_type,
+        artifact_kind=effective_kind,
+        path=normalized_path,
+        exists=effective_exists,
+        role=effective_role,
+        extension=extension,
+        summary=effective_summary,
+        pinned=bool(pinned),
+    )
+
+
+def build_virtual_project_artifact(workspace_root: str) -> ArtifactRef:
+    normalized_root = os.path.abspath(workspace_root)
+    return ArtifactRef(
+        id=artifact_id_from_path("virtual", normalized_root, "project"),
+        entity_type="virtual",
+        artifact_kind="project",
+        path=normalized_root,
+        exists=os.path.isdir(normalized_root),
+        role="workspace_root",
+        extension="",
+        summary="project workspace",
+        pinned=True,
+    )
+
+
+def serialize_artifact_ref(artifact: ArtifactRef) -> dict:
+    return {
+        "id": artifact.id,
+        "entity_type": artifact.entity_type,
+        "artifact_kind": artifact.artifact_kind,
+        "path": artifact.path,
+        "exists": artifact.exists,
+        "role": artifact.role,
+        "extension": artifact.extension,
+        "summary": artifact.summary,
+        "pinned": artifact.pinned,
+    }
+
+
+def deserialize_artifact_ref(data: dict, workspace_root: str) -> ArtifactRef | None:
+    if not isinstance(data, dict):
+        return None
+    entity_type = str(data.get("entity_type", "file") or "file")
+    path = os.path.abspath(str(data.get("path", ""))) if data.get("path") else ""
+    artifact_kind = str(data.get("artifact_kind", "") or infer_artifact_kind(path, entity_type))
+    role = str(data.get("role", "") or infer_artifact_role(workspace_root, path, entity_type, artifact_kind))
+    extension = str(data.get("extension", "") or (os.path.splitext(path)[1].lower() if entity_type == "file" else ""))
+    artifact_id = str(data.get("id", "") or artifact_id_from_path(entity_type, path, artifact_kind))
+    return ArtifactRef(
+        id=artifact_id,
+        entity_type=entity_type,
+        artifact_kind=artifact_kind,
+        path=path,
+        exists=bool(data.get("exists", os.path.exists(path) if path else False)),
+        role=role,
+        extension=extension,
+        summary=str(data.get("summary", "")),
+        pinned=bool(data.get("pinned", False)),
+    )
+
+
+def serialize_resolution_result(resolution: ResolutionResult | None) -> dict | None:
+    if resolution is None:
+        return None
+    return {
+        "target_id": resolution.target_id,
+        "target_path": resolution.target_path,
+        "intent": resolution.intent,
+        "confidence": resolution.confidence,
+        "source": resolution.source,
+        "reasons": list(resolution.reasons),
+        "requested_artifact_kind": resolution.requested_artifact_kind,
+    }
+
+
+def deserialize_resolution_result(data: dict | None) -> ResolutionResult | None:
+    if not isinstance(data, dict):
+        return None
+    try:
+        confidence = float(data.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return ResolutionResult(
+        target_id=str(data.get("target_id", "")),
+        target_path=os.path.abspath(str(data.get("target_path", ""))) if data.get("target_path") else "",
+        intent=str(data.get("intent", "create") or "create"),
+        confidence=confidence,
+        source=str(data.get("source", "fallback") or "fallback"),
+        reasons=[str(item) for item in data.get("reasons", []) if str(item).strip()],
+        requested_artifact_kind=str(data.get("requested_artifact_kind", "unknown") or "unknown"),
+    )
+
+
+def get_artifact_by_id(state: SessionState, artifact_id: str) -> ArtifactRef | None:
+    if not artifact_id:
+        return None
+    for artifact in state.artifacts:
+        if artifact.id == artifact_id:
+            return artifact
+    return None
+
+
+def get_artifact_by_path(state: SessionState, path: str, entity_type: str | None = None) -> ArtifactRef | None:
+    if not path:
+        return None
+    normalized_path = os.path.abspath(path)
+    for artifact in state.artifacts:
+        if entity_type and artifact.entity_type != entity_type:
+            continue
+        if artifact.path and paths_equal(artifact.path, normalized_path):
+            return artifact
+    return None
+
+
+def upsert_artifact(state: SessionState, artifact: ArtifactRef) -> ArtifactRef:
+    artifacts: list[ArtifactRef] = []
+    inserted = False
+    for existing in state.artifacts:
+        if existing.id == artifact.id:
+            artifacts.append(artifact)
+            inserted = True
+        else:
+            artifacts.append(existing)
+    if not inserted:
+        artifacts.append(artifact)
+    state.artifacts = artifacts
+    return artifact
+
+
+def list_workspace_candidate_paths(workspace_root: str) -> list[str]:
+    if not os.path.isdir(workspace_root):
+        return []
+
+    discovered: list[str] = []
+    for root, dirs, files in os.walk(workspace_root):
+        dirs[:] = [
+            directory
+            for directory in dirs
+            if directory not in SCAN_SKIP_DIRS and not directory.startswith(".")
+        ]
+        for filename in files:
+            lower_name = filename.lower()
+            extension = os.path.splitext(lower_name)[1]
+            if lower_name.endswith(".working.lua"):
+                continue
+            absolute_path = os.path.abspath(os.path.join(root, filename))
+            if (
+                extension not in TEXT_ARTIFACT_EXTENSIONS
+                and os.path.splitext(lower_name)[0] not in GENERIC_TEXT_FILE_NAMES
+                and not is_probably_text_file(absolute_path)
+            ):
+                continue
+            discovered.append(absolute_path)
+            if len(discovered) >= MAX_DISCOVERED_LUA_FILES:
+                return sorted(discovered)
+    return sorted(discovered)
+
+
+def merge_inventory_artifacts(
+    workspace_root: str,
+    existing_artifacts: list[ArtifactRef],
+    candidate_paths: list[str],
+) -> list[ArtifactRef]:
+    existing_by_id = {artifact.id: artifact for artifact in existing_artifacts}
+    merged: list[ArtifactRef] = [build_virtual_project_artifact(workspace_root)]
+    seen_ids = {merged[0].id}
+
+    directory_paths: set[str] = {os.path.abspath(workspace_root)}
+    for path in candidate_paths:
+        if path:
+            absolute_path = os.path.abspath(path)
+            if os.path.isdir(absolute_path):
+                directory_paths.add(absolute_path)
+            else:
+                directory_paths.add(os.path.dirname(absolute_path) or os.path.abspath(workspace_root))
+
+    for directory_path in sorted(directory_paths):
+        artifact = build_artifact_ref(
+            workspace_root,
+            directory_path,
+            entity_type="directory",
+            pinned=bool(existing_by_id.get(artifact_id_from_path("directory", directory_path)).pinned) if artifact_id_from_path("directory", directory_path) in existing_by_id else paths_equal(directory_path, workspace_root),
+        )
+        if artifact.id not in seen_ids:
+            merged.append(artifact)
+            seen_ids.add(artifact.id)
+
+    for path in candidate_paths:
+        absolute_path = os.path.abspath(path)
+        if os.path.isdir(absolute_path):
+            continue
+        artifact = build_artifact_ref(workspace_root, absolute_path, entity_type="file")
+        previous = existing_by_id.get(artifact.id)
+        if previous:
+            artifact.summary = previous.summary or artifact.summary
+            artifact.pinned = previous.pinned
+        if artifact.id not in seen_ids:
+            merged.append(artifact)
+            seen_ids.add(artifact.id)
+
+    for artifact in existing_artifacts:
+        if artifact.id in seen_ids:
+            continue
+        if artifact.entity_type == "virtual":
+            continue
+        if artifact.path and artifact.path.startswith(os.path.abspath(workspace_root)):
+            missing_artifact = build_artifact_ref(
+                workspace_root,
+                artifact.path,
+                entity_type=artifact.entity_type,
+                artifact_kind=artifact.artifact_kind,
+                role=artifact.role,
+                summary=artifact.summary or summarize_artifact_path(artifact.path, artifact.artifact_kind, artifact.entity_type),
+                pinned=artifact.pinned,
+                exists=os.path.exists(artifact.path),
+            )
+            merged.append(missing_artifact)
+            seen_ids.add(missing_artifact.id)
+
+    return merged
+
+
+def build_workspace_inventory(
+    workspace_root: str,
+    existing_artifacts: list[ArtifactRef] | None = None,
+    extra_paths: list[str] | None = None,
+) -> WorkspaceInventory:
+    existing = existing_artifacts or []
+    candidate_paths = list_workspace_candidate_paths(workspace_root)
+    if extra_paths:
+        candidate_paths.extend(os.path.abspath(path) for path in extra_paths if path)
+    candidate_paths = normalize_file_list(candidate_paths)
+    artifacts = merge_inventory_artifacts(workspace_root, existing, candidate_paths)
+    return WorkspaceInventory(
+        workspace_root=os.path.abspath(workspace_root),
+        artifacts=artifacts,
+        scanned_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    )
+
+
+def select_default_active_directory_id(state: SessionState) -> str:
+    active_target = get_artifact_by_id(state, state.active_target_id)
+    if active_target and active_target.path:
+        directory_path = active_target.path if active_target.entity_type == "directory" else os.path.dirname(active_target.path)
+        directory_artifact = get_artifact_by_path(state, directory_path, "directory")
+        if directory_artifact:
+            return directory_artifact.id
+    workspace_directory = get_artifact_by_path(state, state.workspace_root, "directory")
+    return workspace_directory.id if workspace_directory else ""
+
+
+def sync_state_compatibility(state: SessionState) -> None:
+    if state.current_code.strip() and not state.current_content.strip():
+        state.current_content = state.current_code
+
+    active_target = get_artifact_by_id(state, state.active_target_id)
+    if not active_target and state.current_target_path:
+        active_target = get_artifact_by_path(state, state.current_target_path)
+    if not active_target and state.output_path:
+        active_target = get_artifact_by_path(state, state.output_path)
+
+    if not active_target and state.output_path:
+        active_target = upsert_artifact(
+            state,
+            build_artifact_ref(
+                state.workspace_root,
+                state.output_path,
+                entity_type="file",
+                pinned=True,
+                summary="active target",
+                exists=os.path.exists(state.output_path),
+            ),
+        )
+
+    if active_target:
+        state.active_target_id = active_target.id
+        state.current_target_path = active_target.path
+        state.output_path = active_target.path
+        state.artifact_type = active_target.artifact_kind
+        state.working_path = (
+            os.path.abspath(build_working_path(active_target.path))
+            if active_target.path and active_target.entity_type == "file"
+            else ""
+        )
+        if active_target.entity_type != "file":
+            state.current_content = ""
+            state.current_code = ""
+        elif not state.current_content and active_target.path and active_target.exists:
+            state.current_content = load_preferred_code(active_target.path, build_working_path(active_target.path), state.current_code or "")
+    else:
+        state.active_target_id = ""
+        state.current_target_path = ""
+
+    if not state.active_directory_id:
+        state.active_directory_id = select_default_active_directory_id(state)
+
+    if state.workspace_root:
+        workspace_directory = get_artifact_by_path(state, state.workspace_root, "directory")
+        if workspace_directory:
+            if not state.active_directory_id:
+                state.active_directory_id = workspace_directory.id
+
+    if state.current_content.strip() or not state.current_code.strip():
+        state.current_code = state.current_content
+
+
+def rebuild_state_inventory(state: SessionState, extra_paths: list[str] | None = None) -> None:
+    inventory = build_workspace_inventory(state.workspace_root, state.artifacts, extra_paths)
+    state.artifacts = inventory.artifacts
+    sync_state_compatibility(state)
+
+
+def get_active_target_artifact(state: SessionState) -> ArtifactRef | None:
+    sync_state_compatibility(state)
+    return get_artifact_by_id(state, state.active_target_id)
+
+
+def get_active_directory_artifact(state: SessionState) -> ArtifactRef | None:
+    sync_state_compatibility(state)
+    return get_artifact_by_id(state, state.active_directory_id)
+
+
+def migrate_resolution_from_legacy(
+    target_path: str,
+    intent: str,
+    artifact_kind: str,
+    source: str = "fallback",
+) -> ResolutionResult | None:
+    if not target_path:
+        return None
+    return ResolutionResult(
+        target_id=artifact_id_from_path("file", target_path, artifact_kind),
+        target_path=os.path.abspath(target_path),
+        intent=intent or "create",
+        confidence=0.5,
+        source=source,
+        reasons=["Migrated from legacy path-based state."],
+        requested_artifact_kind=artifact_kind or "unknown",
+    )
+
+
 def load_context_data(context_path: str) -> dict:
     if not os.path.exists(context_path):
         return {}
@@ -979,15 +1827,11 @@ def load_context_data(context_path: str) -> dict:
 
 def resolve_workspace_root(args: argparse.Namespace, prompt: str = "") -> str:
     cwd = os.path.abspath(os.getcwd())
-    explicit_file = extract_explicit_lua_path_candidate(prompt)
-    if explicit_file:
-        resolved_file = resolve_prompt_path(explicit_file, cwd)
-        return os.path.dirname(resolved_file) or cwd
-
-    explicit_document = extract_explicit_markdown_path_candidate(prompt)
-    if explicit_document:
-        resolved_file = resolve_prompt_path(explicit_document, cwd)
-        return os.path.dirname(resolved_file) or cwd
+    explicit_path = extract_explicit_path(prompt, cwd)
+    if explicit_path:
+        if looks_like_file_path(explicit_path):
+            return os.path.dirname(explicit_path) or cwd
+        return explicit_path
 
     requested_directory = extract_requested_output_directory(prompt)
     if requested_directory:
@@ -1007,45 +1851,38 @@ def load_session_state(
     workspace_root = os.path.abspath(workspace_root)
     context_path = build_context_path(workspace_root)
     data = load_context_data(context_path)
-    restored_managed_files = normalize_file_list([str(item) for item in data.get("managed_files", [])])
-    managed_files = [path for path in restored_managed_files if path_has_lua_artifact(path)]
-
-    restored_output_path = os.path.abspath(data.get("output_path", fallback_output_path))
-    if path_has_lua_artifact(restored_output_path):
-        output_path = restored_output_path
-    elif managed_files:
-        output_path = managed_files[-1]
-    else:
-        output_path = os.path.abspath(fallback_output_path)
-
-    restored_target_path = (
-        os.path.abspath(data.get("current_target_path", ""))
-        if data.get("current_target_path")
-        else ""
-    )
-    if path_has_lua_artifact(restored_target_path):
-        current_target_path = restored_target_path
-    elif path_has_lua_artifact(output_path):
-        current_target_path = output_path
-    else:
-        current_target_path = ""
-
-    current_code = str(data.get("current_code", ""))
-    if not current_target_path and not path_has_lua_artifact(output_path):
-        current_code = ""
+    restored_managed_files = normalize_file_list([str(item) for item in data.get("managed_files", []) if str(item).strip()])
+    serialized_artifacts = [
+        artifact
+        for artifact in (
+            deserialize_artifact_ref(item, workspace_root)
+            for item in data.get("artifacts", [])
+        )
+        if artifact is not None
+    ]
+    legacy_paths = restored_managed_files + [
+        os.path.abspath(str(data.get("output_path", fallback_output_path))) if (data.get("output_path") or fallback_output_path) else "",
+        os.path.abspath(str(data.get("current_target_path", ""))) if data.get("current_target_path") else "",
+        os.path.abspath(fallback_output_path) if fallback_output_path else "",
+    ]
 
     state = SessionState(
         workspace_root=workspace_root,
         context_path=context_path,
-        output_path=output_path,
-        working_path=os.path.abspath(build_working_path(output_path)),
+        output_path=os.path.abspath(fallback_output_path),
+        working_path=os.path.abspath(fallback_working_path),
+        chat_id=str(data.get("chat_id", "")),
         base_prompt=str(data.get("base_prompt", "")),
         change_requests=[str(item) for item in data.get("change_requests", []) if str(item).strip()],
-        current_code=current_code,
+        artifacts=serialized_artifacts,
+        active_target_id=str(data.get("active_target_id", "")),
+        active_directory_id=str(data.get("active_directory_id", "")),
+        current_content=str(data.get("current_content", data.get("current_code", ""))),
+        current_code=str(data.get("current_code", data.get("current_content", ""))),
         last_report=deserialize_report(data.get("last_report")),
-        managed_files=managed_files,
-        current_target_path=current_target_path,
-        chat_id=str(data.get("chat_id", "")),
+        last_resolution=deserialize_resolution_result(data.get("last_resolution")),
+        managed_files=restored_managed_files,
+        current_target_path=os.path.abspath(str(data.get("current_target_path", ""))) if data.get("current_target_path") else "",
         artifact_type=str(data.get("artifact_type", "lua") or "lua"),
         last_route_intent=str(data.get("last_route_intent", "create") or "create"),
     )
@@ -1053,16 +1890,39 @@ def load_session_state(
     if not state.chat_id:
         state.chat_id = new_chat_id()
 
-    cleanup_legacy_working_file(state.output_path)
+    rebuild_state_inventory(state, legacy_paths)
+
+    if not state.active_target_id:
+        legacy_target_path = state.current_target_path or str(data.get("output_path", "") or "")
+        if legacy_target_path:
+            legacy_target = get_artifact_by_path(state, legacy_target_path) or get_artifact_by_path(state, legacy_target_path, "file")
+            if legacy_target:
+                state.active_target_id = legacy_target.id
+    if not state.active_directory_id:
+        state.active_directory_id = select_default_active_directory_id(state)
+    if state.last_resolution is None:
+        legacy_resolution_path = state.current_target_path or state.output_path
+        state.last_resolution = migrate_resolution_from_legacy(
+            legacy_resolution_path,
+            state.last_route_intent,
+            state.artifact_type,
+            source="fallback",
+        )
+
+    sync_state_compatibility(state)
+
+    if state.output_path:
+        cleanup_legacy_working_file(state.output_path)
     for path in state.managed_files:
         cleanup_legacy_working_file(path)
 
     preferred_code = load_preferred_code(
         state.current_target_path or state.output_path,
         build_working_path(state.current_target_path or state.output_path),
-        state.current_code,
+        state.current_content or state.current_code,
     )
     if preferred_code:
+        state.current_content = preferred_code
         state.current_code = preferred_code
 
     return state
@@ -1070,18 +1930,24 @@ def load_session_state(
 
 def save_session_state(state: SessionState) -> None:
     os.makedirs(state.workspace_root, exist_ok=True)
+    sync_state_compatibility(state)
     payload = {
-        "version": 1,
+        "version": 2,
         "chat_id": state.chat_id or new_chat_id(),
         "workspace_root": state.workspace_root,
         "output_path": state.output_path,
         "working_path": state.working_path,
         "current_target_path": state.current_target_path or state.output_path,
+        "active_target_id": state.active_target_id,
+        "active_directory_id": state.active_directory_id,
         "base_prompt": state.base_prompt,
         "change_requests": state.change_requests,
+        "artifacts": [serialize_artifact_ref(artifact) for artifact in state.artifacts],
+        "current_content": state.current_content,
         "current_code": state.current_code,
         "managed_files": normalize_file_list(state.managed_files),
         "last_report": serialize_report(state.last_report),
+        "last_resolution": serialize_resolution_result(state.last_resolution),
         "artifact_type": state.artifact_type,
         "last_route_intent": state.last_route_intent,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1103,26 +1969,43 @@ def switch_workspace(
     state.context_path = loaded_state.context_path
     state.output_path = loaded_state.output_path
     state.working_path = loaded_state.working_path
+    state.chat_id = loaded_state.chat_id
     state.base_prompt = loaded_state.base_prompt
     state.change_requests = loaded_state.change_requests
+    state.artifacts = loaded_state.artifacts
+    state.active_target_id = loaded_state.active_target_id
+    state.active_directory_id = loaded_state.active_directory_id
+    state.current_content = loaded_state.current_content
     state.current_code = loaded_state.current_code
     state.last_report = loaded_state.last_report
+    state.last_resolution = loaded_state.last_resolution
     state.managed_files = loaded_state.managed_files
     state.current_target_path = loaded_state.current_target_path
-    state.chat_id = loaded_state.chat_id
     state.artifact_type = loaded_state.artifact_type
     state.last_route_intent = loaded_state.last_route_intent
+    sync_state_compatibility(state)
 
 
 def sync_current_code_from_active_target(state: SessionState) -> None:
+    sync_state_compatibility(state)
     target_path = state.current_target_path or state.output_path
+    if not target_path:
+        state.current_content = ""
+        state.current_code = ""
+        return
     working_path = build_working_path(target_path)
-    state.current_code = load_preferred_code(target_path, working_path, state.current_code)
+    loaded_content = load_preferred_code(target_path, working_path, state.current_content or state.current_code)
+    state.current_content = loaded_content
+    state.current_code = loaded_content
 
 
 def register_managed_file(state: SessionState, path: str) -> None:
     normalized = normalize_file_list(state.managed_files + [path])
     state.managed_files = normalized
+    if path:
+        artifact = build_artifact_ref(state.workspace_root, path, entity_type="file", pinned=True)
+        upsert_artifact(state, artifact)
+        rebuild_state_inventory(state, [path])
 
 
 def discover_workspace_lua_files(workspace_root: str) -> list[str]:
@@ -1201,17 +2084,20 @@ def select_target_from_context_file(context_path: str, state: SessionState) -> T
     if not current_code and not any(path_has_lua_artifact(path) for path in restored_managed_files + [output_path]):
         return None
 
-    working_path = os.path.abspath(build_working_path(output_path))
-    fallback_code = current_code or get_target_code(state, output_path, working_path)
-    return TargetSelection(
-        output_path=output_path,
-        working_path=working_path,
-        current_code=fallback_code,
+    selection = build_target_selection_for_path(
+        state,
+        output_path,
         explicit=True,
-        exists=bool(fallback_code) or os.path.exists(output_path) or os.path.exists(working_path),
-        source="context",
-        restored_from_context=bool(fallback_code) and not os.path.exists(output_path),
+        source="fallback",
+        requested_artifact_kind=infer_artifact_kind(output_path, "file"),
+        confidence=0.66,
+        reasons=["Target restored from saved workspace context."],
+        restored_from_context=bool(current_code) and not os.path.exists(output_path),
     )
+    if current_code:
+        selection.current_code = current_code
+        selection.exists = True
+    return selection
 
 
 def summarize_lua_file(path: str) -> str:
@@ -1256,6 +2142,382 @@ def get_target_code(state: SessionState, output_path: str, working_path: str) ->
     return load_preferred_code(output_path, working_path, fallback_code)
 
 
+def resolve_directory_artifact_id(state: SessionState, path: str) -> str:
+    if not path:
+        return ""
+    directory_path = path if os.path.isdir(path) else os.path.dirname(os.path.abspath(path))
+    if not directory_path:
+        directory_path = state.workspace_root
+    directory_artifact = get_artifact_by_path(state, directory_path, "directory")
+    if not directory_artifact:
+        directory_artifact = upsert_artifact(
+            state,
+            build_artifact_ref(state.workspace_root, directory_path, entity_type="directory", pinned=paths_equal(directory_path, state.workspace_root)),
+        )
+    return directory_artifact.id
+
+
+def build_target_selection_for_path(
+    state: SessionState,
+    output_path: str,
+    explicit: bool,
+    source: str,
+    requested_artifact_kind: str,
+    confidence: float,
+    reasons: list[str],
+    restored_from_context: bool = False,
+    entity_type: str = "file",
+) -> TargetSelection:
+    normalized_output = os.path.abspath(output_path)
+    working_path = os.path.abspath(build_working_path(normalized_output)) if entity_type == "file" else ""
+    artifact = get_artifact_by_path(state, normalized_output, entity_type) or upsert_artifact(
+        state,
+        build_artifact_ref(
+            state.workspace_root,
+            normalized_output,
+            entity_type=entity_type,
+            pinned=explicit or source in {"managed", "carryover", "explicit"},
+            exists=os.path.exists(normalized_output),
+        ),
+    )
+    return TargetSelection(
+        output_path=normalized_output,
+        working_path=working_path,
+        current_code=get_target_code(state, normalized_output, working_path) if entity_type == "file" else "",
+        explicit=explicit,
+        exists=os.path.isdir(normalized_output) if entity_type == "directory" else (os.path.exists(normalized_output) or os.path.exists(working_path)),
+        source=source,
+        entity_type=entity_type,
+        artifact_kind=artifact.artifact_kind,
+        restored_from_context=restored_from_context,
+        artifact_id=artifact.id,
+        directory_id=resolve_directory_artifact_id(state, normalized_output),
+        confidence=confidence,
+        reasons=reasons,
+        requested_artifact_kind=requested_artifact_kind,
+    )
+
+
+def build_directory_selection_for_path(
+    state: SessionState,
+    directory_path: str,
+    explicit: bool,
+    source: str,
+    confidence: float,
+    reasons: list[str],
+) -> TargetSelection:
+    return build_target_selection_for_path(
+        state,
+        directory_path,
+        explicit=explicit,
+        source=source,
+        requested_artifact_kind="directory",
+        confidence=confidence,
+        reasons=reasons,
+        entity_type="directory",
+    )
+
+
+def collect_inventory_candidates(
+    state: SessionState,
+    semantics: ParsedRequestSemantics,
+) -> list[ArtifactRef]:
+    candidates: list[ArtifactRef] = []
+    for artifact in state.artifacts:
+        if artifact.entity_type == "virtual":
+            continue
+        if semantics.requested_entity_type == "directory" and artifact.entity_type != "directory":
+            continue
+        if semantics.requested_entity_type == "file" and artifact.entity_type != "file":
+            continue
+        candidates.append(artifact)
+    return candidates
+
+
+def score_target_candidate(
+    state: SessionState,
+    semantics: ParsedRequestSemantics,
+    artifact: ArtifactRef,
+) -> tuple[int, list[str], str]:
+    score = 0
+    reasons: list[str] = []
+    source = "semantic_resolver"
+    active_target = get_active_target_artifact(state)
+    active_directory = get_active_directory_artifact(state)
+    target_directory = semantics.target_directory
+    expected_entity_type = normalize_requested_entity_type(semantics.requested_entity_type, semantics.requested_artifact_kind)
+    requested_kind = semantics.requested_artifact_kind
+    file_name = os.path.basename(artifact.path).lower() if artifact.path else ""
+
+    if expected_entity_type != "unknown":
+        if artifact.entity_type == expected_entity_type:
+            score += 24
+            reasons.append(f"entity type matches requested {expected_entity_type}")
+        else:
+            score -= 40
+            reasons.append("entity type does not match the request")
+
+    if requested_kind != "unknown":
+        if artifact.artifact_kind == requested_kind:
+            score += 26
+            reasons.append(f"artifact kind matches {requested_kind}")
+        elif requested_kind == "markdown" and artifact.artifact_kind == "readme":
+            score += 20
+            reasons.append("README satisfies the requested Markdown artifact")
+        elif requested_kind == "generic_file" and artifact.entity_type == "file":
+            score += 10
+            reasons.append("generic file request allows this text file candidate")
+        elif requested_kind == "directory" and artifact.entity_type == "directory":
+            score += 16
+        else:
+            score -= 14
+
+    if semantics.explicit_path:
+        normalized_explicit = os.path.abspath(semantics.explicit_path)
+        if artifact.path and paths_equal(artifact.path, normalized_explicit):
+            score += 90
+            source = "explicit"
+            reasons.append("exact explicit path match")
+        elif artifact.path and path_is_within(artifact.path, normalized_explicit):
+            score += 28
+            source = "explicit"
+            reasons.append("candidate is inside the explicitly referenced path")
+
+    if semantics.explicit_filename and file_name == semantics.explicit_filename.lower():
+        score += 42
+        source = "explicit"
+        reasons.append("filename matches the explicit filename from the request")
+
+    if semantics.explicit_extension:
+        if artifact.extension == semantics.explicit_extension:
+            score += 12
+            reasons.append("extension matches the explicit extension")
+        elif artifact.entity_type == "file":
+            score -= 5
+
+    if target_directory and artifact.path and path_is_within(artifact.path, target_directory):
+        score += 22
+        reasons.append("artifact is inside the requested directory scope")
+
+    if active_target and artifact.id == active_target.id:
+        score += 34 if semantics.follow_active_context else 20
+        source = "carryover" if source != "explicit" else source
+        reasons.append("matches the active target from the current chat")
+
+    if active_directory and active_directory.path and artifact.path and path_is_within(artifact.path, active_directory.path):
+        score += 10
+        reasons.append("artifact is inside the active directory")
+
+    if artifact.role == "documentation" and requested_kind in {"readme", "markdown"}:
+        score += 8
+        reasons.append("role matches documentation")
+    elif artifact.role == "config" and requested_kind in {"json", "generic_file"}:
+        score += 8
+        reasons.append("role matches configuration")
+    elif artifact.role == "entrypoint" and requested_kind == "lua":
+        score += 8
+        reasons.append("role matches Lua entrypoint")
+
+    if artifact.pinned:
+        score += 4
+        reasons.append("artifact is pinned in workspace state")
+    if artifact.path and artifact.path.lower() in {path.lower() for path in state.managed_files}:
+        score += 6
+        reasons.append("artifact was previously managed in this chat")
+    if semantics.expects_existing_target:
+        if artifact.exists:
+            score += 6
+        else:
+            score -= 24
+
+    return score, reasons[:6], source
+
+
+def choose_best_inventory_candidate(
+    state: SessionState,
+    semantics: ParsedRequestSemantics,
+) -> tuple[ArtifactRef | None, float, list[str], str]:
+    best_artifact: ArtifactRef | None = None
+    best_score = -10_000
+    best_reasons: list[str] = []
+    best_source = "fallback"
+    for artifact in collect_inventory_candidates(state, semantics):
+        score, reasons, source = score_target_candidate(state, semantics, artifact)
+        if score > best_score:
+            best_artifact = artifact
+            best_score = score
+            best_reasons = reasons
+            best_source = source
+    confidence = max(0.0, min(0.99, best_score / 100.0))
+    return best_artifact, confidence, best_reasons, best_source
+
+
+def derive_creation_directory(
+    state: SessionState,
+    semantics: ParsedRequestSemantics,
+) -> str:
+    if semantics.explicit_path and semantics.requested_entity_type == "directory":
+        return os.path.abspath(os.path.dirname(semantics.explicit_path) or state.workspace_root)
+    if semantics.target_directory:
+        return os.path.abspath(semantics.target_directory)
+    if semantics.explicit_path and looks_like_file_path(semantics.explicit_path):
+        return os.path.abspath(os.path.dirname(semantics.explicit_path) or state.workspace_root)
+    active_directory = get_active_directory_artifact(state)
+    if active_directory and active_directory.path:
+        return os.path.abspath(active_directory.path)
+    return os.path.abspath(state.workspace_root)
+
+
+def derive_creation_path(
+    state: SessionState,
+    prompt: str,
+    semantics: ParsedRequestSemantics,
+) -> str:
+    if semantics.explicit_path:
+        return os.path.abspath(semantics.explicit_path)
+    base_directory = derive_creation_directory(state, semantics)
+    if semantics.requested_entity_type == "directory":
+        directory_name = semantics.explicit_filename or build_task_slug(prompt) or "workspace_item"
+        return os.path.abspath(os.path.join(base_directory, directory_name))
+    filename = semantics.explicit_filename or default_filename_for_artifact_kind(
+        semantics.requested_artifact_kind,
+        prompt,
+        semantics.explicit_extension,
+    )
+    return os.path.abspath(os.path.join(base_directory, filename))
+
+
+def resolve_target(
+    args: argparse.Namespace,
+    state: SessionState,
+    prompt: str,
+    semantics: ParsedRequestSemantics,
+) -> TargetSelection:
+    extra_paths: list[str] = []
+    if semantics.explicit_path:
+        extra_paths.append(semantics.explicit_path)
+        if looks_like_file_path(semantics.explicit_path):
+            extra_paths.append(os.path.dirname(semantics.explicit_path))
+    if semantics.target_directory:
+        extra_paths.append(semantics.target_directory)
+    rebuild_state_inventory(state, extra_paths)
+
+    if semantics.explicit_path:
+        normalized_explicit = os.path.abspath(semantics.explicit_path)
+        explicit_entity_type = (
+            "directory"
+            if semantics.requested_entity_type == "directory" or (os.path.exists(normalized_explicit) and os.path.isdir(normalized_explicit))
+            else "file"
+        )
+        explicit_artifact = get_artifact_by_path(state, normalized_explicit, explicit_entity_type)
+        if explicit_artifact:
+            if explicit_entity_type == "directory":
+                return build_directory_selection_for_path(
+                    state,
+                    explicit_artifact.path,
+                    explicit=True,
+                    source="explicit",
+                    confidence=0.99,
+                    reasons=["Using the exact directory path explicitly referenced by the user."],
+                )
+            return build_target_selection_for_path(
+                state,
+                explicit_artifact.path,
+                explicit=True,
+                source="explicit",
+                requested_artifact_kind=semantics.requested_artifact_kind or explicit_artifact.artifact_kind,
+                confidence=0.99,
+                reasons=["Using the exact file path explicitly referenced by the user."],
+            )
+        if semantics.intent == "create" or semantics.create_if_missing:
+            if explicit_entity_type == "directory":
+                return build_directory_selection_for_path(
+                    state,
+                    normalized_explicit,
+                    explicit=True,
+                    source="explicit",
+                    confidence=0.95,
+                    reasons=["Creating the directory at the explicit path requested by the user."],
+                )
+            return build_target_selection_for_path(
+                state,
+                normalized_explicit,
+                explicit=True,
+                source="explicit",
+                requested_artifact_kind=normalize_requested_artifact_kind(
+                    semantics.requested_artifact_kind,
+                    os.path.basename(normalized_explicit),
+                    os.path.splitext(normalized_explicit)[1],
+                ),
+                confidence=0.95,
+                    reasons=["Creating the file at the explicit path requested by the user."],
+                )
+
+    if semantics.intent == "create" and semantics.explicit_filename:
+        explicit_create_path = derive_creation_path(state, prompt, semantics)
+        if not os.path.exists(explicit_create_path):
+            return build_target_selection_for_path(
+                state,
+                explicit_create_path,
+                explicit=True,
+                source="explicit",
+                requested_artifact_kind=normalize_requested_artifact_kind(
+                    semantics.requested_artifact_kind,
+                    os.path.basename(explicit_create_path),
+                    os.path.splitext(explicit_create_path)[1],
+                ),
+                confidence=0.94,
+                reasons=["Creating the explicitly named file requested by the user."],
+            )
+
+    best_artifact, confidence, reasons, source = choose_best_inventory_candidate(state, semantics)
+    minimum_score_ok = confidence >= 0.45 or source in {"explicit", "carryover"}
+    if best_artifact and minimum_score_ok:
+        if best_artifact.entity_type == "directory":
+            return build_directory_selection_for_path(
+                state,
+                best_artifact.path,
+                explicit=source == "explicit",
+                source=source,
+                confidence=confidence,
+                reasons=reasons or ["Resolved the directory from workspace inventory and active context."],
+            )
+        return build_target_selection_for_path(
+            state,
+            best_artifact.path,
+            explicit=source == "explicit",
+            source=source,
+            requested_artifact_kind=semantics.requested_artifact_kind or best_artifact.artifact_kind,
+            confidence=confidence,
+            reasons=reasons or ["Resolved the file from workspace inventory and active context."],
+        )
+
+    creation_path = derive_creation_path(state, prompt, semantics)
+    if semantics.requested_entity_type == "directory":
+        return build_directory_selection_for_path(
+            state,
+            creation_path,
+            explicit=bool(semantics.explicit_path),
+            source="fallback",
+            confidence=0.42,
+            reasons=["No grounded directory candidate was found, so a conservative directory create path was chosen."],
+        )
+    requested_kind = normalize_requested_artifact_kind(
+        semantics.requested_artifact_kind,
+        os.path.basename(creation_path),
+        os.path.splitext(creation_path)[1],
+    )
+    return build_target_selection_for_path(
+        state,
+        creation_path,
+        explicit=bool(semantics.explicit_path or semantics.explicit_filename),
+        source="fallback",
+        requested_artifact_kind=requested_kind,
+        confidence=0.42,
+        reasons=["No grounded file candidate was found, so a conservative create target was chosen."],
+    )
+
+
 def collect_known_lua_files(state: SessionState, extra_paths: list[str] | None = None) -> list[str]:
     combined = discover_workspace_lua_files(state.workspace_root)
     combined.extend(
@@ -1272,7 +2534,16 @@ def select_existing_lua_from_directory(directory: str, state: SessionState) -> s
     if not directory or not os.path.isdir(directory):
         return None
 
-    candidate_files = discover_workspace_lua_files(directory)
+    normalized_directory = os.path.abspath(directory)
+    rebuild_state_inventory(state, [normalized_directory])
+    candidate_files = [
+        artifact.path
+        for artifact in state.artifacts
+        if artifact.entity_type == "file"
+        and artifact.artifact_kind == "lua"
+        and artifact.path
+        and path_is_within(artifact.path, normalized_directory)
+    ]
     if not candidate_files:
         return None
 
@@ -1296,7 +2567,16 @@ def select_existing_readme_from_directory(directory: str, state: SessionState) -
     if not directory or not os.path.isdir(directory):
         return None
 
-    candidate_files = discover_workspace_readme_files(directory)
+    normalized_directory = os.path.abspath(directory)
+    rebuild_state_inventory(state, [normalized_directory])
+    candidate_files = [
+        artifact.path
+        for artifact in state.artifacts
+        if artifact.entity_type == "file"
+        and artifact.artifact_kind == "readme"
+        and artifact.path
+        and path_is_within(artifact.path, normalized_directory)
+    ]
     if not candidate_files:
         return None
 
@@ -1317,15 +2597,14 @@ def select_existing_readme_from_directory(directory: str, state: SessionState) -
 def select_existing_target_from_directory(directory: str, state: SessionState) -> TargetSelection | None:
     file_target = select_existing_lua_from_directory(directory, state)
     if file_target:
-        output_path = os.path.abspath(file_target)
-        working_path = os.path.abspath(build_working_path(output_path))
-        return TargetSelection(
-            output_path=output_path,
-            working_path=working_path,
-            current_code=get_target_code(state, output_path, working_path),
+        return build_target_selection_for_path(
+            state,
+            file_target,
             explicit=True,
-            exists=os.path.exists(output_path) or os.path.exists(working_path),
-            source="directory",
+            source="explicit",
+            requested_artifact_kind="lua",
+            confidence=0.92,
+            reasons=["User referenced a directory and a Lua target was found inside it."],
         )
 
     context_candidates: list[tuple[int, int, str, TargetSelection]] = []
@@ -1493,15 +2772,14 @@ def select_readme_target_file(
 ) -> TargetSelection:
     explicit_target = extract_explicit_markdown_target(prompt, state)
     if explicit_target:
-        output_path = os.path.abspath(explicit_target)
-        working_path = os.path.abspath(build_working_path(output_path))
-        return TargetSelection(
-            output_path=output_path,
-            working_path=working_path,
-            current_code=get_target_code(state, output_path, working_path),
+        return build_target_selection_for_path(
+            state,
+            explicit_target,
             explicit=True,
-            exists=os.path.exists(output_path),
             source="explicit",
+            requested_artifact_kind="readme",
+            confidence=0.98,
+            reasons=["User explicitly named a Markdown target."],
         )
 
     if route.intent in {"inspect", "change"}:
@@ -1509,15 +2787,14 @@ def select_readme_target_file(
         if requested_directory:
             existing_readme = select_existing_readme_from_directory(requested_directory, state)
             if existing_readme:
-                output_path = os.path.abspath(existing_readme)
-                working_path = os.path.abspath(build_working_path(output_path))
-                return TargetSelection(
-                    output_path=output_path,
-                    working_path=working_path,
-                    current_code=get_target_code(state, output_path, working_path),
+                return build_target_selection_for_path(
+                    state,
+                    existing_readme,
                     explicit=True,
-                    exists=os.path.exists(output_path),
-                    source="directory",
+                    source="explicit",
+                    requested_artifact_kind="readme",
+                    confidence=0.9,
+                    reasons=["User referenced a directory and README.md was found inside it."],
                 )
 
     preferred_output = ""
@@ -1529,14 +2806,14 @@ def select_readme_target_file(
     if not preferred_output:
         preferred_output, _ = resolve_readme_output_paths(args, state, prompt, route)
 
-    working_path = os.path.abspath(build_working_path(preferred_output))
-    return TargetSelection(
-        output_path=os.path.abspath(preferred_output),
-        working_path=working_path,
-        current_code=get_target_code(state, preferred_output, working_path),
+    return build_target_selection_for_path(
+        state,
+        preferred_output,
         explicit=False,
-        exists=os.path.exists(preferred_output),
-        source="readme",
+        source="carryover" if state.active_target_id else "fallback",
+        requested_artifact_kind="readme",
+        confidence=0.75 if state.active_target_id else 0.55,
+        reasons=["Using the active or default README target for this workspace."],
     )
 
 
@@ -1552,15 +2829,14 @@ def select_target_file(
 
     explicit_target = extract_explicit_lua_target(prompt, state)
     if explicit_target:
-        output_path = os.path.abspath(explicit_target)
-        working_path = os.path.abspath(build_working_path(output_path))
-        return TargetSelection(
-            output_path=output_path,
-            working_path=working_path,
-            current_code=get_target_code(state, output_path, working_path),
+        return build_target_selection_for_path(
+            state,
+            explicit_target,
             explicit=True,
-            exists=os.path.exists(output_path) or os.path.exists(working_path),
             source="explicit",
+            requested_artifact_kind="lua",
+            confidence=0.98,
+            reasons=["User explicitly named a Lua file target."],
         )
 
     if route.intent in {"inspect", "change"}:
@@ -1572,20 +2848,25 @@ def select_target_file(
 
     if is_new_project:
         output_path, working_path = resolve_route_output_paths(args, state, prompt, route)
-        return TargetSelection(
-            output_path=output_path,
-            working_path=working_path,
-            current_code=get_target_code(state, output_path, working_path),
+        selection = build_target_selection_for_path(
+            state,
+            output_path,
             explicit=False,
-            exists=os.path.exists(output_path) or os.path.exists(working_path),
-            source="new",
+            source="semantic_resolver",
+            requested_artifact_kind=route.artifact_type,
+            confidence=0.76,
+            reasons=["Created a new target based on the semantic resolver and workspace scope."],
         )
+        selection.working_path = working_path
+        return selection
 
-    preferred_output = state.output_path
+    active_target = get_artifact_by_id(state, state.active_target_id)
+    preferred_output = active_target.path if active_target and active_target.entity_type == "file" else state.output_path
     if not preferred_output:
         existing_managed = [
             path for path in normalize_file_list(state.managed_files)
-            if os.path.exists(path) or os.path.exists(build_working_path(path))
+            if (os.path.exists(path) or os.path.exists(build_working_path(path)))
+            and infer_artifact_kind(path, "file") == route.artifact_type
         ]
         if existing_managed:
             preferred_output = existing_managed[-1]
@@ -1593,22 +2874,54 @@ def select_target_file(
     if not preferred_output:
         preferred_output, _ = resolve_route_output_paths(args, state, prompt, route)
 
-    working_path = os.path.abspath(build_working_path(preferred_output))
-    return TargetSelection(
-        output_path=os.path.abspath(preferred_output),
-        working_path=working_path,
-        current_code=get_target_code(state, preferred_output, working_path),
+    return build_target_selection_for_path(
+        state,
+        preferred_output,
         explicit=False,
-        exists=os.path.exists(preferred_output) or os.path.exists(working_path),
-        source="managed" if state.managed_files else "current",
+        source="carryover" if active_target else ("fallback" if not state.managed_files else "semantic_resolver"),
+        requested_artifact_kind=route.artifact_type,
+        confidence=0.8 if active_target else 0.58,
+        reasons=[
+            "Reused the active target from the current chat."
+            if active_target
+            else "Fell back to the best known workspace target."
+        ],
     )
 
 
 def activate_target_selection(state: SessionState, selection: TargetSelection) -> None:
-    state.output_path = selection.output_path
-    state.working_path = selection.working_path
-    state.current_target_path = selection.output_path
-    state.current_code = selection.current_code
+    extra_paths = [selection.output_path]
+    if selection.output_path:
+        extra_paths.append(os.path.dirname(selection.output_path))
+    rebuild_state_inventory(state, extra_paths)
+    target_artifact = get_artifact_by_path(state, selection.output_path, selection.entity_type or None) or upsert_artifact(
+        state,
+        build_artifact_ref(
+            state.workspace_root,
+            selection.output_path,
+            entity_type=selection.entity_type,
+            pinned=True,
+            exists=selection.exists,
+        ),
+    )
+    target_artifact.pinned = True
+    upsert_artifact(state, target_artifact)
+    state.active_target_id = target_artifact.id
+    state.active_directory_id = (
+        target_artifact.id if target_artifact.entity_type == "directory" else (selection.directory_id or resolve_directory_artifact_id(state, selection.output_path))
+    )
+    state.current_content = selection.current_code if target_artifact.entity_type == "file" else ""
+    state.current_code = selection.current_code if target_artifact.entity_type == "file" else ""
+    state.last_resolution = ResolutionResult(
+        target_id=target_artifact.id,
+        target_path=selection.output_path,
+        intent=state.last_route_intent or "create",
+        confidence=selection.confidence,
+        source=selection.source,
+        reasons=list(selection.reasons),
+        requested_artifact_kind=selection.requested_artifact_kind or selection.artifact_kind,
+    )
+    sync_state_compatibility(state)
     cleanup_legacy_working_file(selection.output_path)
 
 
@@ -1739,6 +3052,188 @@ def build_verification_prompt(state: SessionState, target_path: str, explicit_ta
     return f"{prompt}\n\n{target_description}".strip()
 
 
+def build_generic_workspace_context(state: SessionState, target_path: str, explicit_target: bool) -> str:
+    rebuild_state_inventory(state, [target_path, os.path.dirname(target_path)])
+    target_artifact = get_artifact_by_path(state, target_path)
+    lines = [
+        f"Workspace root: {state.workspace_root}",
+        f"Target file: {relative_display_path(target_path, state.workspace_root)}",
+    ]
+    if target_artifact:
+        lines.append(
+            f"Target metadata: kind={target_artifact.artifact_kind} role={target_artifact.role} "
+            f"exists={'yes' if target_artifact.exists else 'no'}"
+        )
+    if explicit_target:
+        lines.append("The user explicitly named this target.")
+    active_target = get_active_target_artifact(state)
+    if active_target and active_target.path and not paths_equal(active_target.path, target_path):
+        lines.append(
+            f"Current active target: {relative_display_path(active_target.path, state.workspace_root)} "
+            f"| kind={active_target.artifact_kind}"
+        )
+    related_artifacts = [
+        artifact
+        for artifact in state.artifacts
+        if artifact.entity_type == "file" and artifact.path and not paths_equal(artifact.path, target_path)
+    ][:MAX_CONTEXT_FILE_SUMMARIES]
+    if related_artifacts:
+        lines.append("Related workspace artifacts:")
+        for artifact in related_artifacts:
+            labels: list[str] = [artifact.artifact_kind]
+            if artifact.path.lower() in {path.lower() for path in state.managed_files}:
+                labels.append("managed")
+            lines.append(
+                f"- [{', '.join(labels)}] {relative_display_path(artifact.path, state.workspace_root)} | {artifact.summary}"
+            )
+    return "\n".join(lines)
+
+
+def build_text_artifact_generation_prompt(
+    state: SessionState,
+    user_request: str,
+    target_path: str,
+    explicit_target: bool,
+    artifact_kind: str,
+) -> str:
+    sections = [f"User request:\n{user_request.strip()}"]
+    chat_memory = build_model_change_summary(state)
+    if chat_memory:
+        sections.append(chat_memory)
+    sections.append(build_generic_workspace_context(state, target_path, explicit_target))
+    sections.append(
+        "Target file requirements:\n"
+        f"- File path: {relative_display_path(target_path, state.workspace_root)}\n"
+        f"- Artifact kind: {artifact_kind}\n"
+        f"- Return only the full content for this single {artifact_kind_display_name(artifact_kind, target_path)}."
+    )
+    return "\n\n".join(section for section in sections if section.strip())
+
+
+def build_text_artifact_verification_prompt(
+    state: SessionState,
+    target_path: str,
+    explicit_target: bool,
+    artifact_kind: str,
+) -> str:
+    prompt = state.effective_prompt().strip()
+    if not prompt:
+        prompt = f"Update the target {artifact_kind_display_name(artifact_kind, target_path)} according to the active chat requirements."
+    target_description = (
+        f"Target file: {relative_display_path(target_path, state.workspace_root)}\n"
+        f"Artifact kind: {artifact_kind}"
+    )
+    if explicit_target:
+        target_description += "\nThe user explicitly requested this file."
+    return f"{prompt}\n\n{target_description}".strip()
+
+
+def normalize_text_artifact_content(text: str) -> str:
+    return normalize_document_text(text)
+
+
+def request_generated_text_artifact(
+    args: argparse.Namespace,
+    prompt: str,
+    strict_mode: bool = False,
+    format_reason: str = "",
+) -> str:
+    system_prompt = (
+        TEXT_ARTIFACT_GENERATE_SYSTEM_PROMPT
+        if not strict_mode
+        else build_strict_system_prompt(TEXT_ARTIFACT_GENERATE_SYSTEM_PROMPT)
+    )
+    user_prompt = prompt
+    temperature = args.temperature if not strict_mode else min(args.temperature, 0.05)
+    if strict_mode and format_reason:
+        user_prompt = (
+            f"{prompt}\n\n"
+            "Previous model response format issue to avoid:\n"
+            f"{format_reason}\n\n"
+            "Return only the target file content."
+        )
+    payload = build_payload(
+        model=args.model,
+        user_prompt=user_prompt,
+        system_prompt=system_prompt,
+        temperature=temperature,
+    )
+    response_text = request_chat_completion(args.url, payload, args.request_timeout)
+    text = normalize_text_artifact_content(response_text)
+    if not text:
+        raise RuntimeError("LM Studio returned empty file content.")
+    return text
+
+
+def request_edited_text_artifact(
+    args: argparse.Namespace,
+    overall_prompt: str,
+    change_request: str,
+    current_text: str,
+    file_context: str,
+) -> str:
+    payload = {
+        "model": args.model,
+        "temperature": args.temperature,
+        "messages": [
+            {"role": "system", "content": TEXT_ARTIFACT_EDIT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Current overall project requirements:\n{overall_prompt}\n\n"
+                    f"{file_context}\n\n"
+                    f"Latest user change request:\n{change_request}\n\n"
+                    "Update only the target file. Return the full updated file content only."
+                ),
+            },
+            {"role": "assistant", "content": current_text},
+            {
+                "role": "user",
+                "content": "Apply the requested change above. Return only the complete updated file content.",
+            },
+        ],
+    }
+    response_text = request_chat_completion(args.url, payload, args.request_timeout)
+    text = normalize_text_artifact_content(response_text)
+    if not text:
+        raise RuntimeError("LM Studio returned empty file content after the edit request.")
+    return text
+
+
+def request_text_artifact_explanation(
+    args: argparse.Namespace,
+    state: SessionState,
+    user_request: str,
+    target_path: str,
+    current_text: str,
+    explicit_target: bool,
+    artifact_kind: str,
+) -> str:
+    file_context = build_generic_workspace_context(state, target_path, explicit_target)
+    fence_tag = os.path.splitext(target_path)[1].lstrip(".") or "text"
+    payload = {
+        "model": args.model,
+        "temperature": min(args.temperature, 0.2),
+        "messages": [
+            {"role": "system", "content": TEXT_ARTIFACT_EXPLAIN_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"User request:\n{user_request.strip()}\n\n"
+                    f"Target file: {relative_display_path(target_path, state.workspace_root)}\n\n"
+                    f"{file_context}\n\n"
+                    "File content:\n"
+                    f"```{fence_tag}\n{current_text.rstrip()}\n```"
+                ).strip(),
+            },
+        ],
+    }
+    explanation = request_chat_completion(args.url, payload, args.request_timeout).strip()
+    if not explanation:
+        raise RuntimeError("LM Studio returned an empty explanation.")
+    return repair_mojibake(explanation)
+
+
 def build_document_context_for_model(
     state: SessionState,
     target_path: str,
@@ -1823,7 +3318,7 @@ def build_existing_file_base_prompt(
     artifact_type: str = "lua",
 ) -> str:
     relative_path = relative_display_path(target_path, state.workspace_root)
-    artifact_label = "Lua file" if artifact_type == "lua" else "documentation file"
+    artifact_label = artifact_kind_display_name(artifact_type, target_path)
     return (
         f"Use the existing {artifact_label} '{relative_path}' as the primary target for this chat. "
         "Preserve its current purpose unless the user explicitly asks to change it."
@@ -2036,10 +3531,13 @@ def finalize_report(
     current_code: str,
     report: SessionReport,
 ) -> SessionReport:
+    state.current_content = current_code
     state.current_code = current_code
     state.last_report = report
-    state.current_target_path = state.output_path
+    if report.output_path:
+        state.current_target_path = report.output_path
     cleanup_legacy_working_file(state.output_path)
+    sync_state_compatibility(state)
     persist_state(state)
     return report
 
@@ -2338,8 +3836,8 @@ def save_text_output(output_path: str, text: str) -> None:
 
 
 def normalize_best_effort_output(content: str, artifact_type: str) -> str:
-    if artifact_type == "readme":
-        return normalize_document_text(content)
+    if is_text_artifact_kind(artifact_type):
+        return normalize_text_artifact_content(content)
 
     analysis = analyze_lua_response(content)
     if analysis["valid"]:
@@ -2352,7 +3850,7 @@ def save_best_effort_output(output_path: str, content: str, artifact_type: str) 
     if not normalized.strip():
         return False
 
-    if artifact_type == "readme":
+    if is_text_artifact_kind(artifact_type):
         save_text_output(output_path, normalized)
     else:
         save_final_output(output_path, normalized)
@@ -2373,7 +3871,7 @@ def maybe_save_failed_output(
         return report, content
 
     try:
-        if artifact_type == "readme":
+        if is_text_artifact_kind(artifact_type):
             save_text_output(state.output_path, normalized)
         else:
             save_final_output(state.output_path, normalized)
@@ -2775,6 +4273,345 @@ def request_fixed_document(
     return document_text
 
 
+def validate_text_artifact_content(output_path: str, artifact_kind: str, text: str) -> dict:
+    diagnostics = build_info_diagnostics()
+    normalized = normalize_text_artifact_content(text)
+    if not normalized.strip():
+        diagnostics["failure_kind"] = "format"
+        diagnostics["run_error"] = "Model returned an empty file instead of file content."
+        return diagnostics
+    if artifact_kind == "json":
+        try:
+            json.loads(normalized)
+        except json.JSONDecodeError as exc:
+            diagnostics["failure_kind"] = "syntax"
+            diagnostics["run_error"] = f"JSON validation failed: {exc}"
+            return diagnostics
+    diagnostics["success"] = True
+    diagnostics["started_ok"] = True
+    diagnostics["program_mode"] = "text"
+    diagnostics["run_output"] = f"Prepared {artifact_kind_display_name(artifact_kind, output_path)}."
+    return diagnostics
+
+
+def verify_text_artifact(
+    args: argparse.Namespace,
+    prompt: str,
+    text: str,
+    artifact_kind: str,
+    output_path: str,
+) -> dict:
+    verify_model = args.verify_model or args.model
+    return verify_prompt_requirements(
+        prompt=prompt,
+        solution_content=text,
+        model=verify_model,
+        url=args.url,
+        timeout_seconds=args.request_timeout,
+        extra_context=(
+            f"Target artifact kind: {artifact_kind}\n"
+            f"Target path: {output_path}\n"
+            "The answer should be judged as the full contents of a single text file."
+        ),
+    )
+
+
+def request_fixed_text_artifact(
+    args: argparse.Namespace,
+    model_prompt: str,
+    current_text: str,
+    diagnostics: dict,
+    verification: dict | None,
+) -> str:
+    feedback = build_document_fix_feedback(diagnostics, verification)
+    payload = {
+        "model": args.model,
+        "temperature": min(args.temperature, 0.1),
+        "messages": [
+            {"role": "system", "content": TEXT_ARTIFACT_EDIT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Current requirements:\n{model_prompt}\n\n"
+                    f"Current file content:\n{current_text}\n\n"
+                    f"Issues to fix:\n{feedback}\n\n"
+                    "Return only the full corrected file content."
+                ),
+            },
+        ],
+    }
+    response_text = request_chat_completion(args.url, payload, args.request_timeout)
+    text = normalize_text_artifact_content(response_text)
+    if not text:
+        raise RuntimeError("LM Studio returned empty file content for the fix request.")
+    return text
+
+
+def inspect_text_artifact_file(
+    args: argparse.Namespace,
+    state: SessionState,
+    prompt: str,
+    target: TargetSelection,
+) -> SessionReport:
+    try:
+        explanation = request_text_artifact_explanation(
+            args,
+            state,
+            prompt,
+            target.output_path,
+            target.current_code,
+            target.explicit,
+            target.artifact_kind or target.requested_artifact_kind,
+        )
+    except RuntimeError as exc:
+        diagnostics = build_info_diagnostics()
+        diagnostics["run_error"] = repair_mojibake(str(exc))
+        return finalize_report(
+            state,
+            target.current_code,
+            SessionReport(
+                success=False,
+                action="inspect",
+                attempts=0,
+                output_path=target.output_path,
+                working_path="",
+                saved_output=False,
+                diagnostics=diagnostics,
+                message="Explanation request failed.",
+            ),
+        )
+
+    diagnostics = build_info_diagnostics()
+    diagnostics["run_output"] = explanation
+    return finalize_report(
+        state,
+        target.current_code,
+        SessionReport(
+            success=True,
+            action="inspect",
+            attempts=1,
+            output_path=target.output_path,
+            working_path="",
+            saved_output=False,
+            diagnostics=diagnostics,
+            message=explanation,
+        ),
+    )
+
+
+def process_text_artifact(
+    args: argparse.Namespace,
+    state: SessionState,
+    action: str,
+    model_prompt: str,
+    initial_text: str,
+    verification_prompt: str,
+    artifact_kind: str,
+) -> SessionReport:
+    current_text = normalize_text_artifact_content(initial_text)
+    last_diagnostics = build_info_diagnostics()
+    last_verification = None
+    consecutive_format_failures = 0
+    requirement_attempts = 0
+    previous_requirement_score = -1
+    previous_requirement_fingerprint = ""
+
+    for attempt in range(1, args.max_attempts + 1):
+        print(f"[{action}] attempt {attempt}/{args.max_attempts}: text validation")
+        diagnostics = validate_text_artifact_content(state.output_path, artifact_kind, current_text)
+        if diagnostics["success"]:
+            consecutive_format_failures = 0
+        else:
+            consecutive_format_failures += 1
+        last_diagnostics = diagnostics
+
+        if diagnostics["success"] and not args.skip_verification:
+            print(f"[{action}] attempt {attempt}/{args.max_attempts}: requirements check")
+            try:
+                verification = verify_text_artifact(
+                    args,
+                    verification_prompt,
+                    current_text,
+                    artifact_kind,
+                    state.output_path,
+                )
+            except RuntimeError as exc:
+                diagnostics = dict(diagnostics)
+                diagnostics["verification_checked"] = True
+                diagnostics["verification_passed"] = False
+                diagnostics["verification_score"] = 0
+                diagnostics["verification_summary"] = repair_mojibake(str(exc))
+                diagnostics["verification_missing_requirements"] = []
+                diagnostics["verification_warnings"] = []
+                report = SessionReport(
+                    success=False,
+                    action=action,
+                    attempts=attempt,
+                    output_path=state.output_path,
+                    working_path="",
+                    saved_output=False,
+                    diagnostics=diagnostics,
+                    message="Requirements check failed to run.",
+                )
+                report, final_text = maybe_save_failed_output(state, report, current_text, artifact_kind)
+                return finalize_report(state, final_text, report)
+
+            diagnostics = dict(diagnostics)
+            attach_verification(diagnostics, verification)
+            if not verification["passed"]:
+                diagnostics["failure_kind"] = "requirements"
+            last_diagnostics = diagnostics
+            last_verification = verification
+            if verification["passed"]:
+                try:
+                    save_text_output(state.output_path, current_text)
+                except OSError as exc:
+                    diagnostics = dict(diagnostics)
+                    diagnostics["run_error"] = f"Could not save final file: {exc}"
+                    return finalize_report(
+                        state,
+                        current_text,
+                        SessionReport(
+                            success=False,
+                            action=action,
+                            attempts=attempt,
+                            output_path=state.output_path,
+                            working_path="",
+                            saved_output=False,
+                            diagnostics=diagnostics,
+                            verification=verification,
+                            message="Final file could not be written after verification.",
+                        ),
+                    )
+                register_managed_file(state, state.output_path)
+                return finalize_report(
+                    state,
+                    current_text,
+                    SessionReport(
+                        success=True,
+                        action=action,
+                        attempts=attempt,
+                        output_path=state.output_path,
+                        working_path="",
+                        saved_output=True,
+                        diagnostics=diagnostics,
+                        verification=verification,
+                        message="File passed validation and requirements checks.",
+                    ),
+                )
+
+            requirement_attempts += 1
+            if can_soft_accept_verification(diagnostics, verification):
+                save_text_output(state.output_path, current_text)
+                register_managed_file(state, state.output_path)
+                return finalize_report(
+                    state,
+                    current_text,
+                    SessionReport(
+                        success=True,
+                        action=action,
+                        attempts=attempt,
+                        output_path=state.output_path,
+                        working_path="",
+                        saved_output=True,
+                        diagnostics=diagnostics,
+                        verification=verification,
+                        message="File was saved after passing structural checks; requirements review still reported minor gaps.",
+                    ),
+                )
+
+            if should_stop_requirement_retry(
+                verification,
+                requirement_attempts,
+                previous_requirement_score,
+                previous_requirement_fingerprint,
+            ):
+                report = SessionReport(
+                    success=False,
+                    action=action,
+                    attempts=attempt,
+                    output_path=state.output_path,
+                    working_path="",
+                    saved_output=False,
+                    diagnostics=diagnostics,
+                    verification=verification,
+                    message="Text file passed structural checks, but requirements feedback stopped improving.",
+                )
+                report, final_text = maybe_save_failed_output(state, report, current_text, artifact_kind)
+                return finalize_report(state, final_text, report)
+
+            previous_requirement_score = int(verification.get("score", 0))
+            previous_requirement_fingerprint = build_verification_fingerprint(verification)
+        elif diagnostics["success"]:
+            save_text_output(state.output_path, current_text)
+            register_managed_file(state, state.output_path)
+            return finalize_report(
+                state,
+                current_text,
+                SessionReport(
+                    success=True,
+                    action=action,
+                    attempts=attempt,
+                    output_path=state.output_path,
+                    working_path="",
+                    saved_output=True,
+                    diagnostics=diagnostics,
+                    message="File passed validation.",
+                ),
+            )
+
+        if attempt == args.max_attempts:
+            break
+
+        print(f"[{action}] validation failed, requesting a fix from LM Studio")
+        try:
+            if last_diagnostics.get("failure_kind") == "format" and action in {"new", "retry"}:
+                current_text = request_generated_text_artifact(
+                    args,
+                    model_prompt,
+                    strict_mode=True,
+                    format_reason=last_diagnostics.get("run_error", ""),
+                )
+            else:
+                current_text = request_fixed_text_artifact(
+                    args,
+                    model_prompt,
+                    current_text,
+                    last_diagnostics,
+                    last_verification,
+                )
+        except RuntimeError as exc:
+            last_diagnostics = dict(last_diagnostics)
+            last_diagnostics["run_error"] = repair_mojibake(str(exc))
+            report = SessionReport(
+                success=False,
+                action=action,
+                attempts=attempt,
+                output_path=state.output_path,
+                working_path="",
+                saved_output=False,
+                diagnostics=last_diagnostics,
+                verification=last_verification,
+                message="LM Studio fix request failed.",
+            )
+            report, final_text = maybe_save_failed_output(state, report, current_text, artifact_kind)
+            return finalize_report(state, final_text, report)
+
+    report = SessionReport(
+        success=False,
+        action=action,
+        attempts=args.max_attempts,
+        output_path=state.output_path,
+        working_path="",
+        saved_output=False,
+        diagnostics=last_diagnostics,
+        verification=last_verification,
+        message="Maximum attempts reached before the file passed all checks.",
+    )
+    report, final_text = maybe_save_failed_output(state, report, current_text, artifact_kind)
+    return finalize_report(state, final_text, report)
+
+
 def process_document(
     args: argparse.Namespace,
     state: SessionState,
@@ -3008,75 +4845,328 @@ def process_document(
     return finalize_report(state, final_text, report)
 
 
-def start_new_project(args: argparse.Namespace, state: SessionState, prompt: str) -> SessionReport:
-    route = classify_request_route(args, state, prompt)
-    workspace_root = resolve_workspace_root(args, prompt)
-    fallback_output, fallback_working = resolve_route_output_paths(args, state, prompt, route)
-    switch_workspace(state, workspace_root, fallback_output, fallback_working)
+def build_workspace_fallback_output(
+    workspace_root: str,
+    prompt: str,
+    semantics: ParsedRequestSemantics,
+) -> str:
+    if semantics.explicit_path:
+        return os.path.abspath(semantics.explicit_path)
+    if semantics.requested_entity_type == "directory":
+        return os.path.abspath(os.path.join(workspace_root, build_task_slug(prompt) or "workspace_item"))
+    filename = semantics.explicit_filename or default_filename_for_artifact_kind(
+        semantics.requested_artifact_kind,
+        prompt,
+        semantics.explicit_extension,
+    )
+    return os.path.abspath(os.path.join(workspace_root, filename))
 
-    if route.artifact_type == "readme":
-        explicit_markdown = extract_explicit_markdown_target(prompt, state)
-        existing_target_path = explicit_markdown
-        if not existing_target_path:
-            requested_directory = extract_requested_output_directory(prompt)
-            if requested_directory:
-                existing_target_path = select_existing_readme_from_directory(requested_directory, state)
+
+def prepare_workspace_for_semantics(
+    args: argparse.Namespace,
+    state: SessionState,
+    prompt: str,
+    semantics: ParsedRequestSemantics,
+) -> None:
+    workspace_root = resolve_workspace_root(args, prompt)
+    fallback_output = build_workspace_fallback_output(workspace_root, prompt, semantics)
+    fallback_working = build_working_path(fallback_output) if looks_like_file_path(fallback_output) else ""
+    if not paths_equal(workspace_root, state.workspace_root):
+        switch_workspace(state, workspace_root, fallback_output, fallback_working)
     else:
-        existing_target_path = (
-            extract_explicit_lua_target(prompt, state)
-            if extract_explicit_lua_path_candidate(prompt)
-            else extract_directory_lua_target(prompt, state)
+        rebuild_state_inventory(state, [workspace_root, semantics.explicit_path, semantics.target_directory])
+
+
+def resolve_target_for_request(
+    args: argparse.Namespace,
+    state: SessionState,
+    prompt: str,
+    semantics: ParsedRequestSemantics,
+) -> TargetSelection:
+    prepare_workspace_for_semantics(args, state, prompt, semantics)
+    target = resolve_target(args, state, prompt, semantics)
+    target_workspace_root = target.output_path if target.entity_type == "directory" else (os.path.dirname(target.output_path) or state.workspace_root)
+    if target_workspace_root and not paths_equal(target_workspace_root, state.workspace_root):
+        fallback_working = build_working_path(target.output_path) if target.entity_type == "file" else ""
+        switch_workspace(state, target_workspace_root, target.output_path, fallback_working)
+        target = resolve_target(args, state, prompt, semantics)
+    return target
+
+
+def execute_directory_request(
+    state: SessionState,
+    action: str,
+    target: TargetSelection,
+    semantics: ParsedRequestSemantics,
+) -> SessionReport:
+    activate_target_selection(state, target)
+    if semantics.intent == "create":
+        try:
+            os.makedirs(target.output_path, exist_ok=True)
+        except OSError as exc:
+            diagnostics = build_info_diagnostics()
+            diagnostics["run_error"] = f"Could not create directory: {exc}"
+            return finalize_report(
+                state,
+                "",
+                SessionReport(
+                    success=False,
+                    action=action,
+                    attempts=1,
+                    output_path=target.output_path,
+                    working_path="",
+                    saved_output=False,
+                    diagnostics=diagnostics,
+                    message="Directory creation failed.",
+                ),
+            )
+        rebuild_state_inventory(state, [target.output_path])
+        persist_state(state)
+        return finalize_report(
+            state,
+            "",
+            SessionReport(
+                success=True,
+                action=action,
+                attempts=1,
+                output_path=target.output_path,
+                working_path="",
+                saved_output=True,
+                diagnostics=build_info_diagnostics(),
+                message="Directory is ready and selected as the active workspace scope.",
+            ),
+        )
+    persist_state(state)
+    return finalize_report(
+        state,
+        "",
+        SessionReport(
+            success=True,
+            action=action,
+            attempts=1,
+            output_path=target.output_path,
+            working_path="",
+            saved_output=False,
+            diagnostics=build_info_diagnostics(),
+            message="Directory selected as the active workspace scope.",
+        ),
+    )
+
+
+def execute_lua_request(
+    args: argparse.Namespace,
+    state: SessionState,
+    action: str,
+    request_text: str,
+    target: TargetSelection,
+) -> SessionReport:
+    explicit_target = target.explicit
+    if action == "retry":
+        model_prompt = build_retry_prompt(state, target.output_path, explicit_target)
+        verification_prompt = build_verification_prompt(state, target.output_path, explicit_target)
+        if state.current_code.strip():
+            print("[retry] re-running validation and auto-fix on the current code")
+            return process_code(
+                args,
+                state,
+                "retry",
+                model_prompt,
+                state.current_code,
+                verification_prompt,
+                repair_seed_code=state.current_code,
+            )
+        print("[retry] current code is empty, generating again from the stored requirements")
+        try:
+            generated_code = request_generated_code(args, model_prompt)
+        except RuntimeError as exc:
+            diagnostics = empty_diagnostics()
+            diagnostics["run_error"] = repair_mojibake(str(exc))
+            return finalize_report(
+                state,
+                state.current_code,
+                SessionReport(
+                    success=False,
+                    action="retry",
+                    attempts=0,
+                    output_path=state.output_path,
+                    working_path="",
+                    saved_output=False,
+                    diagnostics=diagnostics,
+                    message="Retry generation failed.",
+                ),
+            )
+        state.current_content = generated_code
+        state.current_code = generated_code
+        persist_state(state)
+        return process_code(
+            args,
+            state,
+            "retry",
+            model_prompt,
+            generated_code,
+            verification_prompt,
+            repair_seed_code=state.current_code,
         )
 
-    target = select_target_file(args, state, prompt, is_new_project=True, route=route)
-    target_workspace_root = os.path.dirname(target.output_path) or state.workspace_root
-    if not paths_equal(target_workspace_root, state.workspace_root):
-        switch_workspace(state, target_workspace_root, target.output_path, target.working_path)
-        if route.artifact_type == "readme":
-            explicit_markdown = extract_explicit_markdown_target(prompt, state)
-            existing_target_path = explicit_markdown
-            if not existing_target_path:
-                requested_directory = extract_requested_output_directory(prompt)
-                if requested_directory:
-                    existing_target_path = select_existing_readme_from_directory(requested_directory, state)
-        else:
-            existing_target_path = (
-                extract_explicit_lua_target(prompt, state)
-                if extract_explicit_lua_path_candidate(prompt)
-                else extract_directory_lua_target(prompt, state)
+    model_prompt = build_generation_prompt(state, request_text, target.output_path, explicit_target)
+    verification_prompt = build_verification_prompt(state, target.output_path, explicit_target)
+    file_context = build_file_context_for_model(state, target.output_path, explicit_target)
+    overall_prompt = build_model_change_summary(state, latest_request=request_text if action == "edit" else "")
+    previous_code = target.current_code
+    try:
+        if target.current_code.strip():
+            print("[new] existing target file found, updating it for the new chat" if action == "new" else "[edit] applying the requested change")
+            initial_code = request_edited_code(
+                args,
+                overall_prompt,
+                request_text,
+                target.current_code,
+                file_context,
             )
-        target = select_target_file(args, state, prompt, is_new_project=True, route=route)
+        else:
+            print("[new] generating initial Lua code" if action == "new" else "[edit] no current code, generating a fresh version for the updated requirements")
+            initial_code = request_generated_code(args, model_prompt)
+    except RuntimeError as exc:
+        diagnostics = empty_diagnostics()
+        diagnostics["run_error"] = repair_mojibake(str(exc))
+        return finalize_report(
+            state,
+            target.current_code,
+            SessionReport(
+                success=False,
+                action=action,
+                attempts=0,
+                output_path=state.output_path,
+                working_path="",
+                saved_output=False,
+                diagnostics=diagnostics,
+                message="Initial generation failed." if action == "new" else "Edit request failed before validation.",
+            ),
+        )
+    state.current_content = initial_code
+    state.current_code = initial_code
+    persist_state(state)
+    return process_code(
+        args,
+        state,
+        action,
+        model_prompt,
+        initial_code,
+        verification_prompt,
+        repair_seed_code=previous_code,
+    )
 
-    state.chat_id = new_chat_id()
-    state.base_prompt = prompt.strip()
-    state.change_requests = []
-    state.last_report = None
-    state.current_code = ""
-    state.current_target_path = ""
-    state.artifact_type = route.artifact_type
-    state.last_route_intent = route.intent
 
-    has_existing_target = target.exists or bool(target.current_code.strip())
-    if route.expects_existing_target and not has_existing_target:
-        missing_target = existing_target_path or extract_requested_output_directory(prompt) or target.output_path
-        activate_target_selection(state, target)
-        state.base_prompt = ""
+def execute_text_file_request(
+    args: argparse.Namespace,
+    state: SessionState,
+    action: str,
+    request_text: str,
+    target: TargetSelection,
+) -> SessionReport:
+    artifact_kind = target.artifact_kind or target.requested_artifact_kind or state.artifact_type or "generic_file"
+    explicit_target = target.explicit
+    if action == "retry":
+        model_prompt = build_text_artifact_generation_prompt(state, state.effective_prompt(), target.output_path, explicit_target, artifact_kind)
+        verification_prompt = build_text_artifact_verification_prompt(state, target.output_path, explicit_target, artifact_kind)
+        if state.current_code.strip():
+            print("[retry] re-running validation and auto-fix on the current text file")
+            return process_text_artifact(args, state, "retry", model_prompt, state.current_code, verification_prompt, artifact_kind)
+        print("[retry] current file is empty, generating it again from the stored requirements")
+        try:
+            generated_text = request_generated_text_artifact(args, model_prompt)
+        except RuntimeError as exc:
+            diagnostics = build_info_diagnostics()
+            diagnostics["run_error"] = repair_mojibake(str(exc))
+            return finalize_report(
+                state,
+                state.current_code,
+                SessionReport(
+                    success=False,
+                    action="retry",
+                    attempts=0,
+                    output_path=state.output_path,
+                    working_path="",
+                    saved_output=False,
+                    diagnostics=diagnostics,
+                    message="Retry file generation failed.",
+                ),
+            )
+        state.current_content = generated_text
+        state.current_code = generated_text
+        persist_state(state)
+        return process_text_artifact(args, state, "retry", model_prompt, generated_text, verification_prompt, artifact_kind)
+
+    model_prompt = build_text_artifact_generation_prompt(state, request_text, target.output_path, explicit_target, artifact_kind)
+    verification_prompt = build_text_artifact_verification_prompt(state, target.output_path, explicit_target, artifact_kind)
+    file_context = build_generic_workspace_context(state, target.output_path, explicit_target)
+    overall_prompt = build_model_change_summary(state, latest_request=request_text if action == "edit" else "")
+    try:
+        if target.current_code.strip():
+            print("[new] existing text file found, updating it for the new chat" if action == "new" else "[edit] applying the requested text-file change")
+            initial_text = request_edited_text_artifact(
+                args,
+                overall_prompt,
+                request_text,
+                target.current_code,
+                file_context,
+            )
+        else:
+            print("[new] generating initial text file" if action == "new" else "[edit] no current file, generating a fresh version for the updated requirements")
+            initial_text = request_generated_text_artifact(args, model_prompt)
+    except RuntimeError as exc:
+        diagnostics = build_info_diagnostics()
+        diagnostics["run_error"] = repair_mojibake(str(exc))
+        return finalize_report(
+            state,
+            target.current_code,
+            SessionReport(
+                success=False,
+                action=action,
+                attempts=0,
+                output_path=state.output_path,
+                working_path="",
+                saved_output=False,
+                diagnostics=diagnostics,
+                message="Initial text-file generation failed." if action == "new" else "Text-file edit request failed before validation.",
+            ),
+        )
+    state.current_content = initial_text
+    state.current_code = initial_text
+    persist_state(state)
+    return process_text_artifact(args, state, action, model_prompt, initial_text, verification_prompt, artifact_kind)
+
+
+def execute_semantic_request(
+    args: argparse.Namespace,
+    state: SessionState,
+    prompt: str,
+    semantics: ParsedRequestSemantics,
+    target: TargetSelection,
+    action: str,
+) -> SessionReport:
+    state.last_route_intent = semantics.intent
+    activate_target_selection(state, target)
+    effective_kind = target.artifact_kind or target.requested_artifact_kind or semantics.requested_artifact_kind or "unknown"
+    state.artifact_type = effective_kind
+    if semantics.expects_existing_target and not (target.exists or bool(target.current_code.strip())):
         persist_state(state)
         return build_missing_existing_target_report(
             state,
-            route.intent,
-            missing_target,
-            "No existing target file was found in the requested path or folder.",
+            semantics.intent,
+            target.output_path or semantics.explicit_path or semantics.target_directory,
+            "No existing target file or directory was found for the requested action.",
         )
-
-    activate_target_selection(state, target)
-    if route.intent == "inspect":
-        state.base_prompt = build_existing_file_base_prompt(state, target.output_path, route.artifact_type)
+    if target.entity_type == "directory":
+        return execute_directory_request(state, action, target, semantics)
+    if semantics.intent == "inspect":
+        if target.current_code.strip():
+            state.base_prompt = build_existing_file_base_prompt(state, target.output_path, effective_kind)
         persist_state(state)
-        if target.current_code.strip() and route.artifact_type == "lua":
+        if target.current_code.strip() and effective_kind == "lua":
             return inspect_target_file(args, state, prompt, target)
         if target.current_code.strip():
-            return inspect_document_file(args, state, prompt, target)
+            return inspect_text_artifact_file(args, state, prompt, target)
         return finalize_report(
             state,
             target.current_code,
@@ -3091,128 +5181,25 @@ def start_new_project(args: argparse.Namespace, state: SessionState, prompt: str
                 message="Target file exists, but it is empty.",
             ),
         )
-
     persist_state(state)
+    if effective_kind == "lua":
+        return execute_lua_request(args, state, action, prompt, target)
+    return execute_text_file_request(args, state, action, prompt, target)
 
-    if route.artifact_type == "readme":
-        model_prompt = build_document_generation_prompt(state, state.base_prompt, target.output_path, target.explicit)
-        verification_prompt = build_document_verification_prompt(state, target.output_path, target.explicit)
-        document_context = build_document_context_for_model(state, target.output_path, target.explicit)
-        overall_prompt = build_model_change_summary(state)
 
-        if target.current_code.strip():
-            print("[new] existing document file found, updating it for the new chat")
-            try:
-                initial_document = request_edited_document(
-                    args,
-                    overall_prompt,
-                    state.base_prompt,
-                    target.current_code,
-                    document_context,
-                )
-            except RuntimeError as exc:
-                diagnostics = build_info_diagnostics()
-                diagnostics["run_error"] = repair_mojibake(str(exc))
-                report = SessionReport(
-                    success=False,
-                    action="new",
-                    attempts=0,
-                    output_path=state.output_path,
-                    working_path="",
-                    saved_output=False,
-                    diagnostics=diagnostics,
-                    message="Initial document update failed.",
-                )
-                return finalize_report(state, target.current_code, report)
-        else:
-            print("[new] generating initial document")
-            try:
-                initial_document = request_generated_document(args, model_prompt)
-            except RuntimeError as exc:
-                diagnostics = build_info_diagnostics()
-                diagnostics["run_error"] = repair_mojibake(str(exc))
-                report = SessionReport(
-                    success=False,
-                    action="new",
-                    attempts=0,
-                    output_path=state.output_path,
-                    working_path="",
-                    saved_output=False,
-                    diagnostics=diagnostics,
-                    message="Initial document generation failed.",
-                )
-                return finalize_report(state, "", report)
-
-        state.current_code = initial_document
-        persist_state(state)
-        return process_document(
-            args,
-            state,
-            "new",
-            model_prompt,
-            initial_document,
-            verification_prompt,
-        )
-
-    model_prompt = build_generation_prompt(state, state.base_prompt, target.output_path, target.explicit)
-    verification_prompt = build_verification_prompt(state, target.output_path, target.explicit)
-    file_context = build_file_context_for_model(state, target.output_path, target.explicit)
-    overall_prompt = build_model_change_summary(state)
-
-    if target.current_code.strip():
-        print("[new] existing target file found, updating it for the new chat")
-        try:
-            initial_code = request_edited_code(
-                args,
-                overall_prompt,
-                state.base_prompt,
-                target.current_code,
-                file_context,
-            )
-        except RuntimeError as exc:
-            diagnostics = empty_diagnostics()
-            diagnostics["run_error"] = repair_mojibake(str(exc))
-            report = SessionReport(
-                success=False,
-                action="new",
-                attempts=0,
-                output_path=state.output_path,
-                working_path="",
-                saved_output=False,
-                diagnostics=diagnostics,
-                message="Initial file update failed.",
-            )
-            return finalize_report(state, target.current_code, report)
-    else:
-        print("[new] generating initial Lua code")
-        try:
-            initial_code = request_generated_code(args, model_prompt)
-        except RuntimeError as exc:
-            diagnostics = empty_diagnostics()
-            diagnostics["run_error"] = repair_mojibake(str(exc))
-            report = SessionReport(
-                success=False,
-                action="new",
-                attempts=0,
-                output_path=state.output_path,
-                working_path="",
-                saved_output=False,
-                diagnostics=diagnostics,
-                message="Initial generation failed.",
-            )
-            return finalize_report(state, "", report)
-
-    state.current_code = initial_code
-    persist_state(state)
-    return process_code(
-        args,
-        state,
-        "new",
-        model_prompt,
-        initial_code,
-        verification_prompt,
-        repair_seed_code=target.current_code,
-    )
+def start_new_project(args: argparse.Namespace, state: SessionState, prompt: str) -> SessionReport:
+    semantics = parse_request_semantics(args, state, prompt)
+    target = resolve_target_for_request(args, state, prompt, semantics)
+    state.chat_id = new_chat_id()
+    state.base_prompt = prompt.strip()
+    state.change_requests = []
+    state.last_report = None
+    state.current_content = ""
+    state.current_code = ""
+    state.current_target_path = ""
+    state.artifact_type = semantics.requested_artifact_kind or "unknown"
+    state.last_route_intent = semantics.intent
+    return execute_semantic_request(args, state, prompt, semantics, target, "new")
 
 
 def apply_change_request(
@@ -3223,255 +5210,27 @@ def apply_change_request(
     if not state.has_project():
         return start_new_project(args, state, change_request)
 
-    route = classify_request_route(args, state, change_request)
-    if route.artifact_type == "readme":
-        explicit_markdown = extract_explicit_markdown_target(change_request, state)
-        existing_target_path = explicit_markdown
-        if not existing_target_path:
-            requested_directory = extract_requested_output_directory(change_request)
-            if requested_directory:
-                existing_target_path = select_existing_readme_from_directory(requested_directory, state)
-    else:
-        existing_target_path = (
-            extract_explicit_lua_target(change_request, state)
-            if extract_explicit_lua_path_candidate(change_request)
-            else extract_directory_lua_target(change_request, state)
-        )
-
-    target = select_target_file(args, state, change_request, is_new_project=False, route=route)
-    target_workspace_root = os.path.dirname(target.output_path) or state.workspace_root
-    if not paths_equal(target_workspace_root, state.workspace_root):
-        switch_workspace(state, target_workspace_root, target.output_path, target.working_path)
-        if route.artifact_type == "readme":
-            explicit_markdown = extract_explicit_markdown_target(change_request, state)
-            existing_target_path = explicit_markdown
-            if not existing_target_path:
-                requested_directory = extract_requested_output_directory(change_request)
-                if requested_directory:
-                    existing_target_path = select_existing_readme_from_directory(requested_directory, state)
-        else:
-            existing_target_path = (
-                extract_explicit_lua_target(change_request, state)
-                if extract_explicit_lua_path_candidate(change_request)
-                else extract_directory_lua_target(change_request, state)
-            )
-        target = select_target_file(args, state, change_request, is_new_project=False, route=route)
-
-    has_existing_target = target.exists or bool(target.current_code.strip())
-    if route.expects_existing_target and not has_existing_target:
-        activate_target_selection(state, target)
-        persist_state(state)
-        missing_target = (
-            existing_target_path
-            or extract_requested_output_directory(change_request)
-            or target.output_path
-        )
-        return build_missing_existing_target_report(
+    semantics = parse_request_semantics(args, state, change_request)
+    target = resolve_target_for_request(args, state, change_request, semantics)
+    if not state.base_prompt.strip() and target.current_code.strip():
+        state.base_prompt = build_existing_file_base_prompt(
             state,
-            route.intent,
-            missing_target,
-            "No existing target file was found in the requested path or folder.",
+            target.output_path,
+            target.artifact_kind or semantics.requested_artifact_kind,
         )
-
-    activate_target_selection(state, target)
-    state.artifact_type = route.artifact_type
-    state.last_route_intent = route.intent
-    if not state.base_prompt.strip() and state.current_code.strip():
-        state.base_prompt = build_existing_file_base_prompt(state, target.output_path, route.artifact_type)
-    if route.intent == "inspect":
-        persist_state(state)
-        if state.current_code.strip() and route.artifact_type == "lua":
-            return inspect_target_file(args, state, change_request, target)
-        if state.current_code.strip():
-            return inspect_document_file(args, state, change_request, target)
-        return finalize_report(
-            state,
-            state.current_code,
-            SessionReport(
-                success=True,
-                action="inspect",
-                attempts=1,
-                output_path=target.output_path,
-                working_path="",
-                saved_output=False,
-                diagnostics=build_info_diagnostics(),
-                message="Target file exists, but it is empty.",
-            ),
-        )
-
-    state.change_requests.append(change_request.strip())
-    persist_state(state)
-
-    if route.artifact_type == "readme":
-        model_prompt = build_document_generation_prompt(state, change_request, target.output_path, target.explicit)
-        verification_prompt = build_document_verification_prompt(state, target.output_path, target.explicit)
-        document_context = build_document_context_for_model(state, target.output_path, target.explicit)
-        overall_prompt = build_model_change_summary(state, latest_request=change_request)
-
-        if state.current_code.strip():
-            print("[edit] applying the requested document change")
-            try:
-                updated_document = request_edited_document(
-                    args,
-                    overall_prompt,
-                    change_request,
-                    state.current_code,
-                    document_context,
-                )
-            except RuntimeError as exc:
-                diagnostics = build_info_diagnostics()
-                diagnostics["run_error"] = repair_mojibake(str(exc))
-                report = SessionReport(
-                    success=False,
-                    action="edit",
-                    attempts=0,
-                    output_path=state.output_path,
-                    working_path="",
-                    saved_output=False,
-                    diagnostics=diagnostics,
-                    message="Document edit request failed before validation.",
-                )
-                return finalize_report(state, state.current_code, report)
-        else:
-            print("[edit] no current document, generating a fresh version for the updated requirements")
-            try:
-                updated_document = request_generated_document(args, model_prompt)
-            except RuntimeError as exc:
-                diagnostics = build_info_diagnostics()
-                diagnostics["run_error"] = repair_mojibake(str(exc))
-                report = SessionReport(
-                    success=False,
-                    action="edit",
-                    attempts=0,
-                    output_path=state.output_path,
-                    working_path="",
-                    saved_output=False,
-                    diagnostics=diagnostics,
-                    message="Generation for the updated document requirements failed.",
-                )
-                return finalize_report(state, state.current_code, report)
-
-        state.current_code = updated_document
-        persist_state(state)
-        return process_document(
-            args,
-            state,
-            "edit",
-            model_prompt,
-            updated_document,
-            verification_prompt,
-        )
-
-    model_prompt = build_generation_prompt(state, change_request, target.output_path, target.explicit)
-    verification_prompt = build_verification_prompt(state, target.output_path, target.explicit)
-    file_context = build_file_context_for_model(state, target.output_path, target.explicit)
-    overall_prompt = build_model_change_summary(state, latest_request=change_request)
-    previous_code = state.current_code
-    if state.current_code.strip():
-        print("[edit] applying the requested change")
-        try:
-            updated_code = request_edited_code(
-                args,
-                overall_prompt,
-                change_request,
-                state.current_code,
-                file_context,
-            )
-        except RuntimeError as exc:
-            diagnostics = empty_diagnostics()
-            diagnostics["run_error"] = repair_mojibake(str(exc))
-            report = SessionReport(
-                success=False,
-                action="edit",
-                attempts=0,
-                output_path=state.output_path,
-                working_path="",
-                saved_output=False,
-                diagnostics=diagnostics,
-                message="Edit request failed before validation.",
-            )
-            return finalize_report(state, state.current_code, report)
-    else:
-        print("[edit] no current code, generating a fresh version for the updated requirements")
-        try:
-            updated_code = request_generated_code(args, model_prompt)
-        except RuntimeError as exc:
-            diagnostics = empty_diagnostics()
-            diagnostics["run_error"] = repair_mojibake(str(exc))
-            report = SessionReport(
-                success=False,
-                action="edit",
-                attempts=0,
-                output_path=state.output_path,
-                working_path="",
-                saved_output=False,
-                diagnostics=diagnostics,
-                message="Generation for the updated requirements failed.",
-            )
-            return finalize_report(state, state.current_code, report)
-
-    state.current_code = updated_code
-    persist_state(state)
-    return process_code(
-        args,
-        state,
-        "edit",
-        model_prompt,
-        updated_code,
-        verification_prompt,
-        repair_seed_code=previous_code,
-    )
+    if semantics.intent != "inspect":
+        state.change_requests.append(change_request.strip())
+    return execute_semantic_request(args, state, change_request, semantics, target, "edit")
 
 
 def retry_current_project(args: argparse.Namespace, state: SessionState) -> SessionReport:
     if not state.has_project():
         diagnostics = empty_diagnostics()
         diagnostics["run_error"] = "There is no active project yet."
-        report = SessionReport(
-            success=False,
-            action="retry",
-            attempts=0,
-            output_path=state.output_path,
-            working_path="",
-            saved_output=False,
-            diagnostics=diagnostics,
-            message="Start a project first by sending a plain-text request or using /new.",
-        )
-        return finalize_report(state, state.current_code, report)
-
-    retry_route = RequestRoute(
-        intent="change",
-        artifact_type=state.artifact_type or "lua",
-        expects_existing_target=False,
-        preferred_filename="README.md" if (state.artifact_type or "lua") == "readme" else "",
-        reason="retry current chat",
-    )
-    target = select_target_file(args, state, "", is_new_project=False, route=retry_route)
-    activate_target_selection(state, target)
-    persist_state(state)
-
-    if state.artifact_type == "readme":
-        retry_prompt = build_document_generation_prompt(state, state.effective_prompt(), target.output_path, target.explicit)
-        verification_prompt = build_document_verification_prompt(state, target.output_path, target.explicit)
-
-        if state.current_code.strip():
-            print("[retry] re-running verification and auto-fix on the current document")
-            return process_document(
-                args,
-                state,
-                "retry",
-                retry_prompt,
-                state.current_code,
-                verification_prompt,
-            )
-
-        print("[retry] current document is empty, generating it again from the stored requirements")
-        try:
-            generated_document = request_generated_document(args, retry_prompt)
-        except RuntimeError as exc:
-            diagnostics = build_info_diagnostics()
-            diagnostics["run_error"] = repair_mojibake(str(exc))
-            report = SessionReport(
+        return finalize_report(
+            state,
+            state.current_code,
+            SessionReport(
                 success=False,
                 action="retry",
                 attempts=0,
@@ -3479,65 +5238,59 @@ def retry_current_project(args: argparse.Namespace, state: SessionState) -> Sess
                 working_path="",
                 saved_output=False,
                 diagnostics=diagnostics,
-                message="Retry document generation failed.",
-            )
-            return finalize_report(state, state.current_code, report)
-
-        state.current_code = generated_document
-        persist_state(state)
-        return process_document(
-            args,
-            state,
-            "retry",
-            retry_prompt,
-            generated_document,
-            verification_prompt,
+                message="Start a project first by sending a plain-text request or using /new.",
+            ),
         )
 
-    retry_prompt = build_retry_prompt(state, target.output_path, target.explicit)
-    verification_prompt = build_verification_prompt(state, target.output_path, target.explicit)
-
-    if state.current_code.strip():
-        print("[retry] re-running validation and auto-fix on the current code")
-        return process_code(
-            args,
-            state,
-            "retry",
-            retry_prompt,
-            state.current_code,
-            verification_prompt,
-            repair_seed_code=state.current_code,
-        )
-
-    print("[retry] current code is empty, generating again from the stored requirements")
-    try:
-        generated_code = request_generated_code(args, retry_prompt)
-    except RuntimeError as exc:
+    active_target = get_active_target_artifact(state)
+    if not active_target:
         diagnostics = empty_diagnostics()
-        diagnostics["run_error"] = repair_mojibake(str(exc))
-        report = SessionReport(
-            success=False,
-            action="retry",
-            attempts=0,
-            output_path=state.output_path,
-            working_path="",
-            saved_output=False,
-            diagnostics=diagnostics,
-            message="Retry generation failed.",
+        diagnostics["run_error"] = "There is no active target to retry."
+        return finalize_report(
+            state,
+            state.current_code,
+            SessionReport(
+                success=False,
+                action="retry",
+                attempts=0,
+                output_path=state.output_path,
+                working_path="",
+                saved_output=False,
+                diagnostics=diagnostics,
+                message="No active target is selected for retry.",
+            ),
         )
-        return finalize_report(state, state.current_code, report)
 
-    state.current_code = generated_code
-    persist_state(state)
-    return process_code(
-        args,
-        state,
-        "retry",
-        retry_prompt,
-        generated_code,
-        verification_prompt,
-        repair_seed_code=state.current_code,
+    target = (
+        build_directory_selection_for_path(
+            state,
+            active_target.path,
+            explicit=False,
+            source="carryover",
+            confidence=0.9,
+            reasons=["Retry keeps the active directory."],
+        )
+        if active_target.entity_type == "directory"
+        else build_target_selection_for_path(
+            state,
+            active_target.path,
+            explicit=False,
+            source="carryover",
+            requested_artifact_kind=active_target.artifact_kind,
+            confidence=0.9,
+            reasons=["Retry keeps the active target from the current chat."],
+        )
     )
+    semantics = ParsedRequestSemantics(
+        intent="change",
+        requested_entity_type=active_target.entity_type,
+        requested_artifact_kind=active_target.artifact_kind,
+        follow_active_context=True,
+        expects_existing_target=False,
+        create_if_missing=False,
+        reason="retry current chat",
+    )
+    return execute_semantic_request(args, state, state.effective_prompt(), semantics, target, "retry")
 
 
 def print_help() -> None:
@@ -3570,16 +5323,27 @@ def print_status(state: SessionState) -> None:
             print(f"Managed Lua files: {len(state.managed_files)}")
         return
 
+    active_target = get_active_target_artifact(state)
+    active_directory = get_active_directory_artifact(state)
     print("Project status:")
     print(f"Workspace: {state.workspace_root}")
     print(f"Chat id: {state.chat_id}")
     print(f"Artifact type: {state.artifact_type}")
     print(f"Final output: {state.output_path}")
-    print(f"Active target: {state.current_target_path or state.output_path}")
+    print(f"Active target: {(active_target.path if active_target else (state.current_target_path or state.output_path))}")
+    print(f"Active target id: {state.active_target_id or 'none'}")
+    print(f"Active directory: {(active_directory.path if active_directory else state.workspace_root)}")
     print(f"Base prompt set: yes")
     print(f"Change requests: {len(state.change_requests)}")
+    print(f"Known artifacts: {len(state.artifacts)}")
     print(f"Managed Lua files: {len(state.managed_files)}")
-    print(f"Current code loaded: {'yes' if state.current_code.strip() else 'no'}")
+    print(f"Current content loaded: {'yes' if state.current_content.strip() else 'no'}")
+    if state.last_resolution:
+        print(f"Last resolution source: {state.last_resolution.source}")
+        if state.last_resolution.reasons:
+            print("Last resolution reasons:")
+            for reason in state.last_resolution.reasons:
+                print(f"- {reason}")
 
     if not state.last_report:
         print("Last result: no actions have completed yet.")
@@ -3600,11 +5364,14 @@ def print_paths(state: SessionState) -> None:
         print("No active target yet.")
         return
 
-    target_path = state.current_target_path or state.output_path
+    active_target = get_active_target_artifact(state)
+    active_directory = get_active_directory_artifact(state)
+    target_path = active_target.path if active_target else (state.current_target_path or state.output_path)
     target_status = "exists" if os.path.exists(target_path) else "not created yet"
     output_status = "exists" if os.path.exists(state.output_path) else "not created yet"
     print(f"Workspace: {state.workspace_root}")
     print(f"Active target: {target_path} ({target_status})")
+    print(f"Active directory: {(active_directory.path if active_directory else state.workspace_root)}")
     print(f"Final output: {state.output_path} ({output_status})")
 
 
@@ -3618,11 +5385,11 @@ def print_prompt(state: SessionState) -> None:
 
 
 def print_code(state: SessionState) -> None:
-    if not state.current_code.strip():
+    if not state.current_content.strip():
         print("No current artifact content is loaded.")
         return
 
-    print(state.current_code)
+    print(state.current_content)
 
 
 def print_report(report: SessionReport, lua_bin: str) -> None:

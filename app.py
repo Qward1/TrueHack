@@ -26,8 +26,12 @@ from main import (
     apply_change_request,
     build_chat_title_from_prompt,
     build_working_path,
+    deserialize_artifact_ref,
     deserialize_report,
+    deserialize_resolution_result,
     empty_diagnostics,
+    get_active_directory_artifact,
+    get_active_target_artifact,
     load_session_state,
     new_chat_id,
     print_code,
@@ -39,7 +43,9 @@ from main import (
     resolve_output_paths,
     resolve_workspace_root,
     retry_current_project,
+    serialize_artifact_ref,
     serialize_report,
+    serialize_resolution_result,
     start_new_project,
     sync_current_code_from_active_target,
     SessionState,
@@ -65,13 +71,18 @@ def build_empty_state(args: argparse.Namespace) -> SessionState:
         context_path=os.path.abspath(os.path.join(workspace_root, ".lua_console_chat.json")),
         output_path=output_path,
         working_path=working_path,
+        chat_id=new_chat_id(),
         base_prompt="",
         change_requests=[],
+        artifacts=[],
+        active_target_id="",
+        active_directory_id="",
+        current_content="",
         current_code="",
         last_report=None,
+        last_resolution=None,
         managed_files=[],
         current_target_path="",
-        chat_id=new_chat_id(),
     )
 
 
@@ -81,13 +92,18 @@ def serialize_state_snapshot(state: SessionState) -> dict:
         "context_path": state.context_path,
         "output_path": state.output_path,
         "working_path": state.working_path,
+        "chat_id": state.chat_id or new_chat_id(),
         "base_prompt": state.base_prompt,
         "change_requests": list(state.change_requests),
+        "artifacts": [serialize_artifact_ref(artifact) for artifact in state.artifacts],
+        "active_target_id": state.active_target_id,
+        "active_directory_id": state.active_directory_id,
+        "current_content": state.current_content,
         "current_code": state.current_code,
         "last_report": serialize_report(state.last_report),
+        "last_resolution": serialize_resolution_result(state.last_resolution),
         "managed_files": list(state.managed_files),
         "current_target_path": state.current_target_path,
-        "chat_id": state.chat_id or new_chat_id(),
         "artifact_type": state.artifact_type,
         "last_route_intent": state.last_route_intent,
     }
@@ -105,30 +121,43 @@ def deserialize_state_snapshot(payload: dict, args: argparse.Namespace) -> Sessi
         context_path=os.path.abspath(payload.get("context_path") or os.path.join(workspace_root, ".lua_console_chat.json")),
         output_path=output_path,
         working_path=working_path,
+        chat_id=str(payload.get("chat_id", "")) or new_chat_id(),
         base_prompt=str(payload.get("base_prompt", "")),
         change_requests=[str(item) for item in payload.get("change_requests", []) if str(item).strip()],
+        artifacts=[
+            artifact
+            for artifact in (
+                deserialize_artifact_ref(item, workspace_root)
+                for item in payload.get("artifacts", [])
+            )
+            if artifact is not None
+        ],
+        active_target_id=str(payload.get("active_target_id", "")),
+        active_directory_id=str(payload.get("active_directory_id", "")),
+        current_content=str(payload.get("current_content", payload.get("current_code", ""))),
         current_code=str(payload.get("current_code", "")),
         last_report=deserialize_report(payload.get("last_report")),
+        last_resolution=deserialize_resolution_result(payload.get("last_resolution")),
         managed_files=[os.path.abspath(str(item)) for item in payload.get("managed_files", []) if str(item).strip()],
         current_target_path=os.path.abspath(payload.get("current_target_path", "")) if payload.get("current_target_path") else "",
-        chat_id=str(payload.get("chat_id", "")) or new_chat_id(),
         artifact_type=str(payload.get("artifact_type", "lua") or "lua"),
         last_route_intent=str(payload.get("last_route_intent", "create") or "create"),
     )
 
 
 def derive_chat_title_from_state(state: SessionState, fallback: str = "Новый чат") -> str:
+    active_target = get_active_target_artifact(state)
     if (
-        state.current_target_path
+        active_target and active_target.path
         and state.base_prompt.strip()
         and state.last_route_intent in {"inspect", "change"}
     ):
-        base_name = os.path.splitext(os.path.basename(state.current_target_path))[0]
+        base_name = os.path.splitext(os.path.basename(active_target.path))[0]
         title = build_chat_title_from_prompt(base_name.replace("_", " ").replace("-", " "), fallback)
     elif state.base_prompt.strip():
         title = build_chat_title_from_prompt(state.base_prompt, fallback)
-    elif state.current_target_path:
-        base_name = os.path.splitext(os.path.basename(state.current_target_path))[0]
+    elif active_target and active_target.path:
+        base_name = os.path.splitext(os.path.basename(active_target.path))[0]
         title = build_chat_title_from_prompt(base_name.replace("_", " ").replace("-", " "), fallback)
     else:
         title = fallback
@@ -1275,18 +1304,37 @@ class AppRuntime:
         if last_report:
             last_report_summary = self.capture_output(lambda: print_report(last_report, self.args.lua_bin))
 
+        active_target = get_active_target_artifact(state)
+        active_directory = get_active_directory_artifact(state)
+        resolution = state.last_resolution
+
         return {
             "workspace_root": state.workspace_root,
             "chat_id": state.chat_id,
             "has_project": state.has_project(),
             "artifact_type": state.artifact_type,
-            "active_target": (state.current_target_path or state.output_path) if state.has_project() else "",
+            "active_target": (active_target.path if active_target else (state.current_target_path or state.output_path)) if state.has_project() else "",
+            "active_target_id": state.active_target_id,
+            "active_directory": active_directory.path if active_directory else state.workspace_root,
+            "active_directory_id": state.active_directory_id,
             "output_path": state.output_path if state.has_project() else "",
             "managed_files_count": len(state.managed_files),
+            "artifacts_count": len(state.artifacts),
             "change_requests_count": len(state.change_requests),
             "base_prompt": state.base_prompt,
             "change_requests": state.change_requests,
+            "current_content": state.current_content,
             "current_code": state.current_code,
+            "last_resolution": {
+                "target_id": resolution.target_id,
+                "target_path": resolution.target_path,
+                "intent": resolution.intent,
+                "confidence": resolution.confidence,
+                "source": resolution.source,
+                "reasons": list(resolution.reasons),
+                "requested_artifact_kind": resolution.requested_artifact_kind,
+            } if resolution else None,
+            "last_resolution_reasons": list(resolution.reasons) if resolution else [],
             "last_report_summary": last_report_summary,
         }
 
