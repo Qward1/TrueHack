@@ -27,31 +27,55 @@ python app.py
 
 ## Требования
 - Python 3.12+
-- локальный OpenAI-compatible LLM runtime
+- [Ollama](https://ollama.com/) (локальный LLM runtime)
 - `lua` в PATH
 
 ## Установка
+
+### 1. Python-зависимости
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
+### 2. Ollama и модель
+
+Скачать и установить Ollama: https://ollama.com/download
+
+```powershell
+# Скачать модель (хакатонная конфигурация, 8 GB VRAM)
+ollama pull qwen2.5-coder:7b-instruct
+
+# Для слабых GPU (4 GB VRAM) — меньшая модель
+ollama pull qwen2.5-coder:3b-instruct
+```
+
+Опционально — создать кастомную модель с зафиксированными параметрами хакатона:
+
+```powershell
+ollama create truehack -f Modelfile
+```
+
 ## Запуск
-```powershell
-python app.py --workspace C:\Users\Dimentiy\repoVScode\TrueHack
-```
-
-Дополнительно:
 
 ```powershell
-python app.py --host 127.0.0.1 --port 8765 --workspace C:\Work\LuaProjects
-python app.py --url http://127.0.0.1:1234/v1 --model local-model
+# Стандартный запуск (модель по умолчанию: qwen2.5-coder:7b-instruct)
+python app.py --workspace C:\Work\LuaProjects
+
+# С кастомной моделью из Modelfile
+python app.py --model truehack
+
+# С меньшей моделью (4 GB VRAM)
+python app.py --model qwen2.5-coder:3b-instruct
+
+# Все параметры
+python app.py --host 127.0.0.1 --port 8765 --workspace C:\Work\LuaProjects --model qwen2.5-coder:7b-instruct --url http://127.0.0.1:11434/v1
 ```
 
-Переменные окружения:
-- `LOCAL_LLM_BASE_URL`
-- `LOCAL_LLM_MODEL`
+Переменные окружения (альтернатива CLI-аргументам):
+- `OLLAMA_MODEL` — имя модели (по умолчанию `qwen2.5-coder:7b-instruct`)
+- `OLLAMA_BASE_URL` — URL Ollama API (по умолчанию `http://127.0.0.1:11434/v1`)
 
 ## Как задавать путь для Lua
 
@@ -143,14 +167,19 @@ resolve_target -> route_intent -> generate/refine -> validate -> verify -> save 
 - `/status` — показать статус чата
 - `/prompt` — показать базовую задачу, правки и предложения
 
-## Текущий runtime status
-Сейчас canonical runtime:
-- локальный;
-- OpenAI-compatible;
-- по умолчанию использует `http://127.0.0.1:1234/v1`.
+## Runtime
 
-Важно:
-- это еще не финальная Ollama-конфигурация для хакатона;
+Canonical runtime — Ollama с OpenAI-compatible API на `http://127.0.0.1:11434/v1`.
+
+Модель по умолчанию: `qwen2.5-coder:7b-instruct`.
+Параметры хакатона зафиксированы в `Modelfile` (num_ctx=4096, num_predict=256, num_gpu=99).
+
+Смена модели:
+- CLI: `python app.py --model qwen2.5-coder:3b-instruct`
+- ENV: `OLLAMA_MODEL=qwen2.5-coder:3b-instruct`
+- Modelfile: `ollama create mymodel -f Modelfile` + `--model mymodel`
+
+Заметки:
 - `e2e`-агент и e2e-gate сейчас временно отключены;
 - `luacheck` сейчас не используется в каноническом runtime;
 - generation/refine/fix ориентированы на workflow/LUS scripts, а не на console/CLI apps;

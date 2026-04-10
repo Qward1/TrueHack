@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+from dotenv import load_dotenv
+load_dotenv()
+
 import argparse
 import asyncio
 import json
@@ -20,9 +23,9 @@ from src.tools.target_tools import build_chat_title
 
 logger = structlog.get_logger(__name__)
 
-# ── Defaults (kept compatible with CLI args) ─────────────────────────
-DEFAULT_URL = "http://127.0.0.1:1234/v1"
-DEFAULT_MODEL = "local-model"
+# ── Defaults (Ollama runtime) ─────────────────────────────────────────
+DEFAULT_URL = "http://127.0.0.1:11434/v1"
+DEFAULT_MODEL = "qwen2.5-coder:7b-instruct"
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_REQUEST_TIMEOUT = 600.0
 
@@ -1247,13 +1250,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default=os.getenv("LOCAL_LLM_MODEL", os.getenv("LMSTUDIO_MODEL", DEFAULT_MODEL)),
-        help="Model name exposed by the local OpenAI-compatible runtime.",
+        default=os.getenv("OLLAMA_MODEL", DEFAULT_MODEL),
+        help="Ollama model name (e.g. qwen2.5-coder:7b-instruct, qwen2.5-coder:3b-instruct).",
     )
     parser.add_argument(
         "--url",
-        default=os.getenv("LOCAL_LLM_BASE_URL", os.getenv("LMSTUDIO_URL", DEFAULT_URL)),
-        help="Base URL of the local OpenAI-compatible runtime.",
+        default=os.getenv("OLLAMA_BASE_URL", DEFAULT_URL),
+        help="Base URL of the Ollama runtime (default: http://127.0.0.1:11434/v1).",
     )
     parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS, help="Max validation/fix iterations.")
     parser.add_argument(

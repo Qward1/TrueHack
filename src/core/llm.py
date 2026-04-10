@@ -1,8 +1,9 @@
-"""Async provider for a local OpenAI-compatible LLM runtime."""
+"""Async provider for a local OpenAI-compatible LLM runtime (Ollama)."""
 
 from __future__ import annotations
 
 import json
+import os
 import re
 
 import structlog
@@ -10,8 +11,8 @@ from openai import AsyncOpenAI
 
 logger = structlog.get_logger(__name__)
 
-DEFAULT_URL = "http://127.0.0.1:1234/v1"
-DEFAULT_MODEL = "local-model"
+DEFAULT_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1")
+DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b-instruct")
 DEFAULT_TIMEOUT = 600.0
 
 

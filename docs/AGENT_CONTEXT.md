@@ -82,10 +82,17 @@
 ## Runtime зависимости
 - Python 3.12+
 - `lua` в PATH
-- локальный OpenAI-compatible endpoint (по умолчанию `http://127.0.0.1:1234/v1`)
+- Ollama (по умолчанию `http://127.0.0.1:11434/v1`)
+- Модель: `qwen2.5-coder:7b-instruct` (или `3b-instruct` для 4GB VRAM)
+
+## Настройка модели
+Три способа (по приоритету):
+1. CLI аргумент: `python app.py --model <name>`
+2. Env-переменная: `OLLAMA_MODEL=<name>`
+3. Дефолт: `qwen2.5-coder:7b-instruct`
+
+Параметры хакатона (num_ctx=4096, num_predict=256) зафиксированы в `Modelfile`.
 
 ## Важно
-- Ollama migration под финальные требования хакатона пока не завершен.
-- Текущий runtime локальный и единый, но это dev-state, а не финальный Ollama-target.
 - E2E agent flow временно отключен в каноническом pipeline.
 - `luacheck` временно отключен в канонической локальной валидации.
