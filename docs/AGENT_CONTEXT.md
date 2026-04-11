@@ -96,3 +96,15 @@
 ## Важно
 - E2E agent flow временно отключен в каноническом pipeline.
 - `luacheck` временно отключен в канонической локальной валидации.
+
+---
+
+## 2026-04-11 update: public-sample alignment
+- Prompt assembly now splits the user message into `task` and pasted workflow context.
+- Generation, refine, and fix prompts now include embedded few-shot examples derived from the public sample and enforce short workflow-script style.
+- The canonical style is: direct `wf.vars` / `wf.initVariables` access, no recreated demo input tables, no console wrappers, and direct `return` for simple extraction/computation tasks.
+- Deterministic verification now supplements LLM verification with:
+  - expected workflow path matching;
+  - anti-pattern detection for invented sample data and app/service wrappers;
+  - save-gate blocking when deterministic requirements fail, even if the semantic verifier is unavailable.
+- `docs/_pdf_text.txt` remains an offline working aid only and is not read at runtime.

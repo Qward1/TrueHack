@@ -31,21 +31,22 @@ LOWCODE_JSONSTRING_OPEN = "lua{"
 LOWCODE_JSONSTRING_CLOSE = "}lua"
 LOWCODE_CONTRACT_TEXT = (
     f"Target contract:\n"
-    f"- Use {LOWCODE_LUA_VERSION} syntax and conventions.\n"
-    f"- The script is described in JsonString format: {LOWCODE_JSONSTRING_OPEN}<code>{LOWCODE_JSONSTRING_CLOSE}.\n"
-    "- This is a workflow/LUS script, not a console or CLI application.\n"
-    "- Never use JsonPath to access variables or fields.\n"
-    "- Access data directly by field/key.\n"
-    "- Declared LowCode variables are stored in wf.vars.\n"
-    "- Variables received at startup from variables are stored in wf.initVariables.\n"
-    "- The script should transform workflow data, return a value, and/or update wf.vars.\n"
-    "- Avoid console input/output flows, prompts, menus, io.read, io.stdin:read, print, and io.write.\n"
-    "- Allowed primitive types: nil, boolean, number, string, array, table, function.\n"
-    "- To create/mark arrays use _utils.array.new() and _utils.array.markAsArray(arr).\n"
-    "- Allowed basic constructs: if/then/else, while/do/end, for/do/end, repeat/until.\n"
+    f"- {LOWCODE_LUA_VERSION} syntax.\n"
+    f"- Output format: {LOWCODE_JSONSTRING_OPEN}<code>{LOWCODE_JSONSTRING_CLOSE}.\n"
+    "- This is a short workflow script, NOT a console app or CLI tool.\n"
+    "- Read input from wf.vars.X or wf.initVariables.X and access fields directly by key.\n"
+    "- If the request or pasted context mentions wf.vars.* or wf.initVariables.*, use those exact paths directly.\n"
+    "- Never recreate the provided workflow input as demo tables like local data = {...} or local emails = {...}.\n"
+    "- Output: use `return <value>` and/or explicit wf.vars updates; never print(), io.write(), io.read().\n"
+    "- For new arrays: _utils.array.new(), then _utils.array.markAsArray(arr) before return.\n"
+    "- Keep code minimal and avoid unnecessary wrappers, classes, or boilerplate.\n"
+    "- Start with logic immediately, not with function definitions (unless the task needs helper functions).\n"
+    "- Allowed constructs: if/then/else, while/do/end, for/do/end, repeat/until.\n"
 )
 DEFAULT_VERIFICATION_SYSTEM_PROMPT = (
     "You review whether a Lua solution fully satisfies the user's request. "
+    "The code must be a short workflow script (not a console app). "
+    "It must use `return` for output, read data from wf.vars/wf.initVariables, and avoid print/io.read. "
     "Return strict JSON only with the keys: passed, score, summary, missing_requirements, warnings. "
     "Use passed=true only if all important requirements are satisfied."
 )
@@ -107,17 +108,39 @@ WF_ALIAS_ASSIGN_RE = re.compile(
     r"(?:local\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
     r"(wf\.(?:vars|initVariables)(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*|\s*\[\s*['\"][^'\"]+['\"]\s*\])+)"
 )
+WF_ASSIGN_RE = re.compile(
+    r"\bwf\.(vars|initVariables)"
+    r"(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*|\s*\[\s*['\"][^'\"]+['\"]\s*\])+"
+    r"\s*="
+)
+WORKFLOW_CONTEXT_HINT_RE = re.compile(r"(?i)(?:\bwf\b|\"wf\"|'wf')")
+WORKFLOW_ROOT_HINT_RE = re.compile(
+    r"(?i)(?:\bvars\b|\binitVariables\b|\"vars\"|'vars'|\"initVariables\"|'initVariables')"
+)
+LOWCODE_DEMO_TABLE_PATTERNS = (
+    (re.compile(r"(?m)^\s*local\s+data\s*=\s*\{"), "invented demo table `local data = {...}`"),
+    (re.compile(r"(?m)^\s*local\s+users\s*=\s*\{"), "invented demo table `local users = {...}`"),
+    (re.compile(r"(?m)^\s*local\s+emails\s*=\s*\{"), "invented demo table `local emails = {...}`"),
+    (re.compile(r"(?m)^\s*local\s+items\s*=\s*\{"), "invented demo table `local items = {...}`"),
+)
+LOWCODE_APP_WRAPPER_PATTERNS = (
+    (re.compile(r"(?i)\b(http|server|router|endpoint|listen|request|response)\b"), "app/service wrapper vocabulary"),
+    (re.compile(r"(?m)^\s*local\s+app\s*="), "application wrapper declaration"),
+)
+LOWCODE_RETURN_RE = re.compile(r"(?m)^\s*return\b")
+LOWCODE_SAVE_INTENT_RE = re.compile(
+    r"(?i)\b(save|update|set|assign|store|write|persist)\b|сохрани|запиши|обнови|установи|присвой"
+)
 LOWCODE_CONSOLE_INPUT_PATTERNS = (
     (re.compile(r"\bio\.read\s*\("), "io.read"),
     (re.compile(r"\bio\.stdin\s*:\s*read\s*\("), "io.stdin:read"),
     (re.compile(r"\bio\.stdin:read\s*\("), "io.stdin:read"),
-)
-LOWCODE_CONSOLE_OUTPUT_PATTERNS = (
     (re.compile(r"\bprint\s*\("), "print"),
     (re.compile(r"\bio\.write\s*\("), "io.write"),
     (re.compile(r"\bio\.stdout\s*:\s*write\s*\("), "io.stdout:write"),
     (re.compile(r"\bio\.stdout:write\s*\("), "io.stdout:write"),
 )
+LOWCODE_CONSOLE_OUTPUT_PATTERNS = ()
 _DELETE_KEYWORDS = (
     "remove", "delete", "drop",
     "убери", "удали", "удалить", "уберите", "выкинь",
@@ -353,6 +376,157 @@ def collect_lowcode_access_paths(lua_code: str) -> dict[str, list[list[str]]]:
                 add_path(root, [*base_segments, *suffix_segments])
 
     return discovered
+
+
+def extract_workflow_paths_from_text(text: str) -> dict[str, list[list[str]]]:
+    """Collect explicit wf.vars/wf.initVariables paths mentioned in free-form text."""
+    discovered: dict[str, list[list[str]]] = {"vars": [], "initVariables": []}
+    seen: set[tuple[str, ...]] = set()
+
+    for match in WF_ROOT_ACCESS_RE.finditer(str(text or "")):
+        parsed = _parse_wf_expression(match.group(0))
+        if not parsed:
+            continue
+        root, segments = parsed
+        key = (root, *segments)
+        if key in seen:
+            continue
+        seen.add(key)
+        discovered[root].append(segments)
+
+    return discovered
+
+
+def flatten_lowcode_paths(paths: dict[str, list[list[str]]]) -> list[str]:
+    """Render workflow paths into stable dotted strings."""
+    flattened: list[str] = []
+    seen: set[str] = set()
+    for root in ("vars", "initVariables"):
+        for segments in paths.get(root, []):
+            dotted = ".".join([f"wf.{root}", *segments])
+            if dotted in seen:
+                continue
+            seen.add(dotted)
+            flattened.append(dotted)
+    return flattened
+
+
+def has_workflow_context(text: str) -> bool:
+    """Detect whether the prompt likely contains workflow context."""
+    cleaned = str(text or "")
+    return bool(WORKFLOW_CONTEXT_HINT_RE.search(cleaned) and WORKFLOW_ROOT_HINT_RE.search(cleaned))
+
+
+def _workflow_path_matches(expected: str, actual: str) -> bool:
+    return actual == expected or actual.startswith(f"{expected}.")
+
+
+def _tail_non_comment_lines(lua_code: str, limit: int = 6) -> list[str]:
+    lines = [
+        line.strip()
+        for line in str(lua_code or "").splitlines()
+        if line.strip() and not line.strip().startswith("--")
+    ]
+    return lines[-limit:]
+
+
+def has_direct_return(lua_code: str) -> bool:
+    """Check whether the last executable lines contain a direct return."""
+    return any(line.startswith("return") for line in _tail_non_comment_lines(lua_code))
+
+
+def request_explicitly_saves_to_workflow(prompt: str) -> bool:
+    """Heuristic: detect prompts that explicitly ask to update workflow state."""
+    lowered = str(prompt or "").lower()
+    save_markers = ("save", "update", "set", "assign", "store", "write", "сохрани", "запиши", "обнови", "установи", "присвой")
+    return "wf.vars" in lowered and any(marker in lowered for marker in save_markers)
+
+
+def detect_lowcode_anti_patterns(
+    prompt: str,
+    lua_code: str,
+    actual_paths: list[str] | None = None,
+) -> list[str]:
+    """Detect code shapes that violate the expected workflow-script style."""
+    anti_patterns: list[str] = []
+    workflow_context = has_workflow_context(prompt)
+    actual = list(actual_paths or [])
+    if not workflow_context:
+        return anti_patterns
+
+    for pattern, label in LOWCODE_DEMO_TABLE_PATTERNS:
+        if pattern.search(lua_code):
+            anti_patterns.append(label)
+
+    if not actual:
+        for pattern, label in LOWCODE_APP_WRAPPER_PATTERNS:
+            if pattern.search(lua_code):
+                anti_patterns.append(label)
+
+    if workflow_context and not actual and not anti_patterns:
+        anti_patterns.append("workflow context was provided but the code does not read from wf.vars / wf.initVariables")
+
+    return anti_patterns
+
+
+def inspect_lowcode_request_alignment(prompt: str, code: str) -> dict[str, Any]:
+    """Deterministically verify that the code follows the workflow paths from the request."""
+    expected_paths = flatten_lowcode_paths(extract_workflow_paths_from_text(prompt))
+    actual_paths = flatten_lowcode_paths(collect_lowcode_access_paths(code))
+    workflow_context = has_workflow_context(prompt)
+    anti_patterns = detect_lowcode_anti_patterns(prompt, code, actual_paths)
+    missing_requirements: list[str] = []
+    warnings: list[str] = []
+
+    if expected_paths:
+        unmatched = [
+            path for path in expected_paths
+            if not any(_workflow_path_matches(path, actual) for actual in actual_paths)
+        ]
+        if unmatched:
+            missing_requirements.append(
+                "Use the workflow paths mentioned in the request/context directly: "
+                + ", ".join(unmatched)
+            )
+
+    if workflow_context and not actual_paths:
+        missing_requirements.append(
+            "The request includes workflow context, so the script must read from wf.vars / wf.initVariables instead of invented local input data."
+        )
+
+    if anti_patterns:
+        missing_requirements.append(
+            "Remove workflow anti-patterns: " + ", ".join(anti_patterns)
+        )
+
+    if workflow_context and not request_explicitly_saves_to_workflow(prompt):
+        if not WF_ASSIGN_RE.search(code) and not has_direct_return(code):
+            missing_requirements.append(
+                "Return the computed workflow value directly instead of only defining locals/functions."
+            )
+
+    if actual_paths and not LOWCODE_RETURN_RE.search(code) and not WF_ASSIGN_RE.search(code):
+        warnings.append("No explicit return or wf.vars assignment detected.")
+
+    if missing_requirements:
+        summary = "Deterministic workflow guard failed."
+    elif expected_paths:
+        summary = "Deterministic workflow guard passed: workflow paths are used directly."
+    elif workflow_context:
+        summary = "Deterministic workflow guard passed: workflow context is used."
+    else:
+        summary = "Deterministic workflow guard found no explicit workflow-path requirements."
+
+    return {
+        "passed": not missing_requirements,
+        "summary": summary,
+        "missing_requirements": missing_requirements,
+        "warnings": warnings,
+        "expected_workflow_paths": expected_paths,
+        "actual_workflow_paths": actual_paths,
+        "anti_patterns": anti_patterns,
+        "has_workflow_context": workflow_context,
+    }
 
 
 def build_mock_leaf_value(path_segments: list[str]) -> str:

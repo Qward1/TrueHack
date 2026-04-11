@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Callable
 
 import structlog
@@ -16,6 +17,7 @@ from src.tools.lua_tools import (
     async_verify_requirements,
     extract_function_names,
     format_lowcode_jsonstring,
+    inspect_lowcode_request_alignment,
     restore_lost_functions,
     smart_normalize,
     validate_lua_response,
@@ -68,62 +70,27 @@ User message: {user_input}
 JSON only:"""
 
 _GENERATE_SYSTEM = (
-    f"You generate clean, correct {LOWCODE_LUA_VERSION} workflow/LUS scripts from the user's request. "
-    "Return the script in LowCode JsonString format lua{...}lua without markdown fences or explanations. "
-    f"{LOWCODE_CONTRACT_TEXT} "
-    "Generate a data/workflow script, not a console or CLI app. "
-    "Prefer direct work with wf.vars / wf.initVariables, keep helper functions only when needed, and return the final value and/or update wf.vars."
+    f"You write short {LOWCODE_LUA_VERSION} workflow scripts. "
+    "Return ONLY Lua code wrapped in lua{{...}}lua — no markdown, no explanations, no prose.\n"
+    f"{LOWCODE_CONTRACT_TEXT}"
+    "Style: write the shortest correct script. "
+    "Simple tasks = 1-3 lines. Use helper functions only for genuinely complex logic."
 )
 
 _REFINE_SYSTEM = (
-    "You modify existing Lua code according to the user's request. "
-    "Return the COMPLETE updated file, not just the changed parts. "
+    "You modify existing Lua workflow scripts according to the user's request. "
+    "Return the COMPLETE updated script in lua{...}lua format. "
     "Preserve existing functions unless explicitly asked to remove them. "
-    "Return the script in LowCode JsonString format lua{...}lua. "
-    f"{LOWCODE_CONTRACT_TEXT} "
-    "Keep the result as a workflow/LUS script instead of a console or CLI app."
+    f"{LOWCODE_CONTRACT_TEXT}"
+    "Keep the result minimal — do not add unnecessary structure."
 )
-
-_REFINE_USER = """Primary target file: {target_path}
-Existing functions you must preserve unless the user explicitly removes them:
-{function_list}
-
-Original code:
-{code}
-
-User request:
-{user_input}
-
-LowCode contract:
-{lowcode_contract}
-
-Return the complete updated Lua file in JsonString format lua{{...}}lua. No fences. No prose."""
 
 _FIX_SYSTEM = (
-    "You fix broken Lua code using the user's goal and diagnostics. "
-    "Return only corrected Lua code in JsonString format lua{...}lua without markdown fences, explanations, or extra text. "
-    f"{LOWCODE_CONTRACT_TEXT} "
-    "Keep the result as a workflow/LUS script. Do not introduce console input/output, prompts, menus, or CLI scaffolding."
+    "You fix broken Lua workflow scripts. "
+    "Return ONLY the corrected code in lua{...}lua — no markdown, no explanations.\n"
+    f"{LOWCODE_CONTRACT_TEXT}"
+    "Do not convert the script into a console app. Do not add print/io.read/menus."
 )
-
-_FIX_USER = """Primary target file: {target_path}
-Original task: {base_prompt}
-Current failure stage: {failure_stage}
-
-Validation diagnostics:
-- Failure kind: {failure_kind}
-- Runtime error: {run_error}
-- Runtime output: {run_output}
-
-Requirement verification:
-- Summary: {verification_summary}
-- Missing requirements: {missing_requirements}
-
-Current code:
-{code}
-
-Fix the code so it satisfies the original task and passes validation + requirement checks.
-Return only the full corrected Lua file in JsonString format lua{{...}}lua."""
 
 _ANSWER_SYSTEM = (
     "You are a helpful Lua programming assistant. "
@@ -138,6 +105,75 @@ _EXPLAIN_SYSTEM = (
     "IMPORTANT: write all text values in the same language as the user_request field "
     "(if the request is in Russian — answer in Russian; if in English — answer in English)."
 )
+
+_FENCED_BLOCK_RE = re.compile(r"```(?:[A-Za-z0-9_-]+)?\s*([\s\S]*?)```")
+_TRAILING_JSON_CONTEXT_RE = re.compile(
+    r"(?s)^(?P<task>.*?)(?:\n\s*)(?P<context>(?:\{[\s\S]*\}|\[[\s\S]*\]))\s*$"
+)
+_PUBLIC_SAMPLE_FEWSHOT = """Reference style from the public sample:
+
+Example 1
+Task: Return the last email from the provided workflow context.
+Good output:
+lua{return wf.vars.emails[#wf.vars.emails]}lua
+
+Example 2
+Task: Increment wf.vars.try_count_n by one.
+Good output:
+lua{return wf.vars.try_count_n + 1}lua
+
+Example 3
+Task: Convert DATUM/TIME from wf.vars.json.IDOC.ZCDF_HEAD to ISO 8601.
+Good output:
+lua{
+local DATUM = wf.vars.json.IDOC.ZCDF_HEAD.DATUM
+local TIME = wf.vars.json.IDOC.ZCDF_HEAD.TIME
+local function safe_sub(str, start_pos, end_pos)
+    str = str or ""
+    return string.sub(str, start_pos, math.min(end_pos, #str))
+end
+local year = safe_sub(DATUM, 1, 4)
+local month = safe_sub(DATUM, 5, 6)
+local day = safe_sub(DATUM, 7, 8)
+local hour = safe_sub(TIME, 1, 2)
+local minute = safe_sub(TIME, 3, 4)
+local second = safe_sub(TIME, 5, 6)
+return string.format("%s-%s-%sT%s:%s:%s.00000Z", year, month, day, hour, minute, second)
+}lua
+
+Example 4
+Task: Ensure obj.items is always an array in wf.vars.json.IDOC.ZCDF_HEAD.ZCDF_PACKAGES.
+Good output:
+lua{
+local function ensureArray(value)
+    if type(value) ~= "table" then
+        return { value }
+    end
+    local isArray = true
+    for key in pairs(value) do
+        if type(key) ~= "number" or math.floor(key) ~= key then
+            isArray = false
+            break
+        end
+    end
+    return isArray and value or { value }
+end
+
+for _, obj in ipairs(wf.vars.json.IDOC.ZCDF_HEAD.ZCDF_PACKAGES) do
+    if type(obj) == "table" and obj.items ~= nil then
+        obj.items = ensureArray(obj.items)
+    end
+end
+
+return wf.vars.json.IDOC.ZCDF_HEAD.ZCDF_PACKAGES
+}lua"""
+_PROMPT_STYLE_RULES = """Hard rules:
+- Use the exact wf.vars / wf.initVariables paths from the task or provided workflow context.
+- Do not recreate the provided input as local demo tables like local data = {...}, local users = {...}, local emails = {...}.
+- Do not build an app, service, API, menu, tutorial, or CLI wrapper.
+- Do not use print(), io.write(), io.read(), or console prompts.
+- Simple extraction/computation tasks should usually be 1-3 lines with a direct return.
+- If the task explicitly asks to save/update wf.vars, keep the script minimal and still use the exact workflow paths."""
 
 
 def _target_context(state: PipelineState) -> str:
@@ -156,6 +192,133 @@ def _normalize_string_list(value: object, limit: int = 3) -> list[str]:
         return []
     normalized = [str(item).strip() for item in value if str(item).strip()]
     return normalized[:limit]
+
+
+def _format_values_for_prompt(values: object, fallback: str = "none") -> str:
+    if isinstance(values, list):
+        cleaned = [str(value).strip() for value in values if str(value).strip()]
+        return ", ".join(cleaned) if cleaned else fallback
+    text = str(values or "").strip()
+    return text or fallback
+
+
+def split_task_and_context(user_input: str) -> tuple[str, str]:
+    """Split a user message into task text and pasted workflow context."""
+    cleaned = str(user_input or "").strip()
+    if not cleaned:
+        return "", ""
+
+    fenced_blocks = [
+        block.strip()
+        for block in _FENCED_BLOCK_RE.findall(cleaned)
+        if block and block.strip()
+    ]
+    if fenced_blocks:
+        task = _FENCED_BLOCK_RE.sub("\n", cleaned)
+        task = re.sub(r"\n{3,}", "\n\n", task).strip()
+        return task or cleaned, "\n\n".join(fenced_blocks)
+
+    trailing_context = _TRAILING_JSON_CONTEXT_RE.match(cleaned)
+    if trailing_context:
+        task = str(trailing_context.group("task") or "").strip()
+        context = str(trailing_context.group("context") or "").strip()
+        if task and context and (context.count("\n") >= 1 or ":" in context):
+            return task, context
+
+    return cleaned, ""
+
+
+def _join_prompt_sections(*sections: str) -> str:
+    return "\n\n".join(section.strip() for section in sections if section and section.strip())
+
+
+def _build_generation_prompt(user_input: str, target_context: str = "") -> str:
+    task, provided_context = split_task_and_context(user_input)
+    sections = [
+        f"Task:\n{task or user_input.strip()}",
+        f"Target file:\n{target_context}" if target_context else "",
+        (
+            "Provided workflow context:\n"
+            f"{provided_context}"
+        ) if provided_context else "",
+        _PROMPT_STYLE_RULES,
+        _PUBLIC_SAMPLE_FEWSHOT,
+        "Return ONLY the final Lua file in JsonString format lua{...}lua.",
+    ]
+    return _join_prompt_sections(*sections)
+
+
+def _build_refine_prompt(
+    *,
+    base_prompt: str,
+    user_input: str,
+    target_path: str,
+    function_list: str,
+    code: str,
+) -> str:
+    original_task, provided_context = split_task_and_context(base_prompt or user_input)
+    sections = [
+        f"Original task:\n{original_task or user_input.strip()}",
+        (
+            "Original workflow context:\n"
+            f"{provided_context}"
+        ) if provided_context else "",
+        f"Primary target file:\n{target_path}",
+        (
+            "Existing functions you must preserve unless the user explicitly removes them:\n"
+            f"{function_list}"
+        ),
+        f"Current code:\n{code}",
+        f"Change request:\n{user_input}",
+        _PROMPT_STYLE_RULES,
+        _PUBLIC_SAMPLE_FEWSHOT,
+        "Return ONLY the complete updated Lua file in JsonString format lua{...}lua.",
+    ]
+    return _join_prompt_sections(*sections)
+
+
+def _build_fix_prompt(
+    *,
+    base_prompt: str,
+    target_path: str,
+    failure_stage: str,
+    failure_kind: str,
+    run_error: str,
+    run_output: str,
+    verification_summary: str,
+    missing_requirements: str,
+    expected_paths: str,
+    actual_paths: str,
+    anti_patterns: str,
+    code: str,
+) -> str:
+    original_task, provided_context = split_task_and_context(base_prompt)
+    sections = [
+        f"Original task:\n{original_task or base_prompt.strip()}",
+        (
+            "Original workflow context:\n"
+            f"{provided_context}"
+        ) if provided_context else "",
+        f"Primary target file:\n{target_path}",
+        (
+            "Failure diagnostics:\n"
+            f"- Current failure stage: {failure_stage}\n"
+            f"- Failure kind: {failure_kind}\n"
+            f"- Runtime error: {run_error}\n"
+            f"- Runtime output: {run_output}\n"
+            f"- Verification summary: {verification_summary}\n"
+            f"- Missing requirements: {missing_requirements}\n"
+            f"- Expected workflow paths: {expected_paths}\n"
+            f"- Actual workflow paths in code: {actual_paths}\n"
+            f"- Detected anti-patterns: {anti_patterns}"
+        ),
+        f"Current code:\n{code}",
+        _PROMPT_STYLE_RULES,
+        _PUBLIC_SAMPLE_FEWSHOT,
+        "Fix the code so it follows the provided workflow context and passes validation + requirement checks.",
+        "Return ONLY the complete corrected Lua file in JsonString format lua{...}lua.",
+    ]
+    return _join_prompt_sections(*sections)
 
 
 def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
@@ -301,9 +464,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 "target_explicit": target_explicit,
             }
         )
-        prompt = user_input
-        if target_context:
-            prompt = f"{user_input}\n\n{target_context}\nGenerate only the code for this Lua file."
+        prompt = _build_generation_prompt(base_prompt, target_context=target_context)
 
         logger.info(
             f"[{_AGENT_GENERATE_CODE}/llm.generate] calling",
@@ -409,12 +570,12 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         )
 
         func_list = "\n".join(f"  - {name}" for name in func_names) or "  (none)"
-        prompt = _REFINE_USER.format(
+        prompt = _build_refine_prompt(
+            base_prompt=state.get("base_prompt", "") or user_input,
+            user_input=user_input,
             target_path=target_path,
             function_list=func_list,
             code=existing,
-            user_input=user_input,
-            lowcode_contract=LOWCODE_CONTRACT_TEXT,
         )
 
         logger.info(
@@ -536,15 +697,18 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             target_path=state.get("target_path", "(not set)"),
         )
 
-        prompt = _FIX_USER.format(
-            target_path=state.get("target_path", "(not set)"),
+        prompt = _build_fix_prompt(
             base_prompt=base_prompt,
+            target_path=state.get("target_path", "(not set)"),
             failure_stage=failure_stage,
             failure_kind=diagnostics.get("failure_kind", "unknown"),
             run_error=diagnostics.get("run_error", "none"),
             run_output=diagnostics.get("run_output", "none"),
             verification_summary=verification.get("summary", "none"),
-            missing_requirements=", ".join(verification.get("missing_requirements", [])) or "none",
+            missing_requirements=_format_values_for_prompt(verification.get("missing_requirements", [])),
+            expected_paths=_format_values_for_prompt(verification.get("expected_workflow_paths", [])),
+            actual_paths=_format_values_for_prompt(verification.get("actual_workflow_paths", [])),
+            anti_patterns=_format_values_for_prompt(verification.get("anti_patterns", [])),
             code=code,
         )
 
@@ -596,11 +760,13 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         code = state.get("generated_code", "")
         base_prompt = state.get("base_prompt", "") or state.get("user_input", "")
         diagnostics = state.get("diagnostics", {})
+        deterministic = inspect_lowcode_request_alignment(base_prompt, code)
 
         logger.info(
             f"[{_AGENT_VERIFY_REQUIREMENTS}] started",
             code_len=len(code),
             base_prompt_len=len(base_prompt),
+            deterministic_expected_paths=deterministic.get("expected_workflow_paths", []),
         )
 
         try:
@@ -621,13 +787,14 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 score=verification.get("score", 0),
                 missing=verification.get("missing_requirements", []),
             )
+            verification["error"] = False
         except Exception as exc:
             logger.warning(
                 f"[{_AGENT_VERIFY_REQUIREMENTS}/async_verify_requirements] failed",
                 error=str(exc),
             )
             verification = {
-                "passed": False,
+                "passed": deterministic.get("passed", False),
                 "score": 0,
                 "summary": f"LLM verification unavailable: {exc}",
                 "missing_requirements": [],
@@ -635,22 +802,65 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 "error": True,
             }
 
-        passed = bool(verification.get("passed")) or int(verification.get("score", 0) or 0) >= 70
+        llm_passed = bool(verification.get("passed")) or int(verification.get("score", 0) or 0) >= 70
+        combined_missing = [
+            *deterministic.get("missing_requirements", []),
+            *[
+                item
+                for item in verification.get("missing_requirements", [])
+                if item not in deterministic.get("missing_requirements", [])
+            ],
+        ]
+        combined_warnings = [
+            *deterministic.get("warnings", []),
+            *[
+                item
+                for item in verification.get("warnings", [])
+                if item not in deterministic.get("warnings", [])
+            ],
+        ]
+        llm_summary = str(verification.get("summary", "")).strip()
+        deterministic_summary = str(deterministic.get("summary", "")).strip()
+        if verification.get("error"):
+            summary_parts = [deterministic_summary]
+            if llm_summary:
+                summary_parts.append(llm_summary)
+        else:
+            summary_parts = [part for part in (deterministic_summary, llm_summary) if part]
+        combined_summary = " ".join(part for part in summary_parts if part).strip()
+
+        passed = deterministic.get("passed", False) and (llm_passed or verification.get("error"))
+        verification = {
+            **verification,
+            "passed": passed,
+            "summary": combined_summary or deterministic_summary or llm_summary or "Verification completed.",
+            "missing_requirements": combined_missing,
+            "warnings": combined_warnings,
+            "expected_workflow_paths": deterministic.get("expected_workflow_paths", []),
+            "actual_workflow_paths": deterministic.get("actual_workflow_paths", []),
+            "anti_patterns": deterministic.get("anti_patterns", []),
+            "deterministic_summary": deterministic_summary,
+        }
         diagnostics_updated = dict(diagnostics)
         diagnostics_updated["verification_summary"] = verification.get("summary", "")
         diagnostics_updated["verification_checked"] = not verification.get("error", False)
         diagnostics_updated["verification_passed"] = passed
+        diagnostics_updated["deterministic_verification_summary"] = deterministic_summary
+        diagnostics_updated["expected_workflow_paths"] = verification.get("expected_workflow_paths", [])
+        diagnostics_updated["actual_workflow_paths"] = verification.get("actual_workflow_paths", [])
+        diagnostics_updated["anti_patterns"] = verification.get("anti_patterns", [])
+        diagnostics_updated["failure_kind"] = "requirements" if combined_missing else diagnostics.get("failure_kind", "")
 
         logger.info(
             f"[{_AGENT_VERIFY_REQUIREMENTS}] completed",
             passed=passed,
             score=verification.get("score", 0),
-            failure_stage="" if (passed or verification.get("error")) else "requirements",
+            failure_stage="" if (passed or (verification.get("error") and not combined_missing)) else "requirements",
         )
         return {
             "verification": verification,
             "verification_passed": passed,
-            "failure_stage": "" if (passed or verification.get("error")) else "requirements",
+            "failure_stage": "" if (passed or (verification.get("error") and not combined_missing)) else "requirements",
             "diagnostics": diagnostics_updated,
         }
 
