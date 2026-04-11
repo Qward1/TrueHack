@@ -100,3 +100,21 @@ README описывает канонический запуск через `app.
   - deterministic LowCode alignment guard;
   - pipeline scenario: app-style generation goes into fix-loop;
   - pipeline scenario: public-sample-style generation passes validate -> verify -> save.
+
+## 2026-04-11 update: hybrid compiler for workflow data tasks
+- The canonical pipeline now inserts `prepare_generation_context` between intent routing and code generation/refinement.
+- Parsed workflow JSON is normalized into a compiled request object and used as the main source of truth for:
+  - path inventory and types;
+  - operation detection;
+  - primary-path selection;
+  - clarification gating on ambiguity;
+  - deterministic fast-path generation for simple data tasks.
+- Current deterministic simple scope:
+  - count array;
+  - first/last element from array;
+  - direct field/scalar extraction;
+  - increment/decrement numeric scalar;
+  - string length.
+- Example target behavior now covered by tests:
+  - `Посчитай количество товаров в корзине` + workflow context -> `return #wf.vars.cart.items`
+- Ambiguous requests with multiple matching paths now return a clarification response instead of guessing and instead of saving invalid code.

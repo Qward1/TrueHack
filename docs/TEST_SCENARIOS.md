@@ -179,3 +179,30 @@ return recallTime
 ### Pass criteria
 - deterministic verification lists `wf.initVariables.recallTime` as a missing direct workflow path;
 - save does not happen until the script uses the expected workflow path directly.
+
+## 14. Deterministic fast-path for array count
+### Prompt
+`Посчитай количество товаров в корзине.` plus pasted workflow context with `wf.vars.cart.items`.
+
+### Pass criteria
+- pipeline does not call main LLM generation;
+- generated code is exactly `return #wf.vars.cart.items`;
+- validate -> verify -> save still run normally after deterministic compilation.
+
+## 15. Deterministic fast-path for last element
+### Prompt
+`Return the last email from the provided workflow context.` plus pasted workflow context with `wf.vars.emails`.
+
+### Pass criteria
+- pipeline does not call main LLM generation;
+- generated code is exactly `return wf.vars.emails[#wf.vars.emails]`.
+
+## 16. Ambiguous path selection asks before generation
+### Prompt
+`Посчитай количество товаров.` plus pasted workflow context containing both `wf.vars.cart.items` and `wf.vars.wishlist.items`.
+
+### Pass criteria
+- pipeline returns a clarification response instead of code;
+- save is not attempted;
+- clarification text contains both candidate workflow paths;
+- after the user answers with an explicit workflow path, the pipeline reuses the original base prompt/context and continues from the same chat.

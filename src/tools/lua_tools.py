@@ -131,6 +131,35 @@ LOWCODE_RETURN_RE = re.compile(r"(?m)^\s*return\b")
 LOWCODE_SAVE_INTENT_RE = re.compile(
     r"(?i)\b(save|update|set|assign|store|write|persist)\b|сохрани|запиши|обнови|установи|присвой"
 )
+TASK_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9_]+")
+SEMANTIC_STEM_GROUPS: dict[str, tuple[str, ...]] = {
+    "cart": ("cart", "basket", "корзин"),
+    "item": ("item", "items", "товар", "product", "products", "goods", "sku", "позиц", "position"),
+    "wishlist": ("wishlist", "wish", "избран"),
+    "email": ("email", "emails", "mail", "почт", "емайл", "емейл"),
+    "count": ("count", "qty", "quantity", "колич", "сколько", "числ"),
+    "first": ("first", "перв", "начал"),
+    "last": ("last", "послед", "конеч"),
+    "return": ("return", "get", "extract", "take", "верн", "получ", "возьми", "достань"),
+    "increment": ("increment", "increase", "add", "plus", "увелич", "прибав", "инкрем"),
+    "decrement": ("decrement", "decrease", "subtract", "minus", "уменьш", "убав", "выч"),
+    "length": ("length", "len", "длин"),
+    "retry": ("retry", "try", "tries", "attempt", "attempts", "попыт", "счетчик", "счётчик"),
+    "string": ("string", "text", "строк", "текст"),
+    "name": ("name", "title", "назв", "имя"),
+    "total": ("total", "sum", "итог", "сумм"),
+}
+SIMPLE_OPERATION_ALLOWED_TYPES: dict[str, set[str]] = {
+    "count": {"array_scalar", "array_object"},
+    "first": {"array_scalar", "array_object"},
+    "last": {"array_scalar", "array_object"},
+    "return": {"scalar", "object", "array_scalar", "array_object"},
+    "increment": {"scalar"},
+    "decrement": {"scalar"},
+    "string_length": {"scalar"},
+}
+NUMERIC_PATH_HINTS = ("count", "qty", "quantity", "total", "sum", "amount", "num", "number", "index", "retry", "try")
+STRING_PATH_HINTS = ("name", "title", "text", "message", "label", "email", "mail", "description", "desc")
 LOWCODE_CONSOLE_INPUT_PATTERNS = (
     (re.compile(r"\bio\.read\s*\("), "io.read"),
     (re.compile(r"\bio\.stdin\s*:\s*read\s*\("), "io.stdin:read"),
@@ -411,6 +440,373 @@ def flatten_lowcode_paths(paths: dict[str, list[list[str]]]) -> list[str]:
     return flattened
 
 
+def _extract_json_like_value(text: str) -> Any | None:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return None
+
+    candidates = [cleaned]
+    start = min(
+        [index for index in (cleaned.find("{"), cleaned.find("[")) if index != -1],
+        default=-1,
+    )
+    end_object = cleaned.rfind("}")
+    end_array = cleaned.rfind("]")
+    end = max(end_object, end_array)
+    if start != -1 and end > start:
+        candidates.append(cleaned[start : end + 1])
+
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except Exception:
+            continue
+    return None
+
+
+def _compact_sample_value(value: Any, limit: int = 120) -> str:
+    try:
+        serialized = json.dumps(value, ensure_ascii=False)
+    except Exception:
+        serialized = repr(value)
+    if len(serialized) <= limit:
+        return serialized
+    return f"{serialized[: limit - 3].rstrip()}..."
+
+
+def _detect_inventory_value_type(value: Any) -> str:
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        first_non_null = next((item for item in value if item is not None), None)
+        if isinstance(first_non_null, dict):
+            return "array_object"
+        return "array_scalar"
+    return "scalar"
+
+
+def _collect_array_item_keys(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    keys: set[str] = set()
+    for item in value:
+        if isinstance(item, dict):
+            keys.update(str(key) for key in item.keys())
+    return sorted(keys)
+
+
+def build_workflow_path_inventory(context_value: Any) -> list[dict[str, Any]]:
+    """Flatten parseable workflow JSON into a path inventory with types and samples."""
+    entries: list[dict[str, Any]] = []
+
+    def walk(root_name: str, value: Any, segments: list[str]) -> None:
+        if not segments:
+            if isinstance(value, dict):
+                for child_key, child_value in value.items():
+                    walk(root_name, child_value, [str(child_key)])
+            return
+
+        path = ".".join([f"wf.{root_name}", *segments])
+        value_type = _detect_inventory_value_type(value)
+        child_keys = sorted(str(key) for key in value.keys()) if isinstance(value, dict) else []
+        entry = {
+            "path": path,
+            "root": root_name,
+            "segments": list(segments),
+            "type": value_type,
+            "child_keys": child_keys,
+            "item_keys": _collect_array_item_keys(value),
+            "sample_value": value,
+            "sample_preview": _compact_sample_value(value),
+        }
+        entries.append(entry)
+
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                walk(root_name, child_value, [*segments, str(child_key)])
+
+    if not isinstance(context_value, dict):
+        return entries
+
+    wf_section = context_value.get("wf") if isinstance(context_value.get("wf"), dict) else context_value
+    if not isinstance(wf_section, dict):
+        return entries
+
+    for root_name in ("vars", "initVariables"):
+        root_value = wf_section.get(root_name)
+        if root_value is None:
+            continue
+        walk(root_name, root_value, [])
+
+    return entries
+
+
+def parse_lowcode_workflow_context(raw_context: str) -> dict[str, Any]:
+    """Parse pasted workflow JSON-like context into an inventory the compiler can use."""
+    parsed_value = _extract_json_like_value(raw_context)
+    inventory = build_workflow_path_inventory(parsed_value)
+    path_types = {entry["path"]: entry["type"] for entry in inventory}
+    sample_values = {entry["path"]: entry["sample_preview"] for entry in inventory}
+    return {
+        "has_parseable_context": bool(inventory),
+        "parsed_context": parsed_value,
+        "workflow_path_inventory": inventory,
+        "path_types": path_types,
+        "sample_values": sample_values,
+    }
+
+
+def _extract_task_tokens(text: str) -> list[str]:
+    return [token.lower() for token in TASK_TOKEN_RE.findall(str(text or ""))]
+
+
+def _canonicalize_tokens(tokens: list[str]) -> set[str]:
+    canonical: set[str] = set()
+    for token in tokens:
+        canonical.add(token)
+        for name, stems in SEMANTIC_STEM_GROUPS.items():
+            if any(stem in token for stem in stems):
+                canonical.add(name)
+    return canonical
+
+
+def _entry_semantic_tokens(entry: dict[str, Any]) -> dict[str, set[str]]:
+    segment_tokens = _extract_task_tokens(" ".join(entry.get("segments", [])))
+    item_tokens = _extract_task_tokens(" ".join(entry.get("item_keys", [])))
+    child_tokens = _extract_task_tokens(" ".join(entry.get("child_keys", [])))
+    return {
+        "segment_tokens": _canonicalize_tokens(segment_tokens),
+        "item_tokens": _canonicalize_tokens(item_tokens),
+        "child_tokens": _canonicalize_tokens(child_tokens),
+    }
+
+
+def detect_lowcode_operation(task_text: str) -> dict[str, Any]:
+    """Detect the dominant simple operation requested by the user."""
+    tokens = _canonicalize_tokens(_extract_task_tokens(task_text))
+    numbers = [int(match) for match in re.findall(r"\b\d+\b", str(task_text or ""))]
+
+    if "increment" in tokens:
+        return {"operation": "increment", "argument": numbers[0] if numbers else 1}
+    if "decrement" in tokens:
+        return {"operation": "decrement", "argument": numbers[0] if numbers else 1}
+    if "count" in tokens:
+        return {"operation": "count", "argument": None}
+    if "first" in tokens:
+        return {"operation": "first", "argument": None}
+    if "last" in tokens:
+        return {"operation": "last", "argument": None}
+    if "length" in tokens and "string" in tokens:
+        return {"operation": "string_length", "argument": None}
+    if "return" in tokens:
+        return {"operation": "return", "argument": None}
+    return {"operation": "llm", "argument": None}
+
+
+def _path_looks_numeric(entry: dict[str, Any]) -> bool:
+    sample_value = entry.get("sample_value")
+    if isinstance(sample_value, (int, float)) and not isinstance(sample_value, bool):
+        return True
+    path_lower = str(entry.get("path", "")).lower()
+    return any(hint in path_lower for hint in NUMERIC_PATH_HINTS)
+
+
+def _path_looks_string(entry: dict[str, Any]) -> bool:
+    sample_value = entry.get("sample_value")
+    if isinstance(sample_value, str):
+        return True
+    path_lower = str(entry.get("path", "")).lower()
+    return any(hint in path_lower for hint in STRING_PATH_HINTS)
+
+
+def rank_workflow_paths(
+    task_text: str,
+    inventory: list[dict[str, Any]],
+    operation: str,
+    explicit_paths: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Rank context-derived workflow paths against the current task."""
+    task_tokens_raw = _extract_task_tokens(task_text)
+    task_tokens = _canonicalize_tokens(task_tokens_raw)
+    explicit = set(explicit_paths or [])
+    ranked: list[dict[str, Any]] = []
+
+    for entry in inventory:
+        path = str(entry.get("path", ""))
+        if not path:
+            continue
+        path_type = str(entry.get("type", ""))
+        tokens = _entry_semantic_tokens(entry)
+        segment_overlap = len(task_tokens & tokens["segment_tokens"])
+        item_overlap = len(task_tokens & tokens["item_tokens"])
+        child_overlap = len(task_tokens & tokens["child_tokens"])
+        score = (segment_overlap * 4) + (item_overlap * 3) + (child_overlap * 2)
+
+        if path in explicit:
+            score += 100
+        elif any(path.startswith(f"{candidate}.") for candidate in explicit):
+            score += 20
+
+        if operation in SIMPLE_OPERATION_ALLOWED_TYPES:
+            allowed_types = SIMPLE_OPERATION_ALLOWED_TYPES[operation]
+            if path_type not in allowed_types:
+                continue
+            score += 10
+            if operation in {"increment", "decrement"} and not _path_looks_numeric(entry):
+                score -= 6
+            if operation == "string_length" and not _path_looks_string(entry):
+                score -= 6
+
+        if operation == "return" and path_type == "scalar":
+            score += 4
+        if operation == "count" and path.endswith(".items"):
+            score += 3
+
+        ranked.append(
+            {
+                "path": path,
+                "score": score,
+                "type": path_type,
+                "sample_preview": entry.get("sample_preview", ""),
+            }
+        )
+
+    ranked.sort(key=lambda item: (-float(item["score"]), item["path"]))
+    return ranked
+
+
+def compile_deterministic_lowcode_script(
+    *,
+    selected_operation: str,
+    selected_primary_path: str,
+    operation_argument: Any = None,
+    selected_save_path: str = "",
+) -> str:
+    """Compile a simple single-target data task into a minimal workflow script."""
+    expr = ""
+    if selected_operation == "count":
+        expr = f"#{selected_primary_path}"
+    elif selected_operation == "first":
+        expr = f"{selected_primary_path}[1]"
+    elif selected_operation == "last":
+        expr = f"{selected_primary_path}[#{selected_primary_path}]"
+    elif selected_operation == "return":
+        expr = selected_primary_path
+    elif selected_operation == "increment":
+        delta = int(operation_argument or 1)
+        expr = f"({selected_primary_path} or 0) + {delta}"
+    elif selected_operation == "decrement":
+        delta = int(operation_argument or 1)
+        expr = f"({selected_primary_path} or 0) - {delta}"
+    elif selected_operation == "string_length":
+        expr = f"string.len({selected_primary_path} or \"\")"
+    else:
+        return ""
+
+    if not expr:
+        return ""
+    if selected_save_path:
+        return f"{selected_save_path} = {expr}\nreturn {selected_save_path}"
+    return f"return {expr}"
+
+
+def compile_lowcode_request(
+    *,
+    task_text: str,
+    raw_context: str = "",
+    clarification_text: str = "",
+    allow_deterministic: bool = True,
+) -> dict[str, Any]:
+    """Compile task text plus pasted workflow context into a structured request."""
+    parsed_context = parse_lowcode_workflow_context(raw_context)
+    inventory = parsed_context["workflow_path_inventory"]
+    merged_text = "\n".join(part for part in (task_text.strip(), clarification_text.strip()) if part.strip())
+    operation_info = detect_lowcode_operation(merged_text)
+    operation = str(operation_info.get("operation", "llm"))
+    explicit_paths = flatten_lowcode_paths(extract_workflow_paths_from_text(merged_text))
+    ranked_candidates = rank_workflow_paths(merged_text, inventory, operation, explicit_paths)
+
+    selected_primary_path = ""
+    selected_save_path = ""
+    needs_clarification = False
+    clarification_candidates = ranked_candidates[:3]
+    confidence = 0.0
+
+    inventory_paths = {entry["path"] for entry in inventory}
+    explicit_exact = [path for path in explicit_paths if path in inventory_paths]
+    if len(explicit_exact) == 1:
+        selected_primary_path = explicit_exact[0]
+        confidence = 1.0
+    elif len(explicit_exact) > 1:
+        needs_clarification = True
+    elif ranked_candidates:
+        top = ranked_candidates[0]
+        second = ranked_candidates[1] if len(ranked_candidates) > 1 else None
+        confidence = min(1.0, float(top["score"]) / 20.0)
+        if float(top["score"]) < 10:
+            needs_clarification = operation in SIMPLE_OPERATION_ALLOWED_TYPES and parsed_context["has_parseable_context"]
+        elif second and float(top["score"]) - float(second["score"]) < 3:
+            needs_clarification = operation in SIMPLE_OPERATION_ALLOWED_TYPES and parsed_context["has_parseable_context"]
+        else:
+            selected_primary_path = str(top["path"])
+
+    if request_explicitly_saves_to_workflow(merged_text):
+        save_candidates = [
+            path for path in explicit_paths
+            if path.startswith("wf.vars.") and path not in inventory_paths and path != selected_primary_path
+        ]
+        if len(save_candidates) == 1:
+            selected_save_path = save_candidates[0]
+
+    deterministic_code = ""
+    use_deterministic_fast_path = False
+    if (
+        allow_deterministic
+        and parsed_context["has_parseable_context"]
+        and not needs_clarification
+        and selected_primary_path
+        and operation in SIMPLE_OPERATION_ALLOWED_TYPES
+    ):
+        deterministic_code = compile_deterministic_lowcode_script(
+            selected_operation=operation,
+            selected_primary_path=selected_primary_path,
+            operation_argument=operation_info.get("argument"),
+            selected_save_path=selected_save_path,
+        )
+        use_deterministic_fast_path = bool(deterministic_code)
+
+    clarifying_question = ""
+    if needs_clarification:
+        option_text = ", ".join(candidate["path"] for candidate in clarification_candidates) or "wf.vars.<path>"
+        clarifying_question = (
+            "Уточни, с каким workflow-путём работать: "
+            f"{option_text}. Ответь, например: `используй {clarification_candidates[0]['path']}`."
+            if clarification_candidates
+            else "Уточни, с каким workflow-путём работать. Ответь явным путём вида `используй wf.vars.some.path`."
+        )
+
+    return {
+        "task_text": task_text.strip(),
+        "raw_context": raw_context.strip(),
+        "clarification_text": clarification_text.strip(),
+        "workflow_path_inventory": inventory,
+        "path_types": parsed_context["path_types"],
+        "sample_values": parsed_context["sample_values"],
+        "selected_operation": operation,
+        "operation_argument": operation_info.get("argument"),
+        "selected_primary_path": selected_primary_path,
+        "selected_save_path": selected_save_path,
+        "candidate_paths_ranked": clarification_candidates,
+        "confidence": confidence,
+        "needs_clarification": needs_clarification,
+        "clarifying_question": clarifying_question,
+        "has_parseable_context": parsed_context["has_parseable_context"],
+        "deterministic_code": deterministic_code,
+        "use_deterministic_fast_path": use_deterministic_fast_path,
+        "explicit_paths": explicit_paths,
+    }
+
+
 def has_workflow_context(text: str) -> bool:
     """Detect whether the prompt likely contains workflow context."""
     cleaned = str(text or "")
@@ -446,17 +842,27 @@ def detect_lowcode_anti_patterns(
     prompt: str,
     lua_code: str,
     actual_paths: list[str] | None = None,
+    compiled_request: dict[str, Any] | None = None,
 ) -> list[str]:
     """Detect code shapes that violate the expected workflow-script style."""
     anti_patterns: list[str] = []
-    workflow_context = has_workflow_context(prompt)
+    workflow_context = bool(compiled_request and compiled_request.get("has_parseable_context")) or has_workflow_context(prompt)
     actual = list(actual_paths or [])
     if not workflow_context:
         return anti_patterns
 
-    for pattern, label in LOWCODE_DEMO_TABLE_PATTERNS:
-        if pattern.search(lua_code):
-            anti_patterns.append(label)
+    generic_demo_table = re.search(
+        r"(?m)^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{",
+        lua_code,
+    )
+    if generic_demo_table:
+        anti_patterns.append(
+            f"invented top-level table `local {generic_demo_table.group(1)} = {{...}}`"
+        )
+    else:
+        for pattern, label in LOWCODE_DEMO_TABLE_PATTERNS:
+            if pattern.search(lua_code):
+                anti_patterns.append(label)
 
     if not actual:
         for pattern, label in LOWCODE_APP_WRAPPER_PATTERNS:
@@ -469,12 +875,21 @@ def detect_lowcode_anti_patterns(
     return anti_patterns
 
 
-def inspect_lowcode_request_alignment(prompt: str, code: str) -> dict[str, Any]:
+def inspect_lowcode_request_alignment(
+    prompt: str,
+    code: str,
+    compiled_request: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Deterministically verify that the code follows the workflow paths from the request."""
-    expected_paths = flatten_lowcode_paths(extract_workflow_paths_from_text(prompt))
+    if compiled_request and compiled_request.get("selected_primary_path"):
+        expected_paths = [str(compiled_request.get("selected_primary_path", "")).strip()]
+    elif compiled_request and compiled_request.get("explicit_paths"):
+        expected_paths = [str(path).strip() for path in compiled_request.get("explicit_paths", []) if str(path).strip()]
+    else:
+        expected_paths = flatten_lowcode_paths(extract_workflow_paths_from_text(prompt))
     actual_paths = flatten_lowcode_paths(collect_lowcode_access_paths(code))
-    workflow_context = has_workflow_context(prompt)
-    anti_patterns = detect_lowcode_anti_patterns(prompt, code, actual_paths)
+    workflow_context = bool(compiled_request and compiled_request.get("has_parseable_context")) or has_workflow_context(prompt)
+    anti_patterns = detect_lowcode_anti_patterns(prompt, code, actual_paths, compiled_request=compiled_request)
     missing_requirements: list[str] = []
     warnings: list[str] = []
 
@@ -499,10 +914,18 @@ def inspect_lowcode_request_alignment(prompt: str, code: str) -> dict[str, Any]:
             "Remove workflow anti-patterns: " + ", ".join(anti_patterns)
         )
 
+    selected_operation = str((compiled_request or {}).get("selected_operation", "")).strip()
     if workflow_context and not request_explicitly_saves_to_workflow(prompt):
         if not WF_ASSIGN_RE.search(code) and not has_direct_return(code):
             missing_requirements.append(
                 "Return the computed workflow value directly instead of only defining locals/functions."
+            )
+
+    if selected_operation in SIMPLE_OPERATION_ALLOWED_TYPES and has_direct_return(code):
+        expected_shape = str((compiled_request or {}).get("deterministic_code", "")).strip()
+        if expected_shape and normalize_lua_code(code) != normalize_lua_code(expected_shape):
+            warnings.append(
+                "Code shape differs from the deterministic simple-task form expected for this request."
             )
 
     if actual_paths and not LOWCODE_RETURN_RE.search(code) and not WF_ASSIGN_RE.search(code):

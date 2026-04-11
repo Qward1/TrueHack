@@ -108,3 +108,19 @@
   - anti-pattern detection for invented sample data and app/service wrappers;
   - save-gate blocking when deterministic requirements fail, even if the semantic verifier is unavailable.
 - `docs/_pdf_text.txt` remains an offline working aid only and is not read at runtime.
+
+## 2026-04-11 update: compiled workflow context
+- The pipeline now has an explicit generation-context preparation stage before `generate_code` / `refine_code`.
+- Parsed workflow JSON is compiled into an internal request object with:
+  - path inventory;
+  - path types;
+  - sample values;
+  - selected operation;
+  - selected primary path;
+  - ranked candidate paths;
+  - deterministic simple-task code when available.
+- Simple single-target data tasks now bypass main LLM generation and are compiled directly into minimal workflow Lua, for example:
+  - count array -> `return #wf.vars.path`
+  - first/last element -> `return wf.vars.path[1]` / `return wf.vars.path[#wf.vars.path]`
+  - direct scalar extraction -> `return wf.vars.path`
+- If the workflow path cannot be selected confidently, the pipeline stops before generation, asks a clarification question, and does not save code.

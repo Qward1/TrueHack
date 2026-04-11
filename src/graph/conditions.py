@@ -8,15 +8,27 @@ from src.core.state import PipelineState
 def route_by_intent(state: PipelineState) -> str:
     """After intent classification -> choose the next high-level step.
 
-    Returns: "generate" | "refine" | "answer"
+    Returns: "prepare" | "answer"
     """
     intent = state.get("intent", "")
     if intent == "create":
-        return "generate"
+        return "prepare"
     if intent in ("change", "retry"):
-        return "refine"
+        return "prepare"
     # question / inspect / general
     return "answer"
+
+
+def route_after_preparation(state: PipelineState) -> str:
+    """After generation-context compilation -> clarify, generate, or refine."""
+    compiled_request = state.get("compiled_request", {})
+    if isinstance(compiled_request, dict) and compiled_request.get("needs_clarification"):
+        return "clarify"
+
+    intent = state.get("intent", "")
+    if intent in ("change", "retry"):
+        return "refine"
+    return "generate"
 
 
 def check_validation(state: PipelineState) -> str:

@@ -15,6 +15,7 @@ from src.tools.lua_tools import (
     LOWCODE_LUA_VERSION,
     async_run_diagnostics,
     async_verify_requirements,
+    compile_lowcode_request,
     extract_function_names,
     format_lowcode_jsonstring,
     inspect_lowcode_request_alignment,
@@ -174,6 +175,25 @@ _PROMPT_STYLE_RULES = """Hard rules:
 - Do not use print(), io.write(), io.read(), or console prompts.
 - Simple extraction/computation tasks should usually be 1-3 lines with a direct return.
 - If the task explicitly asks to save/update wf.vars, keep the script minimal and still use the exact workflow paths."""
+_NEGATIVE_STYLE_FEWSHOT = """Bad style example:
+
+Task: Count items in the cart from workflow context.
+Bad output:
+lua{
+local cart = {
+  items = {
+    { sku = "A001" },
+    { sku = "A002" },
+    { sku = "A003" }
+  }
+}
+
+local itemCount = #cart.items
+print("Количество товаров в корзине:", itemCount)
+}lua
+
+Correct output:
+lua{return #wf.vars.cart.items}lua"""
 
 
 def _target_context(state: PipelineState) -> str:
@@ -200,6 +220,52 @@ def _format_values_for_prompt(values: object, fallback: str = "none") -> str:
         return ", ".join(cleaned) if cleaned else fallback
     text = str(values or "").strip()
     return text or fallback
+
+
+def _format_compiled_request_summary(compiled_request: dict[str, Any]) -> str:
+    if not isinstance(compiled_request, dict):
+        return ""
+
+    lines: list[str] = []
+    operation = str(compiled_request.get("selected_operation", "") or "").strip() or "llm"
+    selected_path = str(compiled_request.get("selected_primary_path", "") or "").strip() or "none"
+    confidence = float(compiled_request.get("confidence", 0.0) or 0.0)
+    lines.append("Compiled workflow request:")
+    lines.append(f"- selected operation: {operation}")
+    lines.append(f"- selected primary path: {selected_path}")
+    lines.append(f"- confidence: {confidence:.2f}")
+
+    inventory = compiled_request.get("workflow_path_inventory", [])
+    if isinstance(inventory, list) and inventory:
+        lines.append("- available workflow paths:")
+        for entry in inventory[:8]:
+            path = str(entry.get("path", "")).strip()
+            path_type = str(entry.get("type", "")).strip()
+            sample = str(entry.get("sample_preview", "")).strip()
+            item_keys = _format_values_for_prompt(entry.get("item_keys", []), fallback="")
+            suffix = f" sample={sample}" if sample else ""
+            if item_keys:
+                suffix = f"{suffix} item_keys={item_keys}".strip()
+                suffix = f" {suffix}" if suffix else ""
+            lines.append(f"  - {path} [{path_type}]{suffix}")
+
+    candidates = compiled_request.get("candidate_paths_ranked", [])
+    if isinstance(candidates, list) and candidates:
+        lines.append("- ranked candidates:")
+        for candidate in candidates[:3]:
+            path = str(candidate.get("path", "")).strip()
+            path_type = str(candidate.get("type", "")).strip()
+            score = float(candidate.get("score", 0.0) or 0.0)
+            lines.append(f"  - {path} [{path_type}] score={score:.1f}")
+
+    return "\n".join(lines).strip()
+
+
+def _build_clarification_response(compiled_request: dict[str, Any]) -> str:
+    question = str(compiled_request.get("clarifying_question", "") or "").strip()
+    if question:
+        return question
+    return "Нужна явная привязка к workflow-пути. Ответь, например: `используй wf.vars.some.path`."
 
 
 def split_task_and_context(user_input: str) -> tuple[str, str]:
@@ -232,17 +298,23 @@ def _join_prompt_sections(*sections: str) -> str:
     return "\n\n".join(section.strip() for section in sections if section and section.strip())
 
 
-def _build_generation_prompt(user_input: str, target_context: str = "") -> str:
-    task, provided_context = split_task_and_context(user_input)
+def _build_generation_prompt(compiled_request: dict[str, Any], target_context: str = "") -> str:
+    task = str(compiled_request.get("task_text", "") or "").strip()
+    provided_context = str(compiled_request.get("raw_context", "") or "").strip()
+    clarification_text = str(compiled_request.get("clarification_text", "") or "").strip()
+    compiled_summary = _format_compiled_request_summary(compiled_request)
     sections = [
-        f"Task:\n{task or user_input.strip()}",
+        f"Task:\n{task}",
         f"Target file:\n{target_context}" if target_context else "",
+        f"Clarification from user:\n{clarification_text}" if clarification_text else "",
+        f"Normalized workflow context:\n{compiled_summary}" if compiled_summary else "",
         (
             "Provided workflow context:\n"
             f"{provided_context}"
         ) if provided_context else "",
         _PROMPT_STYLE_RULES,
         _PUBLIC_SAMPLE_FEWSHOT,
+        _NEGATIVE_STYLE_FEWSHOT,
         "Return ONLY the final Lua file in JsonString format lua{...}lua.",
     ]
     return _join_prompt_sections(*sections)
@@ -255,14 +327,19 @@ def _build_refine_prompt(
     target_path: str,
     function_list: str,
     code: str,
+    compiled_request: dict[str, Any],
 ) -> str:
     original_task, provided_context = split_task_and_context(base_prompt or user_input)
+    compiled_summary = _format_compiled_request_summary(compiled_request)
+    clarification_text = str(compiled_request.get("clarification_text", "") or "").strip()
     sections = [
         f"Original task:\n{original_task or user_input.strip()}",
         (
             "Original workflow context:\n"
             f"{provided_context}"
         ) if provided_context else "",
+        f"Change clarification:\n{clarification_text}" if clarification_text else "",
+        f"Normalized workflow context:\n{compiled_summary}" if compiled_summary else "",
         f"Primary target file:\n{target_path}",
         (
             "Existing functions you must preserve unless the user explicitly removes them:\n"
@@ -272,6 +349,7 @@ def _build_refine_prompt(
         f"Change request:\n{user_input}",
         _PROMPT_STYLE_RULES,
         _PUBLIC_SAMPLE_FEWSHOT,
+        _NEGATIVE_STYLE_FEWSHOT,
         "Return ONLY the complete updated Lua file in JsonString format lua{...}lua.",
     ]
     return _join_prompt_sections(*sections)
@@ -291,14 +369,19 @@ def _build_fix_prompt(
     actual_paths: str,
     anti_patterns: str,
     code: str,
+    compiled_request: dict[str, Any],
 ) -> str:
     original_task, provided_context = split_task_and_context(base_prompt)
+    compiled_summary = _format_compiled_request_summary(compiled_request)
+    clarification_text = str(compiled_request.get("clarification_text", "") or "").strip()
     sections = [
         f"Original task:\n{original_task or base_prompt.strip()}",
         (
             "Original workflow context:\n"
             f"{provided_context}"
         ) if provided_context else "",
+        f"Clarification from user:\n{clarification_text}" if clarification_text else "",
+        f"Normalized workflow context:\n{compiled_summary}" if compiled_summary else "",
         f"Primary target file:\n{target_path}",
         (
             "Failure diagnostics:\n"
@@ -315,6 +398,7 @@ def _build_fix_prompt(
         f"Current code:\n{code}",
         _PROMPT_STYLE_RULES,
         _PUBLIC_SAMPLE_FEWSHOT,
+        _NEGATIVE_STYLE_FEWSHOT,
         "Fix the code so it follows the provided workflow context and passes validation + requirement checks.",
         "Return ONLY the complete corrected Lua file in JsonString format lua{...}lua.",
     ]
@@ -386,6 +470,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
 
     async def route_intent(state: PipelineState) -> dict:
         has_code = bool(state.get("current_code", "").strip())
+        has_pending_base_prompt = bool(state.get("base_prompt", "").strip()) and not has_code
         logger.info(
             f"[{_AGENT_ROUTE_INTENT}] started",
             user_input=state["user_input"][:80],
@@ -409,6 +494,9 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             confidence=confidence,
         )
 
+        if has_pending_base_prompt and state.get("base_prompt", "").strip() != state["user_input"].strip():
+            intent = "create"
+
         if has_code and confidence < 0.5:
             intent = "change"
 
@@ -423,12 +511,75 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         )
         return {"intent": intent}
 
+    async def prepare_generation_context(state: PipelineState) -> dict:
+        user_input = state.get("user_input", "")
+        current_code = state.get("current_code", "")
+        existing_base_prompt = state.get("base_prompt", "")
+        intent = state.get("intent", "create")
+
+        task_source_prompt = user_input
+        clarification_text = ""
+        persistent_base_prompt = existing_base_prompt or user_input
+        if not current_code.strip() and existing_base_prompt.strip() and existing_base_prompt.strip() != user_input.strip():
+            task_source_prompt = existing_base_prompt
+            clarification_text = user_input
+            persistent_base_prompt = existing_base_prompt
+
+        task_text, raw_context = split_task_and_context(task_source_prompt)
+        compiled_request = compile_lowcode_request(
+            task_text=task_text or task_source_prompt,
+            raw_context=raw_context,
+            clarification_text=clarification_text,
+            allow_deterministic=not current_code.strip(),
+        )
+        verification_prompt = task_source_prompt.strip()
+        if current_code.strip() and existing_base_prompt.strip():
+            verification_prompt = f"{existing_base_prompt.strip()}\n\nChange request:\n{user_input.strip()}"
+        if clarification_text.strip():
+            verification_prompt = f"{verification_prompt}\n\nClarification:\n{clarification_text.strip()}"
+        compiled_request["verification_prompt"] = verification_prompt
+
+        logger.info(
+            "[GenerationContextCompiler] compiled",
+            intent=intent,
+            has_parseable_context=compiled_request.get("has_parseable_context", False),
+            selected_operation=compiled_request.get("selected_operation", ""),
+            selected_primary_path=compiled_request.get("selected_primary_path", ""),
+            needs_clarification=compiled_request.get("needs_clarification", False),
+            deterministic=compiled_request.get("use_deterministic_fast_path", False),
+        )
+
+        if compiled_request.get("needs_clarification", False):
+            response = _build_clarification_response(compiled_request)
+            return {
+                "base_prompt": persistent_base_prompt,
+                "compiled_request": compiled_request,
+                "response": response,
+                "response_type": "text",
+                "clarifying_questions": [response],
+                "failure_stage": "clarification",
+                "verification": {},
+                "verification_passed": False,
+                "save_success": False,
+                "save_error": "",
+            }
+
+        return {
+            "base_prompt": persistent_base_prompt,
+            "compiled_request": compiled_request,
+            "response": "",
+            "response_type": "text",
+            "clarifying_questions": [],
+            "failure_stage": "",
+        }
+
     async def generate_code(state: PipelineState) -> dict:
         user_input = state["user_input"]
         base_prompt = state.get("base_prompt", "") or user_input
         target_path = state.get("target_path", "")
         target_directory = state.get("target_directory", state.get("workspace_root", ""))
         target_explicit = state.get("target_explicit", False)
+        compiled_request = state.get("compiled_request", {})
 
         logger.info(
             f"[{_AGENT_GENERATE_CODE}] started",
@@ -464,7 +615,37 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 "target_explicit": target_explicit,
             }
         )
-        prompt = _build_generation_prompt(base_prompt, target_context=target_context)
+        if isinstance(compiled_request, dict) and compiled_request.get("use_deterministic_fast_path"):
+            code = str(compiled_request.get("deterministic_code", "")).strip()
+            logger.info(
+                f"[{_AGENT_GENERATE_CODE}] deterministic fast-path",
+                selected_operation=compiled_request.get("selected_operation", ""),
+                selected_primary_path=compiled_request.get("selected_primary_path", ""),
+            )
+            return {
+                "generated_code": code,
+                "base_prompt": base_prompt,
+                "compiled_request": compiled_request,
+                "fix_iterations": 0,
+                "target_path": target_path,
+                "target_directory": target_directory,
+                "target_explicit": target_explicit,
+                "failure_stage": "",
+                "verification": {},
+                "verification_passed": False,
+                "e2e_suite": {},
+                "e2e_results": {"summary": "E2E-проверка временно отключена."},
+                "e2e_passed": False,
+                "save_success": False,
+                "save_error": "",
+                "saved_to": "",
+                "saved_jsonstring_to": "",
+                "explanation": {},
+                "suggested_changes": [],
+                "clarifying_questions": [],
+            }
+
+        prompt = _build_generation_prompt(compiled_request, target_context=target_context)
 
         logger.info(
             f"[{_AGENT_GENERATE_CODE}/llm.generate] calling",
@@ -521,6 +702,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         return {
             "generated_code": code,
             "base_prompt": base_prompt,
+            "compiled_request": compiled_request,
             "fix_iterations": 0,
             "target_path": target_path,
             "target_directory": target_directory,
@@ -544,6 +726,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         existing = state.get("current_code", "")
         user_input = state["user_input"]
         target_path = state.get("target_path", "(not set)")
+        compiled_request = state.get("compiled_request", {})
 
         logger.info(
             f"[{_AGENT_REFINE_CODE}] started",
@@ -576,6 +759,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             target_path=target_path,
             function_list=func_list,
             code=existing,
+            compiled_request=compiled_request if isinstance(compiled_request, dict) else {},
         )
 
         logger.info(
@@ -619,6 +803,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         return {
             "generated_code": code,
             "change_requests": changes,
+            "compiled_request": compiled_request,
             "failure_stage": "",
             "verification": {},
             "verification_passed": False,
@@ -687,6 +872,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         base_prompt = state.get("base_prompt", "") or state.get("user_input", "")
         fix_iter = state.get("fix_iterations", 0)
         failure_stage = state.get("failure_stage", "unknown")
+        compiled_request = state.get("compiled_request", {})
 
         logger.info(
             f"[{_AGENT_FIX_CODE}] started",
@@ -696,6 +882,31 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             code_len=len(code),
             target_path=state.get("target_path", "(not set)"),
         )
+
+        if isinstance(compiled_request, dict) and compiled_request.get("use_deterministic_fast_path"):
+            fixed = str(compiled_request.get("deterministic_code", "")).strip() or code
+            logger.info(
+                f"[{_AGENT_FIX_CODE}] deterministic recovery",
+                selected_operation=compiled_request.get("selected_operation", ""),
+                selected_primary_path=compiled_request.get("selected_primary_path", ""),
+            )
+            return {
+                "generated_code": fixed,
+                "compiled_request": compiled_request,
+                "fix_iterations": fix_iter + 1,
+                "failure_stage": "",
+                "validation_passed": False,
+                "verification_passed": False,
+                "e2e_passed": False,
+                "e2e_results": {"summary": "E2E-проверка временно отключена."},
+                "save_success": False,
+                "save_error": "",
+                "saved_to": "",
+                "saved_jsonstring_to": "",
+                "explanation": {},
+                "suggested_changes": [],
+                "clarifying_questions": [],
+            }
 
         prompt = _build_fix_prompt(
             base_prompt=base_prompt,
@@ -710,6 +921,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             actual_paths=_format_values_for_prompt(verification.get("actual_workflow_paths", [])),
             anti_patterns=_format_values_for_prompt(verification.get("anti_patterns", [])),
             code=code,
+            compiled_request=compiled_request if isinstance(compiled_request, dict) else {},
         )
 
         messages = [
@@ -741,6 +953,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         )
         return {
             "generated_code": fixed,
+            "compiled_request": compiled_request,
             "fix_iterations": fix_iter + 1,
             "failure_stage": "",
             "validation_passed": False,
@@ -760,7 +973,17 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         code = state.get("generated_code", "")
         base_prompt = state.get("base_prompt", "") or state.get("user_input", "")
         diagnostics = state.get("diagnostics", {})
-        deterministic = inspect_lowcode_request_alignment(base_prompt, code)
+        compiled_request = state.get("compiled_request", {})
+        verification_prompt = (
+            str(compiled_request.get("verification_prompt", "")).strip()
+            if isinstance(compiled_request, dict)
+            else ""
+        ) or base_prompt
+        deterministic = inspect_lowcode_request_alignment(
+            verification_prompt,
+            code,
+            compiled_request=compiled_request if isinstance(compiled_request, dict) else None,
+        )
 
         logger.info(
             f"[{_AGENT_VERIFY_REQUIREMENTS}] started",
@@ -772,12 +995,12 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         try:
             logger.info(
                 f"[{_AGENT_VERIFY_REQUIREMENTS}/async_verify_requirements] calling",
-                prompt_len=len(base_prompt),
+                prompt_len=len(verification_prompt),
                 has_run_output=bool(diagnostics.get("run_output", "")),
             )
             verification = await async_verify_requirements(
                 llm,
-                prompt=base_prompt,
+                prompt=verification_prompt,
                 code=code,
                 run_output=diagnostics.get("run_output", ""),
             )
@@ -821,12 +1044,21 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         ]
         llm_summary = str(verification.get("summary", "")).strip()
         deterministic_summary = str(deterministic.get("summary", "")).strip()
+        compiled_request_summary = ""
+        if isinstance(compiled_request, dict) and compiled_request:
+            compiled_request_summary = (
+                "Compiled request: "
+                f"parseable_context={bool(compiled_request.get('has_parseable_context', False))}, "
+                f"selected_operation={compiled_request.get('selected_operation', 'llm')}, "
+                f"selected_path={compiled_request.get('selected_primary_path', 'none') or 'none'}, "
+                f"needs_clarification={bool(compiled_request.get('needs_clarification', False))}"
+            )
         if verification.get("error"):
-            summary_parts = [deterministic_summary]
+            summary_parts = [compiled_request_summary, deterministic_summary]
             if llm_summary:
                 summary_parts.append(llm_summary)
         else:
-            summary_parts = [part for part in (deterministic_summary, llm_summary) if part]
+            summary_parts = [part for part in (compiled_request_summary, deterministic_summary, llm_summary) if part]
         combined_summary = " ".join(part for part in summary_parts if part).strip()
 
         passed = deterministic.get("passed", False) and (llm_passed or verification.get("error"))
@@ -840,6 +1072,10 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             "actual_workflow_paths": deterministic.get("actual_workflow_paths", []),
             "anti_patterns": deterministic.get("anti_patterns", []),
             "deterministic_summary": deterministic_summary,
+            "selected_operation": compiled_request.get("selected_operation", "") if isinstance(compiled_request, dict) else "",
+            "selected_primary_path": compiled_request.get("selected_primary_path", "") if isinstance(compiled_request, dict) else "",
+            "needs_clarification": compiled_request.get("needs_clarification", False) if isinstance(compiled_request, dict) else False,
+            "has_parseable_context": compiled_request.get("has_parseable_context", False) if isinstance(compiled_request, dict) else False,
         }
         diagnostics_updated = dict(diagnostics)
         diagnostics_updated["verification_summary"] = verification.get("summary", "")
@@ -849,6 +1085,9 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         diagnostics_updated["expected_workflow_paths"] = verification.get("expected_workflow_paths", [])
         diagnostics_updated["actual_workflow_paths"] = verification.get("actual_workflow_paths", [])
         diagnostics_updated["anti_patterns"] = verification.get("anti_patterns", [])
+        diagnostics_updated["selected_operation"] = verification.get("selected_operation", "")
+        diagnostics_updated["selected_primary_path"] = verification.get("selected_primary_path", "")
+        diagnostics_updated["has_parseable_context"] = verification.get("has_parseable_context", False)
         diagnostics_updated["failure_kind"] = "requirements" if combined_missing else diagnostics.get("failure_kind", "")
 
         logger.info(
@@ -860,6 +1099,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         return {
             "verification": verification,
             "verification_passed": passed,
+            "compiled_request": compiled_request,
             "failure_stage": "" if (passed or (verification.get("error") and not combined_missing)) else "requirements",
             "diagnostics": diagnostics_updated,
         }
@@ -1147,6 +1387,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
     return {
         "resolve_target": resolve_target,
         "route_intent": route_intent,
+        "prepare_generation_context": prepare_generation_context,
         "generate_code": generate_code,
         "refine_code": refine_code,
         "validate_code": validate_code,

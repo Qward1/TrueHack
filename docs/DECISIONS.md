@@ -196,3 +196,18 @@ LLM-only verification was insufficient for public-sample tasks: the model could 
   - absence of invented demo tables and app/service wrappers when workflow context is present;
   - direct `return` for simple extraction/computation tasks unless the request explicitly asks to save into `wf.vars`.
 - `check_verification` no longer allows save when deterministic `missing_requirements` are present, even if the semantic verifier returns a high score or is temporarily unavailable.
+
+---
+
+## 2026-04-11
+### Decision
+Simple workflow data tasks are compiled deterministically from parsed context before main LLM generation.
+
+### Why
+Prompt-only steering was insufficient. The model could still fall back to tutorial/application-style code whenever the request drifted away from the few-shot examples. The missing piece was structural understanding of pasted workflow JSON.
+
+### Consequences
+- The pipeline now compiles parseable workflow context into an internal request object before generation/refinement.
+- For simple single-target tasks, code is generated deterministically instead of asking the main LLM.
+- When multiple workflow paths match the request with similar confidence, the system asks for clarification and stops before generation/save.
+- Main LLM generation remains for complex transformations, but now receives normalized workflow-path/type context rather than only raw pasted JSON.

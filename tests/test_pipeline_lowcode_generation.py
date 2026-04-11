@@ -17,12 +17,14 @@ class StubLLM:
         self._generate_responses = list(generate_responses)
         self._fix_response = fix_response
         self.fix_calls = 0
+        self.generate_calls = 0
 
     async def generate(self, prompt: str, system: str = "", temperature: float = 0.2, max_tokens: int | None = None) -> str:
         if system.startswith(ROUTE_SYSTEM_PREFIX):
             raise AssertionError("route_intent should use generate_json")
         if system.startswith(EXPLAIN_SYSTEM_PREFIX):
             raise AssertionError("explain_solution should use generate_json")
+        self.generate_calls += 1
         if self._generate_responses:
             return self._generate_responses.pop(0)
         raise AssertionError(f"unexpected generate call: {system[:80]}")
@@ -85,7 +87,7 @@ class PipelineLowcodeGenerationTests(unittest.TestCase):
                 child.unlink()
             self.tmp_path.rmdir()
 
-    def test_accepts_public_sample_style_generation(self) -> None:
+    def test_simple_count_prompt_uses_deterministic_fast_path(self) -> None:
         async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
             return _success_diagnostics()
 
@@ -96,7 +98,58 @@ class PipelineLowcodeGenerationTests(unittest.TestCase):
             }
 
         llm = StubLLM(
-            generate_responses=["lua{return wf.vars.emails[#wf.vars.emails]}lua"],
+            generate_responses=[],
+            fix_response="lua{return #wf.vars.cart.items}lua",
+        )
+        target_path = self.tmp_path / "sample.lua"
+        prompt = """Посчитай количество товаров в корзине.
+
+{
+  "wf": {
+    "vars": {
+      "cart": {
+        "items": [
+          { "sku": "A001" },
+          { "sku": "A002" },
+          { "sku": "A003" }
+        ]
+      }
+    }
+  }
+}"""
+
+        with patch("src.graph.nodes.async_run_diagnostics", new=fake_run_diagnostics), patch(
+            "src.graph.nodes.save_final_output",
+            new=fake_save_output,
+        ):
+            engine = PipelineEngine(llm=llm)
+            result = asyncio.run(
+                engine.process_message(
+                    chat_id=1,
+                    user_input=prompt,
+                    workspace_root=str(self.tmp_path),
+                    target_path=str(target_path),
+                )
+            )
+
+        self.assertTrue(result["save_success"])
+        self.assertEqual(result["generated_code"].strip(), "return #wf.vars.cart.items")
+        self.assertTrue(result["verification"]["passed"])
+        self.assertEqual(llm.fix_calls, 0)
+        self.assertEqual(llm.generate_calls, 0)
+
+    def test_last_email_prompt_uses_deterministic_fast_path(self) -> None:
+        async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
+            return _success_diagnostics()
+
+        def fake_save_output(target_path: str, code: str, jsonstring_code: str = "") -> dict:
+            return {
+                "lua_path": target_path,
+                "jsonstring_path": f"{target_path}.jsonstring.txt",
+            }
+
+        llm = StubLLM(
+            generate_responses=[],
             fix_response="lua{return wf.vars.emails[#wf.vars.emails]}lua",
         )
         target_path = self.tmp_path / "sample.lua"
@@ -127,9 +180,9 @@ class PipelineLowcodeGenerationTests(unittest.TestCase):
         self.assertTrue(result["save_success"])
         self.assertEqual(result["generated_code"].strip(), "return wf.vars.emails[#wf.vars.emails]")
         self.assertTrue(result["verification"]["passed"])
-        self.assertEqual(llm.fix_calls, 0)
+        self.assertEqual(llm.generate_calls, 0)
 
-    def test_sends_app_style_generation_into_fix_loop(self) -> None:
+    def test_sends_complex_app_style_generation_into_fix_loop(self) -> None:
         async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
             return _success_diagnostics()
 
@@ -142,19 +195,33 @@ class PipelineLowcodeGenerationTests(unittest.TestCase):
         llm = StubLLM(
             generate_responses=[
                 """lua{
-local emails = {"user1@example.com", "user2@example.com", "user3@example.com"}
-return emails[#emails]
+local payload = {
+  DATUM = "20260410",
+  TIME = "123045"
+}
+print(payload.DATUM .. payload.TIME)
 }lua"""
             ],
-            fix_response="lua{return wf.vars.emails[#wf.vars.emails]}lua",
+            fix_response="""lua{
+local DATUM = wf.vars.json.IDOC.ZCDF_HEAD.DATUM
+local TIME = wf.vars.json.IDOC.ZCDF_HEAD.TIME
+return string.format("%s-%s-%sT%s:%s:%s.00000Z", string.sub(DATUM, 1, 4), string.sub(DATUM, 5, 6), string.sub(DATUM, 7, 8), string.sub(TIME, 1, 2), string.sub(TIME, 3, 4), string.sub(TIME, 5, 6))
+}lua""",
         )
         target_path = self.tmp_path / "sample.lua"
-        prompt = """Return the last email from the provided workflow context.
+        prompt = """Преобразуй DATUM/TIME из workflow context в ISO 8601.
 
 {
   "wf": {
     "vars": {
-      "emails": ["user1@example.com", "user2@example.com", "user3@example.com"]
+      "json": {
+        "IDOC": {
+          "ZCDF_HEAD": {
+            "DATUM": "20260410",
+            "TIME": "123045"
+          }
+        }
+      }
     }
   }
 }"""
@@ -175,8 +242,120 @@ return emails[#emails]
 
         self.assertEqual(llm.fix_calls, 1)
         self.assertTrue(result["save_success"])
-        self.assertEqual(result["generated_code"].strip(), "return wf.vars.emails[#wf.vars.emails]")
+        self.assertIn("wf.vars.json.IDOC.ZCDF_HEAD.DATUM", result["generated_code"])
         self.assertEqual(result["verification"]["anti_patterns"], [])
+
+    def test_ambiguity_returns_clarification_without_generation(self) -> None:
+        async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
+            return _success_diagnostics()
+
+        def fake_save_output(target_path: str, code: str, jsonstring_code: str = "") -> dict:
+            return {
+                "lua_path": target_path,
+                "jsonstring_path": f"{target_path}.jsonstring.txt",
+            }
+
+        llm = StubLLM(generate_responses=[], fix_response="")
+        target_path = self.tmp_path / "sample.lua"
+        prompt = """Посчитай количество товаров.
+
+{
+  "wf": {
+    "vars": {
+      "cart": {
+        "items": [
+          { "sku": "A001" }
+        ]
+      },
+      "wishlist": {
+        "items": [
+          { "sku": "W001" }
+        ]
+      }
+    }
+  }
+}"""
+
+        with patch("src.graph.nodes.async_run_diagnostics", new=fake_run_diagnostics), patch(
+            "src.graph.nodes.save_final_output",
+            new=fake_save_output,
+        ):
+            engine = PipelineEngine(llm=llm)
+            result = asyncio.run(
+                engine.process_message(
+                    chat_id=1,
+                    user_input=prompt,
+                    workspace_root=str(self.tmp_path),
+                    target_path=str(target_path),
+                )
+            )
+
+        self.assertEqual(result["response_type"], "text")
+        self.assertFalse(result["save_success"])
+        self.assertEqual(result["generated_code"], "")
+        self.assertEqual(llm.generate_calls, 0)
+        self.assertIn("wf.vars.cart.items", result["response"])
+
+    def test_clarification_followup_reuses_original_base_prompt(self) -> None:
+        async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
+            return _success_diagnostics()
+
+        def fake_save_output(target_path: str, code: str, jsonstring_code: str = "") -> dict:
+            return {
+                "lua_path": target_path,
+                "jsonstring_path": f"{target_path}.jsonstring.txt",
+            }
+
+        llm = StubLLM(generate_responses=[], fix_response="")
+        target_path = self.tmp_path / "sample.lua"
+        original_prompt = """Посчитай количество товаров.
+
+{
+  "wf": {
+    "vars": {
+      "cart": {
+        "items": [
+          { "sku": "A001" }
+        ]
+      },
+      "wishlist": {
+        "items": [
+          { "sku": "W001" }
+        ]
+      }
+    }
+  }
+}"""
+
+        with patch("src.graph.nodes.async_run_diagnostics", new=fake_run_diagnostics), patch(
+            "src.graph.nodes.save_final_output",
+            new=fake_save_output,
+        ):
+            engine = PipelineEngine(llm=llm)
+            first = asyncio.run(
+                engine.process_message(
+                    chat_id=1,
+                    user_input=original_prompt,
+                    workspace_root=str(self.tmp_path),
+                    target_path=str(target_path),
+                )
+            )
+            second = asyncio.run(
+                engine.process_message(
+                    chat_id=1,
+                    user_input="используй wf.vars.cart.items",
+                    current_code="",
+                    base_prompt=first["base_prompt"],
+                    change_requests=[],
+                    workspace_root=str(self.tmp_path),
+                    target_path=str(target_path),
+                )
+            )
+
+        self.assertEqual(first["response_type"], "text")
+        self.assertEqual(first["base_prompt"].strip(), original_prompt.strip())
+        self.assertTrue(second["save_success"])
+        self.assertEqual(second["generated_code"].strip(), "return #wf.vars.cart.items")
 
 
 if __name__ == "__main__":

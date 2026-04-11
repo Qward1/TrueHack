@@ -22,6 +22,7 @@ class PipelineState(TypedDict):
     intent: str
     base_prompt: str
     change_requests: list[str]
+    compiled_request: dict[str, Any]
 
     # Code
     current_code: str
