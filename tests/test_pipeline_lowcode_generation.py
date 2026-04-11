@@ -13,13 +13,28 @@ FIX_SYSTEM_PREFIX = "You fix broken Lua workflow scripts."
 
 
 class StubLLM:
-    def __init__(self, *, generate_responses: list[str], fix_response: str, route_intent: str = "create") -> None:
+    def __init__(
+        self,
+        *,
+        generate_responses: list[str],
+        fix_response: str | list[str],
+        route_intent: str = "create",
+        verify_response: str | None = None,
+    ) -> None:
         self._generate_responses = list(generate_responses)
-        self._fix_response = fix_response
+        if isinstance(fix_response, list):
+            self._fix_responses = list(fix_response)
+        else:
+            self._fix_responses = [fix_response]
         self._route_intent = route_intent
+        self._verify_response = verify_response
         self.fix_calls = 0
         self.generate_calls = 0
         self.last_fix_prompt = ""
+        self.last_generate_prompt = ""
+        self.last_generate_system = ""
+        self.last_generate_temperature = None
+        self.last_chat_temperature = None
 
     async def generate(self, prompt: str, system: str = "", temperature: float = 0.2, max_tokens: int | None = None) -> str:
         if system.startswith(ROUTE_SYSTEM_PREFIX):
@@ -27,6 +42,9 @@ class StubLLM:
         if system.startswith(EXPLAIN_SYSTEM_PREFIX):
             raise AssertionError("explain_solution should use generate_json")
         self.generate_calls += 1
+        self.last_generate_prompt = prompt
+        self.last_generate_system = system
+        self.last_generate_temperature = temperature
         if self._generate_responses:
             return self._generate_responses.pop(0)
         raise AssertionError(f"unexpected generate call: {system[:80]}")
@@ -46,15 +64,28 @@ class StubLLM:
 
     async def chat(self, messages: list[dict], temperature: float = 0.2, max_tokens: int | None = None) -> str:
         system = str(messages[0].get("content", "")) if messages else ""
+        self.last_chat_temperature = temperature
         if system.startswith(VERIFY_SYSTEM_PREFIX):
+            if self._verify_response is not None:
+                return self._verify_response
             return (
                 '{"passed": true, "score": 100, "summary": "LLM verification passed.", '
-                '"missing_requirements": [], "warnings": []}'
+                '"missing_requirements": [], "warnings": [], '
+                '"checks": {'
+                '"workflow_path_usage": {"status": "pass", "reason": ""}, '
+                '"source_shape_understood": {"status": "pass", "reason": ""}, '
+                '"target_shape_satisfied": {"status": "pass", "reason": ""}, '
+                '"logic_correctness": {"status": "pass", "reason": ""}, '
+                '"helper_api_usage": {"status": "pass", "reason": ""}, '
+                '"edge_case_handling": {"status": "pass", "reason": ""}'
+                '}}'
             )
         if system.startswith(FIX_SYSTEM_PREFIX):
             self.fix_calls += 1
             self.last_fix_prompt = str(messages[-1].get("content", "")) if messages else ""
-            return self._fix_response
+            if self._fix_responses:
+                return self._fix_responses.pop(0)
+            raise AssertionError("unexpected extra fix call")
         raise AssertionError(f"unexpected chat call: {system[:80]}")
 
 
@@ -91,7 +122,7 @@ class PipelineLowcodeGenerationTests(unittest.TestCase):
                 child.unlink()
             self.tmp_path.rmdir()
 
-    def test_simple_count_prompt_uses_deterministic_fast_path(self) -> None:
+    def test_simple_count_prompt_uses_model_generation_and_saves(self) -> None:
         async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
             return _success_diagnostics()
 
@@ -102,8 +133,8 @@ class PipelineLowcodeGenerationTests(unittest.TestCase):
             }
 
         llm = StubLLM(
-            generate_responses=[],
-            fix_response="lua{return #wf.vars.cart.items}lua",
+            generate_responses=["lua{return #wf.vars.cart.items}lua"],
+            fix_response="",
         )
         target_path = self.tmp_path / "sample.lua"
         prompt = """Посчитай количество товаров в корзине.
@@ -140,21 +171,25 @@ class PipelineLowcodeGenerationTests(unittest.TestCase):
         self.assertEqual(result["generated_code"].strip(), "return #wf.vars.cart.items")
         self.assertTrue(result["verification"]["passed"])
         self.assertEqual(llm.fix_calls, 0)
-        self.assertEqual(llm.generate_calls, 0)
+        self.assertEqual(llm.generate_calls, 1)
+        self.assertNotIn("shortest correct script", llm.last_generate_system)
 
-    def test_last_email_prompt_uses_deterministic_fast_path(self) -> None:
+    def test_last_email_prompt_uses_model_generation_and_saves(self) -> None:
         async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
             return _success_diagnostics()
 
+        saved_payloads: list[str] = []
+
         def fake_save_output(target_path: str, code: str, jsonstring_code: str = "") -> dict:
+            saved_payloads.append(jsonstring_code)
             return {
                 "lua_path": target_path,
                 "jsonstring_path": f"{target_path}.jsonstring.txt",
             }
 
         llm = StubLLM(
-            generate_responses=[],
-            fix_response="lua{return wf.vars.emails[#wf.vars.emails]}lua",
+            generate_responses=["lua{return wf.vars.emails[#wf.vars.emails]}lua"],
+            fix_response="",
         )
         target_path = self.tmp_path / "sample.lua"
         prompt = """Return the last email from the provided workflow context.
@@ -184,7 +219,529 @@ class PipelineLowcodeGenerationTests(unittest.TestCase):
         self.assertTrue(result["save_success"])
         self.assertEqual(result["generated_code"].strip(), "return wf.vars.emails[#wf.vars.emails]")
         self.assertTrue(result["verification"]["passed"])
-        self.assertEqual(llm.generate_calls, 0)
+        self.assertEqual(llm.generate_calls, 1)
+        self.assertIn('"emails"', result["response"])
+        self.assertIn('lua{\\r\\nreturn wf.vars.emails[#wf.vars.emails]\\r\\n}lua', result["response"])
+        self.assertEqual(len(saved_payloads), 1)
+        self.assertIn('"emails"', saved_payloads[0])
+        self.assertIn('lua{\\r\\nreturn wf.vars.emails[#wf.vars.emails]\\r\\n}lua', saved_payloads[0])
+
+    def test_generation_prompt_allows_multi_step_workflow_script(self) -> None:
+        async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
+            return _success_diagnostics()
+
+        def fake_save_output(target_path: str, code: str, jsonstring_code: str = "") -> dict:
+            return {
+                "lua_path": target_path,
+                "jsonstring_path": f"{target_path}.jsonstring.txt",
+            }
+
+        llm = StubLLM(
+            generate_responses=[
+                """lua{
+local contacts = wf.vars.contacts
+if type(contacts) ~= "table" then
+    local arr = _utils.array.new()
+    arr[1] = contacts
+    _utils.array.markAsArray(arr)
+    return arr
+end
+local isArray = true
+for key in pairs(contacts) do
+    if type(key) ~= "number" or math.floor(key) ~= key then
+        isArray = false
+        break
+    end
+end
+if isArray then
+    return contacts
+end
+local arr = _utils.array.new()
+arr[1] = contacts
+_utils.array.markAsArray(arr)
+return arr
+}lua"""
+            ],
+            fix_response="",
+        )
+        target_path = self.tmp_path / "contacts.lua"
+        prompt = """Приведи wf.vars.contacts к массиву. Если там уже массив — верни как есть, иначе оберни значение в массив.
+
+{
+  "wf": {
+    "vars": {
+      "contacts": {
+        "name": "Иван"
+      }
+    }
+  }
+}"""
+
+        with patch("src.graph.nodes.async_run_diagnostics", new=fake_run_diagnostics), patch(
+            "src.graph.nodes.save_final_output",
+            new=fake_save_output,
+        ):
+            engine = PipelineEngine(llm=llm)
+            result = asyncio.run(
+                engine.process_message(
+                    chat_id=1,
+                    user_input=prompt,
+                    workspace_root=str(self.tmp_path),
+                    target_path=str(target_path),
+                )
+            )
+
+        self.assertTrue(result["save_success"])
+        self.assertEqual(llm.generate_calls, 1)
+        self.assertEqual(llm.fix_calls, 0)
+        self.assertIn('if type(contacts) ~= "table" then', result["generated_code"])
+        self.assertIn("for key in pairs(contacts) do", result["generated_code"])
+        self.assertIn("Do not force a non-trivial workflow transformation into a one-line `return`.", llm.last_generate_prompt)
+        self.assertNotIn("reason privately", llm.last_generate_prompt)
+        self.assertNotIn("ranked candidates", llm.last_generate_prompt)
+        self.assertNotIn("confidence:", llm.last_generate_prompt)
+        self.assertIn("Use workflow path: wf.vars.contacts", llm.last_generate_prompt)
+        self.assertIn("Treat an empty table as an array.", llm.last_generate_prompt)
+        self.assertIn("create it with `_utils.array.new()`, assign items explicitly", llm.last_generate_prompt)
+        self.assertIn("The response must start with `lua{` and end with `}lua`", llm.last_generate_system)
+        self.assertNotIn("JsonString", llm.last_generate_system)
+        self.assertNotIn("return wf.vars.emails[#wf.vars.emails]", llm.last_generate_prompt)
+        self.assertEqual(llm.last_generate_temperature, 0.0)
+
+    def test_generation_prompt_guides_numeric_aggregation_and_uses_low_temperature(self) -> None:
+        async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
+            return _success_diagnostics()
+
+        def fake_save_output(target_path: str, code: str, jsonstring_code: str = "") -> dict:
+            return {
+                "lua_path": target_path,
+                "jsonstring_path": f"{target_path}.jsonstring.txt",
+            }
+
+        llm = StubLLM(
+            generate_responses=[
+                """lua{
+local total = 0
+for _, item in ipairs(wf.vars.items) do
+ total = total + (tonumber(item.quantity) or 0)
+end
+return total
+}lua"""
+            ],
+            fix_response="",
+        )
+        target_path = self.tmp_path / "items.lua"
+        prompt = """Посчитай сумму всех значений quantity в массиве items.
+
+{
+  "wf": {
+    "vars": {
+      "items": [
+        { "sku": "A1", "quantity": "2" },
+        { "sku": "A2", "quantity": "5" },
+        { "sku": "A3", "quantity": "3" }
+      ]
+    }
+  }
+}"""
+
+        with patch("src.graph.nodes.async_run_diagnostics", new=fake_run_diagnostics), patch(
+            "src.graph.nodes.save_final_output",
+            new=fake_save_output,
+        ):
+            engine = PipelineEngine(llm=llm)
+            result = asyncio.run(
+                engine.process_message(
+                    chat_id=1,
+                    user_input=prompt,
+                    workspace_root=str(self.tmp_path),
+                    target_path=str(target_path),
+                )
+            )
+
+        self.assertTrue(result["save_success"])
+        self.assertIn("numeric aggregation over workflow arrays", llm.last_generate_prompt)
+        self.assertEqual(llm.last_generate_temperature, 0.0)
+        self.assertIn("(tonumber(item.quantity) or 0)", result["generated_code"])
+
+    def test_array_normalization_task_rejects_table_only_shortcut_and_enters_fix_loop(self) -> None:
+        async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
+            return _success_diagnostics()
+
+        def fake_save_output(target_path: str, code: str, jsonstring_code: str = "") -> dict:
+            return {
+                "lua_path": target_path,
+                "jsonstring_path": f"{target_path}.jsonstring.txt",
+            }
+
+        llm = StubLLM(
+            generate_responses=[
+                """lua{
+if type(wf.vars.contacts) ~= 'table' then wf.vars.contacts = _utils.array.new({wf.vars.contacts}) end
+_utils.array.markAsArray(wf.vars.contacts)
+return wf.vars.contacts
+}lua"""
+            ],
+            fix_response="""lua{
+local contacts = wf.vars.contacts
+if type(contacts) ~= "table" then
+    local arr = _utils.array.new()
+    arr[1] = contacts
+    _utils.array.markAsArray(arr)
+    return arr
+end
+local is_array = true
+for key in pairs(contacts) do
+    if type(key) ~= "number" or math.floor(key) ~= key then
+        is_array = false
+        break
+    end
+end
+if is_array then
+    return contacts
+end
+local arr = _utils.array.new()
+arr[1] = contacts
+_utils.array.markAsArray(arr)
+return arr
+}lua""",
+        )
+        target_path = self.tmp_path / "contacts.lua"
+        prompt = """Если поле contacts не массив, оберни его в массив.
+
+{
+  "wf": {
+    "vars": {
+      "contacts": {
+        "name": "Ivan",
+        "phone": "+79990001122"
+      }
+    }
+  }
+}"""
+
+        with patch("src.graph.nodes.async_run_diagnostics", new=fake_run_diagnostics), patch(
+            "src.graph.nodes.save_final_output",
+            new=fake_save_output,
+        ):
+            engine = PipelineEngine(llm=llm)
+            result = asyncio.run(
+                engine.process_message(
+                    chat_id=1,
+                    user_input=prompt,
+                    workspace_root=str(self.tmp_path),
+                    target_path=str(target_path),
+                )
+            )
+
+        self.assertEqual(llm.fix_calls, 1)
+        self.assertTrue(result["save_success"])
+        self.assertIn("_utils.array.new()", result["generated_code"])
+        self.assertIn("for key in pairs(contacts) do", result["generated_code"])
+        self.assertIn("Differentiate object-like tables from array-like tables", llm.last_fix_prompt)
+        self.assertIn("Call `_utils.array.new()` without inline arguments", llm.last_fix_prompt)
+        self.assertIn("Rewrite the script from scratch", llm.last_fix_prompt)
+        self.assertNotIn("Current code:", llm.last_fix_prompt)
+
+    def test_array_normalization_rejects_next_check_and_source_marking_shortcut(self) -> None:
+        async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
+            return _success_diagnostics()
+
+        def fake_save_output(target_path: str, code: str, jsonstring_code: str = "") -> dict:
+            return {
+                "lua_path": target_path,
+                "jsonstring_path": f"{target_path}.jsonstring.txt",
+            }
+
+        llm = StubLLM(
+            generate_responses=[
+                """lua{
+if type(wf.vars.contacts) ~= 'table' or next(wf.vars.contacts) == nil then
+    wf.vars.contacts = _utils.array.new()
+    _utils.array.markAsArray(wf.vars.contacts)
+end
+return wf.vars.contacts
+}lua"""
+            ],
+            fix_response="""lua{
+local contacts = wf.vars.contacts
+if type(contacts) ~= "table" then
+    local arr = _utils.array.new()
+    arr[1] = contacts
+    _utils.array.markAsArray(arr)
+    return arr
+end
+local is_array = true
+for key in pairs(contacts) do
+    if type(key) ~= "number" or math.floor(key) ~= key then
+        is_array = false
+        break
+    end
+end
+if is_array then
+    return contacts
+end
+local arr = _utils.array.new()
+arr[1] = contacts
+_utils.array.markAsArray(arr)
+return arr
+}lua""",
+        )
+        target_path = self.tmp_path / "contacts.lua"
+        prompt = """Сделай Если поле contacts не массив, оберни его в массив.
+
+{
+  "wf": {
+    "vars": {
+      "contacts": {
+        "name": "Ivan",
+        "phone": "+79990001122"
+      }
+    }
+  }
+}"""
+
+        with patch("src.graph.nodes.async_run_diagnostics", new=fake_run_diagnostics), patch(
+            "src.graph.nodes.save_final_output",
+            new=fake_save_output,
+        ):
+            engine = PipelineEngine(llm=llm)
+            result = asyncio.run(
+                engine.process_message(
+                    chat_id=1,
+                    user_input=prompt,
+                    workspace_root=str(self.tmp_path),
+                    target_path=str(target_path),
+                )
+            )
+
+        self.assertEqual(llm.fix_calls, 1)
+        self.assertTrue(result["save_success"])
+        self.assertIn("Checking `next(value)` only distinguishes empty vs non-empty tables", llm.last_fix_prompt)
+        self.assertIn("Do not relabel the original workflow value as an array in place", llm.last_fix_prompt)
+        self.assertNotIn("Verification summary:", llm.last_fix_prompt)
+
+    def test_fix_code_retries_when_first_fix_still_repeats_shape_failures(self) -> None:
+        async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
+            return _success_diagnostics()
+
+        def fake_save_output(target_path: str, code: str, jsonstring_code: str = "") -> dict:
+            return {
+                "lua_path": target_path,
+                "jsonstring_path": f"{target_path}.jsonstring.txt",
+            }
+
+        llm = StubLLM(
+            generate_responses=[
+                """lua{
+local contacts = wf.vars.contacts
+if type(contacts) ~= "table" or next(contacts, nil) == nil then
+    contacts = _utils.array.new()
+    table.insert(contacts, wf.vars.contacts)
+    _utils.array.markAsArray(contacts)
+end
+return contacts
+}lua"""
+            ],
+            fix_response=[
+                """```lua
+local contacts = wf.vars.contacts
+if type(contacts) ~= "table" or next(contacts, nil) == nil then
+    contacts = _utils.array.new()
+    table.insert(contacts, wf.vars.contacts)
+    _utils.array.markAsArray(contacts)
+end
+return contacts
+```""",
+                """lua{
+local contacts = wf.vars.contacts
+if type(contacts) ~= "table" then
+    local arr = _utils.array.new()
+    arr[1] = contacts
+    _utils.array.markAsArray(arr)
+    return arr
+end
+local is_array = true
+for key in pairs(contacts) do
+    if type(key) ~= "number" or math.floor(key) ~= key then
+        is_array = false
+        break
+    end
+end
+if is_array then
+    return contacts
+end
+local arr = _utils.array.new()
+arr[1] = contacts
+_utils.array.markAsArray(arr)
+return arr
+}lua""",
+            ],
+        )
+        target_path = self.tmp_path / "contacts.lua"
+        prompt = """Сделай Если поле contacts не массив, оберни его в массив.
+
+{
+  "wf": {
+    "vars": {
+      "contacts": {
+        "name": "Ivan",
+        "phone": "+79990001122"
+      }
+    }
+  }
+}"""
+
+        with patch("src.graph.nodes.async_run_diagnostics", new=fake_run_diagnostics), patch(
+            "src.graph.nodes.save_final_output",
+            new=fake_save_output,
+        ):
+            engine = PipelineEngine(llm=llm)
+            result = asyncio.run(
+                engine.process_message(
+                    chat_id=1,
+                    user_input=prompt,
+                    workspace_root=str(self.tmp_path),
+                    target_path=str(target_path),
+                )
+            )
+
+        self.assertEqual(llm.fix_calls, 2)
+        self.assertTrue(result["save_success"])
+        self.assertIn("for key in pairs(contacts) do", result["generated_code"])
+        self.assertNotIn("next(contacts, nil)", result["generated_code"])
+        self.assertNotIn("assistant", llm.last_fix_prompt.lower())
+
+    def test_deterministic_fail_overrules_hallucinated_llm_verifier_pass(self) -> None:
+        async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
+            return _success_diagnostics()
+
+        def fake_save_output(target_path: str, code: str, jsonstring_code: str = "") -> dict:
+            return {
+                "lua_path": target_path,
+                "jsonstring_path": f"{target_path}.jsonstring.txt",
+            }
+
+        llm = StubLLM(
+            generate_responses=[
+                """lua{
+local contacts = wf.vars.contacts
+if type(contacts) ~= "table" or next(contacts, nil) == nil then
+    contacts = _utils.array.new()
+    table.insert(contacts, wf.vars.contacts)
+    _utils.array.markAsArray(contacts)
+end
+return contacts
+}lua"""
+            ],
+            fix_response="",
+            verify_response=(
+                '{"passed": true, "score": 100, "summary": "The Lua script correctly checks if the contacts field is not an array and wraps it in an array if necessary.", '
+                '"missing_requirements": [], "warnings": [], '
+                '"checks": {'
+                '"workflow_path_usage": {"status": "pass", "reason": ""}, '
+                '"source_shape_understood": {"status": "pass", "reason": ""}, '
+                '"target_shape_satisfied": {"status": "pass", "reason": ""}, '
+                '"logic_correctness": {"status": "pass", "reason": ""}, '
+                '"helper_api_usage": {"status": "pass", "reason": ""}, '
+                '"edge_case_handling": {"status": "pass", "reason": ""}'
+                '}}'
+            ),
+        )
+        target_path = self.tmp_path / "contacts.lua"
+        prompt = """Сделай Если поле contacts не массив, оберни его в массив.
+
+{
+  "wf": {
+    "vars": {
+      "contacts": {
+        "name": "Ivan",
+        "phone": "+79990001122"
+      }
+    }
+  }
+}"""
+
+        with patch("src.graph.nodes.async_run_diagnostics", new=fake_run_diagnostics), patch(
+            "src.graph.nodes.save_final_output",
+            new=fake_save_output,
+        ):
+            engine = PipelineEngine(llm=llm, max_fix_iterations=0)
+            result = asyncio.run(
+                engine.process_message(
+                    chat_id=1,
+                    user_input=prompt,
+                    workspace_root=str(self.tmp_path),
+                    target_path=str(target_path),
+                )
+            )
+
+        self.assertFalse(result["verification"]["passed"])
+        self.assertFalse(result["save_success"])
+        self.assertTrue(result["verification"]["llm_verifier_conflict"])
+        self.assertFalse(result["verification"]["deterministic_passed"])
+        self.assertIn("LLM verifier disagreed with deterministic checks and was overruled.", result["verification"]["summary"])
+        self.assertIn("llm_verifier_conflict_with_deterministic_checks", result["verification"]["warnings"])
+
+    def test_generation_normalizes_json_envelope_with_lua_field(self) -> None:
+        async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
+            self.assertEqual(
+                code.strip(),
+                "return _utils.array.find(wf.vars.orders, function(order) return order.status == 'NEW' end).id",
+            )
+            return _success_diagnostics()
+
+        def fake_save_output(target_path: str, code: str, jsonstring_code: str = "") -> dict:
+            return {
+                "lua_path": target_path,
+                "jsonstring_path": f"{target_path}.jsonstring.txt",
+            }
+
+        llm = StubLLM(
+            generate_responses=[
+                """lua{
+json
+{
+  "lua": "return _utils.array.find(wf.vars.orders, function(order) return order.status == 'NEW' end).id"
+}
+}lua"""
+            ],
+            fix_response="",
+        )
+        target_path = self.tmp_path / "orders.lua"
+        prompt = """Найди id первого заказа со статусом NEW.
+
+{
+  "wf": {
+    "vars": {
+      "orders": [
+        { "id": 1, "status": "OLD" },
+        { "id": 2, "status": "NEW" }
+      ]
+    }
+  }
+}"""
+
+        with patch("src.graph.nodes.async_run_diagnostics", new=fake_run_diagnostics), patch(
+            "src.graph.nodes.save_final_output",
+            new=fake_save_output,
+        ):
+            engine = PipelineEngine(llm=llm)
+            result = asyncio.run(
+                engine.process_message(
+                    chat_id=1,
+                    user_input=prompt,
+                    workspace_root=str(self.tmp_path),
+                    target_path=str(target_path),
+                )
+            )
+
+        self.assertTrue(result["save_success"])
+        self.assertEqual(
+            result["generated_code"].strip(),
+            "return _utils.array.find(wf.vars.orders, function(order) return order.status == 'NEW' end).id",
+        )
+        self.assertEqual(llm.fix_calls, 0)
 
     def test_without_explicit_path_returns_code_but_skips_save(self) -> None:
         async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
@@ -194,8 +751,8 @@ class PipelineLowcodeGenerationTests(unittest.TestCase):
             raise AssertionError("save_final_output must not be called when no explicit path is set")
 
         llm = StubLLM(
-            generate_responses=[],
-            fix_response="lua{return wf.vars.emails[#wf.vars.emails]}lua",
+            generate_responses=["lua{return wf.vars.emails[#wf.vars.emails]}lua"],
+            fix_response="",
         )
         prompt = """Return the last email from the provided workflow context.
 
@@ -228,9 +785,9 @@ class PipelineLowcodeGenerationTests(unittest.TestCase):
         self.assertEqual(result["saved_jsonstring_to"], "")
         self.assertEqual(result["generated_code"].strip(), "return wf.vars.emails[#wf.vars.emails]")
         self.assertIn("не сохранен в файл", result["response"])
-        self.assertEqual(llm.generate_calls, 0)
+        self.assertEqual(llm.generate_calls, 1)
 
-    def test_change_intent_without_existing_code_goes_directly_to_generate(self) -> None:
+    def test_change_like_prompt_without_existing_code_is_reclassified_to_create(self) -> None:
         async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
             return _success_diagnostics()
 
@@ -273,11 +830,91 @@ class PipelineLowcodeGenerationTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(result["intent"], "change")
+        self.assertEqual(result["intent"], "create")
         self.assertTrue(result["save_success"])
         self.assertEqual(result["change_requests"], [])
         self.assertEqual(result["generated_code"].strip(), "return wf.vars.emails[#wf.vars.emails]")
-        self.assertEqual(llm.generate_calls, 0)
+        self.assertEqual(llm.generate_calls, 1)
+
+    def test_pasted_message_code_allows_change_without_chat_code(self) -> None:
+        async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
+            return _success_diagnostics()
+
+        def fake_save_output(target_path: str, code: str, jsonstring_code: str = "") -> dict:
+            return {
+                "lua_path": target_path,
+                "jsonstring_path": f"{target_path}.jsonstring.txt",
+            }
+
+        llm = StubLLM(
+            generate_responses=[
+                """lua{
+local emails = wf.vars.emails
+return emails[#emails]
+}lua"""
+            ],
+            fix_response="",
+            route_intent="change",
+        )
+        target_path = self.tmp_path / "sample.lua"
+        prompt = """Исправь этот код так, чтобы он работал с workflow path.
+
+lua{
+local emails = {"user1@example.com", "user2@example.com"}
+return emails[#emails]
+}lua"""
+
+        with patch("src.graph.nodes.async_run_diagnostics", new=fake_run_diagnostics), patch(
+            "src.graph.nodes.save_final_output",
+            new=fake_save_output,
+        ):
+            engine = PipelineEngine(llm=llm)
+            result = asyncio.run(
+                engine.process_message(
+                    chat_id=1,
+                    user_input=prompt,
+                    workspace_root=str(self.tmp_path),
+                    target_path=str(target_path),
+                    current_code="",
+                    base_prompt="",
+                    change_requests=[],
+                )
+        )
+
+        self.assertEqual(result["intent"], "change")
+        self.assertEqual(result["base_prompt"].strip(), "Исправь этот код так, чтобы он работал с workflow path.")
+        self.assertEqual(result["change_requests"], [prompt])
+        self.assertTrue(result["save_success"])
+        self.assertEqual(result["generated_code"].strip(), "local emails = wf.vars.emails\nreturn emails[#emails]")
+        self.assertEqual(llm.generate_calls, 1)
+        self.assertTrue(llm.last_generate_system.startswith("You modify existing Lua workflow scripts"))
+
+    def test_lua_question_without_code_stays_question(self) -> None:
+        llm = StubLLM(
+            generate_responses=["В Lua цикл `for` используется для повторения действий."],
+            fix_response="",
+            route_intent="create",
+        )
+
+        engine = PipelineEngine(llm=llm)
+        result = asyncio.run(
+            engine.process_message(
+                chat_id=1,
+                user_input="Как в Lua работает цикл for?",
+                workspace_root=str(self.tmp_path),
+                target_path="",
+                current_code="",
+                base_prompt="",
+                change_requests=[],
+            )
+        )
+
+        self.assertEqual(result["intent"], "question")
+        self.assertEqual(result["response_type"], "text")
+        self.assertFalse(result["save_success"])
+        self.assertEqual(result["generated_code"], "")
+        self.assertEqual(result["response"], "В Lua цикл `for` используется для повторения действий.")
+        self.assertEqual(llm.generate_calls, 1)
 
     def test_sends_complex_app_style_generation_into_fix_loop(self) -> None:
         async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
@@ -306,7 +943,7 @@ return string.format("%s-%s-%sT%s:%s:%s.00000Z", string.sub(DATUM, 1, 4), string
 }lua""",
         )
         target_path = self.tmp_path / "sample.lua"
-        prompt = """Преобразуй DATUM/TIME из workflow context в ISO 8601.
+        prompt = """Преобразуй DATUM/TIME из wf.vars.json.IDOC.ZCDF_HEAD в ISO 8601.
 
 {
   "wf": {
@@ -600,7 +1237,7 @@ return epoch
                 "jsonstring_path": f"{target_path}.jsonstring.txt",
             }
 
-        llm = StubLLM(generate_responses=[], fix_response="")
+        llm = StubLLM(generate_responses=["lua{return #wf.vars.cart.items}lua"], fix_response="")
         target_path = self.tmp_path / "sample.lua"
         prompt = """Посчитай количество товаров.
 
@@ -651,7 +1288,7 @@ return epoch
                 "jsonstring_path": f"{target_path}.jsonstring.txt",
             }
 
-        llm = StubLLM(generate_responses=[], fix_response="")
+        llm = StubLLM(generate_responses=["lua{return #wf.vars.cart.items}lua"], fix_response="")
         target_path = self.tmp_path / "sample.lua"
         original_prompt = """Посчитай количество товаров.
 
@@ -701,6 +1338,7 @@ return epoch
         self.assertEqual(first["base_prompt"].strip(), original_prompt.strip())
         self.assertTrue(second["save_success"])
         self.assertEqual(second["generated_code"].strip(), "return #wf.vars.cart.items")
+        self.assertEqual(llm.generate_calls, 1)
 
 
 if __name__ == "__main__":

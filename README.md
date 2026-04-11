@@ -10,9 +10,10 @@
 - выполняет LLM-проверку соответствия исходному запросу;
 - если в чате указан явный target path или уже есть active target, сохраняет код после успешной локальной валидации и проверки требований:
   - как чистый целевой `.lua` файл;
-  - как sidecar JsonString `lua{...}lua` рядом с ним;
+  - как sidecar JSON-артефакт рядом с ним, где значение поля содержит JsonString `lua{...}lua`;
 - возвращает:
   - код;
+  - user-facing JSON payload с embedded `lua{...}lua`;
   - путь сохранения, если он был задан;
   - объяснение реализации;
   - предложения улучшений;
@@ -131,6 +132,7 @@ C:\Work\LuaProjects\<slug>\<slug>.lua
 - скрипт должен возвращать значение и/или обновлять `wf.vars`
 - console input/output (`io.read`, `print`, `io.write`) по умолчанию не используются
 - массивы создаются/маркируются через `_utils.array.new()` и `_utils.array.markAsArray(arr)`
+- для shape-sensitive задач массивом считается только table с числовыми ключами `1..n` без пропусков; table со строковыми ключами вроде `name` / `phone` массивом не считается; пустая table считается массивом
 - базовые конструкции: `if`, `while`, `for`, `repeat`
 
 Во время локальной validation runtime поднимает временный harness:
@@ -151,7 +153,7 @@ resolve_target -> route_intent -> generate/refine -> validate -> verify -> save 
 - если лимит fix-итераций исчерпан, файл не сохраняется.
 
 ## Что видно в ответе
-- итоговый скрипт в формате `lua{ ... }lua`;
+- user-facing JSON payload, где значение поля содержит `lua{ ... }lua`;
 - статус local validation / verification;
 - путь сохранения `.lua` и sidecar JsonString, если сохранение выполнялось;
 - объяснение (что есть в коде и как работает);
@@ -192,9 +194,46 @@ Canonical runtime — Ollama с OpenAI-compatible API на `http://127.0.0.1:114
 - `e2e`-агент и e2e-gate сейчас временно отключены;
 - `luacheck` сейчас не используется в каноническом runtime;
 - generation/refine/fix ориентированы на workflow/LUS scripts, а не на console/CLI apps;
+- `route_intent` теперь hybrid:
+  - сначала учитывает реальное наличие кода в чате, clarification state и deterministic text signals;
+  - LLM intent classifier используется как fallback для неоднозначных случаев;
+  - если кода ещё нет и пользователь не прислал Lua в сообщении, change-like wording (`исправь`, `улучши`, `оберни`, `очисти`) трактуется как `create`, а не как `change`;
+  - если Lua прислан прямо в сообщении, он может стать входным кодом для `change` / `inspect`;
+- generation/refine/fix теперь остаются model-driven:
+  - compiler подготавливает workflow inventory, path hints и clarification gate;
+  - финальный Lua-код всегда синтезирует модель по текущей задаче и контексту;
+  - prompts больше не подталкивают каждую задачу к shortest-return шаблону и допускают multi-step scripts, loops, guards и helper functions, когда это нужно задаче;
+  - prompts теперь используют один жёсткий format contract: ответ должен начинаться с `lua{` и заканчиваться `}lua`, без кавычек и без code fences;
+  - в generation/fix prompts сокращён служебный шум: вместо ranked candidates / confidence / длинных diagnostics модель получает задачу, основной workflow path, текущий context и короткий список обязательных исправлений;
+  - `fix_code` больше не подсовывает модели прошлый сломанный assistant output и переписывает сценарий по short mandatory-fix list;
+  - generate/refine/fix теперь используют более консервативную temperature policy для parseable workflow context и shape-sensitive tasks;
+  - raw LLM output считается невалидным, если модель вернула fences, quoted wrapper или не начала ответ с `lua{`;
+- verification теперь использует semantic checklist, а не только summary scoring:
+  - workflow path usage;
+  - source shape;
+  - target/output shape;
+  - logic correctness;
+  - helper API usage;
+  - edge cases;
+- verifier теперь получает deterministic findings как hard constraints:
+  - если deterministic layer уже нашёл обязательные нарушения, optimistic LLM verdict не может переопределить итоговый fail;
+  - при конфликте итоговый summary явно помечает, что LLM verifier был overridden deterministic checks;
+  - verifier дополнительно не должен одобрять ответы с markdown/quoted wrappers и shape-sensitive код, где `next(...)` выступает единственной проверкой массива;
+- shape-sensitive задачи теперь проходят дополнительный deterministic semantic gate:
+  - нельзя опираться только на `type(x) == "table"` там, где нужно отличать object-like table от array-like table;
+  - проверки `next(x)` / empty-vs-non-empty не считаются достаточным shape detection;
+  - нельзя просто пометить исходный workflow object/scalar как массив через `_utils.array.markAsArray(source)` вместо создания нового array value;
+  - `_utils.array.new()` должен вызываться без inline arguments;
+  - для новых массивов требуется `_utils.array.markAsArray(arr)`;
 - naming для auto-created folder/file и title чата строится из очищенного prompt и санитизируется под Windows;
 - без явного пути в новом чате runtime больше не создаёт fallback file target и показывает код только в ответе;
 - задачи очистки/удаления ключей внутри workflow-объектов больше не считаются простым `return`-сценарием и проходят дополнительную deterministic-проверку на реальную трансформацию данных;
 - если пользователь в задаче упоминает bare field name из parseable workflow context, runtime пытается однозначно привязать его к `wf.vars.*` или `wf.initVariables.*` и использует это в verification/save gate;
 - fix-loop теперь получает не только raw Lua runtime error, но и нормализованные repair hints для типовых ошибок аргументов, nil access/call, arithmetic/type mismatch и concatenation;
+- `fix_code` теперь делает один внутренний stricter retry, если первый fix-ответ:
+  - не является внятным standalone Lua;
+  - почти не меняет код;
+  - или детерминированно повторяет те же requirement failures;
+- normalizer умеет извлекать Lua не только из `lua{...}lua`, но и из structured model envelopes вроде JSON-объектов с полями `lua` / `code` / `script`, чтобы validation не падала на сыром мета-формате ответа;
+- этот extraction работает и для fenced/meta-wrapped JSON envelopes, если модель вернула ` ```json { ... "field": "lua{...}lua" } ``` ` вместо чистого Lua;
 - README фиксирует текущее состояние кода, а не желаемое будущее.

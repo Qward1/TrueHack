@@ -13,14 +13,17 @@ from src.core.state import PipelineState
 from src.tools.lua_tools import (
     LOWCODE_CONTRACT_TEXT,
     LOWCODE_LUA_VERSION,
+    LOWCODE_RESPONSE_FORMAT_REQUIREMENT,
     async_run_diagnostics,
     async_verify_requirements,
     compile_lowcode_request,
     extract_function_names,
+    format_lowcode_json_payload,
     format_lowcode_jsonstring,
     inspect_lowcode_request_alignment,
     restore_lost_functions,
     smart_normalize,
+    validate_lowcode_llm_output,
     validate_lua_response,
 )
 from src.tools.target_tools import (
@@ -58,39 +61,48 @@ _ROUTE_USER = """Categories:
 - inspect: user asks to explain or review existing code
 - question: user asks about Lua / programming without requesting code changes
 - general: greeting or casual text
+- retry: rerun validation/fix for already available code
 
 Decision rules:
-1. If previous code exists AND the message contains change signals -> change
-2. If the message includes error text or asks to fix/apply improvements -> change
-3. If the message asks for new code unrelated to previous code -> create
-4. Otherwise -> question or general
+1. Use only one of the allowed intents: {allowed_intents}
+2. "change" is valid only when there is code to modify in chat or pasted in the current message
+3. If no code is available yet, requests like "fix/improve/wrap/clean/convert" still mean create new code, not change
+4. "inspect" is valid only when there is code to inspect in chat or pasted in the current message
+5. If the user pasted Lua code in this message, treat it as available code context
 
-Previous code exists: {has_code}
+Current code in chat: {has_code}
+Lua code pasted in current message: {has_message_code}
+Effective code available for modification: {effective_has_code}
 User message: {user_input}
 
 JSON only:"""
 
 _GENERATE_SYSTEM = (
-    f"You write short {LOWCODE_LUA_VERSION} workflow scripts. "
-    "Return ONLY Lua code wrapped in lua{{...}}lua — no markdown, no explanations, no prose.\n"
+    f"You write {LOWCODE_LUA_VERSION} workflow scripts for varied automation tasks. "
+    "Return ONLY Lua code.\n"
+    f"{LOWCODE_RESPONSE_FORMAT_REQUIREMENT}\n"
     f"{LOWCODE_CONTRACT_TEXT}"
-    "Style: write the shortest correct script. "
-    "Simple tasks = 1-3 lines. Use helper functions only for genuinely complex logic."
+    "Synthesize the script from the current task and workflow context instead of copying canned patterns. "
+    "Simple tasks may stay short, but when the task needs normalization, validation, iteration, or multi-step transformation, write the full logic explicitly. "
+    "Prefer correctness, robustness, and direct workflow-path usage over terseness."
 )
 
 _REFINE_SYSTEM = (
     "You modify existing Lua workflow scripts according to the user's request. "
-    "Return the COMPLETE updated script in lua{...}lua format. "
+    "Return ONLY the complete updated script. "
+    f"{LOWCODE_RESPONSE_FORMAT_REQUIREMENT} "
     "Preserve existing functions unless explicitly asked to remove them. "
     f"{LOWCODE_CONTRACT_TEXT}"
-    "Keep the result minimal — do not add unnecessary structure."
+    "Keep useful existing structure, but expand the script when the new behavior needs additional guards, loops, helpers, or multi-step transformation logic."
 )
 
 _FIX_SYSTEM = (
     "You fix broken Lua workflow scripts. "
-    "Return ONLY the corrected code in lua{...}lua — no markdown, no explanations.\n"
+    "Return ONLY the corrected code.\n"
+    f"{LOWCODE_RESPONSE_FORMAT_REQUIREMENT}\n"
     f"{LOWCODE_CONTRACT_TEXT}"
-    "Do not convert the script into a console app. Do not add print/io.read/menus."
+    "Do not convert the script into a console app. Do not add print/io.read/menus. "
+    "Fix the actual workflow logic; if the task needs a longer multi-step script, write it instead of forcing a short return-only answer."
 )
 
 _ANSWER_SYSTEM = (
@@ -111,105 +123,124 @@ _FENCED_BLOCK_RE = re.compile(r"```(?:[A-Za-z0-9_-]+)?\s*([\s\S]*?)```")
 _TRAILING_JSON_CONTEXT_RE = re.compile(
     r"(?s)^(?P<task>.*?)(?:\n\s*)(?P<context>(?:\{[\s\S]*\}|\[[\s\S]*\]))\s*$"
 )
-_PUBLIC_SAMPLE_FEWSHOT = """Reference style from the public sample:
-
-Example 1
-Task: Return the last email from the provided workflow context.
-Good output:
-lua{return wf.vars.emails[#wf.vars.emails]}lua
-
-Example 2
-Task: Increment wf.vars.try_count_n by one.
-Good output:
-lua{return wf.vars.try_count_n + 1}lua
-
-Example 3
-Task: Convert DATUM/TIME from wf.vars.json.IDOC.ZCDF_HEAD to ISO 8601.
-Good output:
-lua{
-local DATUM = wf.vars.json.IDOC.ZCDF_HEAD.DATUM
-local TIME = wf.vars.json.IDOC.ZCDF_HEAD.TIME
-local function safe_sub(str, start_pos, end_pos)
-    str = str or ""
-    return string.sub(str, start_pos, math.min(end_pos, #str))
-end
-local year = safe_sub(DATUM, 1, 4)
-local month = safe_sub(DATUM, 5, 6)
-local day = safe_sub(DATUM, 7, 8)
-local hour = safe_sub(TIME, 1, 2)
-local minute = safe_sub(TIME, 3, 4)
-local second = safe_sub(TIME, 5, 6)
-return string.format("%s-%s-%sT%s:%s:%s.00000Z", year, month, day, hour, minute, second)
-}lua
-
-Example 4
-Task: Ensure obj.items is always an array in wf.vars.json.IDOC.ZCDF_HEAD.ZCDF_PACKAGES.
-Good output:
-lua{
-local function ensureArray(value)
-    if type(value) ~= "table" then
-        return { value }
-    end
-    local isArray = true
-    for key in pairs(value) do
-        if type(key) ~= "number" or math.floor(key) ~= key then
-            isArray = false
-            break
-        end
-    end
-    return isArray and value or { value }
-end
-
-for _, obj in ipairs(wf.vars.json.IDOC.ZCDF_HEAD.ZCDF_PACKAGES) do
-    if type(obj) == "table" and obj.items ~= nil then
-        obj.items = ensureArray(obj.items)
-    end
-end
-
-return wf.vars.json.IDOC.ZCDF_HEAD.ZCDF_PACKAGES
-}lua
-
-Example 5
-Task: Remove keys ID, ENTITY_ID, CALL from each object in wf.vars.RESTbody.result.
-Good output:
-lua{
-local result = wf.vars.RESTbody.result
-for _, item in ipairs(result) do
-    if type(item) == "table" then
-        item.ID = nil
-        item.ENTITY_ID = nil
-        item.CALL = nil
-    end
-end
-return result
-}lua"""
+_INLINE_LOWCODE_BLOCK_RE = re.compile(r"lua\{\s*[\s\S]*?\s*\}lua", re.IGNORECASE)
+_FENCED_CODE_BLOCK_RE = re.compile(r"```(?:lua)?\s*([\s\S]*?)```", re.IGNORECASE)
+_INTENT_CHANGE_MARKERS = (
+    "исправ",
+    "поправ",
+    "почин",
+    "улучш",
+    "доработ",
+    "передел",
+    "измени",
+    "обнови",
+    "адаптир",
+    "оптимиз",
+    "refactor",
+    "modify",
+    "improve",
+    "fix",
+    "update",
+    "change",
+    "adjust",
+)
+_INTENT_CREATE_MARKERS = (
+    "сделай",
+    "создай",
+    "напиши",
+    "сгенер",
+    "реализ",
+    "нужен скрипт",
+    "build",
+    "create",
+    "generate",
+    "write",
+    "implement",
+)
+_INTENT_INSPECT_MARKERS = (
+    "объясн",
+    "обьясн",
+    "как работает",
+    "что делает",
+    "разбер",
+    "проанализ",
+    "ревью",
+    "review",
+    "inspect",
+    "explain",
+    "analyze",
+)
+_INTENT_RETRY_MARKERS = (
+    "/retry",
+    "retry",
+    "повтори",
+    "перезапусти",
+    "прогони еще раз",
+    "заново проверь",
+)
+_INTENT_QUESTION_MARKERS = (
+    "почему",
+    "зачем",
+    "как ",
+    "что ",
+    "what ",
+    "why ",
+    "how ",
+)
+_INTENT_GENERAL_MARKERS = (
+    "привет",
+    "здравствуй",
+    "hello",
+    "hi",
+    "thanks",
+    "спасибо",
+)
+_TASK_CODE_MARKERS = (
+    "скрипт",
+    "код",
+    "lua",
+    "workflow",
+    "wf.vars",
+    "wf.initvariables",
+    "jsonstring",
+    "script",
+    "code",
+)
 _PROMPT_STYLE_RULES = """Hard rules:
 - Use the exact wf.vars / wf.initVariables paths from the task or provided workflow context.
 - Do not recreate the provided input as local demo tables like local data = {...}, local users = {...}, local emails = {...}.
 - Do not build an app, service, API, menu, tutorial, or CLI wrapper.
 - Do not use print(), io.write(), io.read(), or console prompts.
-- Simple extraction/computation tasks should usually be 1-3 lines with a direct return.
+- Use the amount of structure the task actually needs: locals, conditions, loops, table traversal, normalization steps, and helper functions are all allowed when they are necessary.
+- Do not force a non-trivial workflow transformation into a one-line `return`.
+- If the task combines or derives data from several workflow fields, read each required field directly from wf.vars / wf.initVariables.
 - If the task asks to remove/clear/filter keys inside workflow objects, transform those objects before return; do not return the source path unchanged.
-- If the task explicitly asks to save/update wf.vars, keep the script minimal and still use the exact workflow paths."""
-_NEGATIVE_STYLE_FEWSHOT = """Bad style example:
+- If the task explicitly asks to save/update wf.vars, use the exact workflow paths and keep the script focused on the requested state change."""
+_PROMPT_SYNTHESIS_GUIDANCE = """Generation guidance:
+- Derive the script from the current task, normalized workflow inventory, and pasted workflow context.
+- Treat the selected primary path as a strong anchor, not as a restriction when the task clearly needs sibling fields or nested related fields.
+- Decide the real output/update shape first, then write the Lua needed to produce it.
+- Prefer direct workflow data access and small local helpers over invented demo inputs or generic boilerplate.
+- If the task is shape-sensitive, treat an array as a table with numeric keys 1..n without gaps. A table with string keys like `name` or `phone` is an object, not an array. Treat an empty table as an array.
+- If the task is shape-sensitive, explicitly distinguish object-like tables from array-like tables with numeric keys instead of relying only on `type(x) == "table"`, `next(x)`, or empty/non-empty checks.
+- If you need a new array, create it with `_utils.array.new()`, assign items explicitly, then call `_utils.array.markAsArray(arr)` before return/store.
+- For numeric aggregation over workflow arrays, iterate the items explicitly and convert number-like string values with `tonumber(...)` or guard nils before arithmetic.
+- Keep simple tasks simple, but let complex tasks stay multi-step and explicit."""
 
-Task: Count items in the cart from workflow context.
-Bad output:
-lua{
-local cart = {
-  items = {
-    { sku = "A001" },
-    { sku = "A002" },
-    { sku = "A003" }
-  }
-}
 
-local itemCount = #cart.items
-print("Количество товаров в корзине:", itemCount)
-}lua
-
-Correct output:
-lua{return #wf.vars.cart.items}lua"""
+def _generation_temperature(compiled_request: dict[str, Any]) -> float:
+    if not isinstance(compiled_request, dict):
+        return 0.1
+    if compiled_request.get("has_parseable_context"):
+        return 0.0
+    semantic_expectations = [
+        str(item).strip()
+        for item in compiled_request.get("semantic_expectations", [])
+        if str(item).strip()
+    ]
+    if semantic_expectations:
+        return 0.0
+    return 0.1
 
 
 def _target_context(state: PipelineState) -> str:
@@ -257,6 +288,13 @@ def _format_compiled_request_summary(compiled_request: dict[str, Any]) -> str:
     ]
     if requested_item_keys:
         lines.append(f"- requested item keys: {', '.join(requested_item_keys)}")
+    semantic_expectations = [
+        str(item).strip()
+        for item in compiled_request.get("semantic_expectations", [])
+        if str(item).strip()
+    ]
+    if semantic_expectations:
+        lines.append(f"- semantic expectations: {', '.join(semantic_expectations)}")
     inferred_explicit_paths = [
         str(path).strip()
         for path in compiled_request.get("inferred_explicit_paths", [])
@@ -291,11 +329,200 @@ def _format_compiled_request_summary(compiled_request: dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
+def _format_prompt_workflow_context(compiled_request: dict[str, Any]) -> str:
+    if not isinstance(compiled_request, dict):
+        return ""
+
+    lines: list[str] = []
+    selected_path = str(compiled_request.get("selected_primary_path", "") or "").strip()
+    selected_type = str(compiled_request.get("selected_primary_type", "") or "").strip()
+    semantic_expectations = [
+        str(item).strip()
+        for item in compiled_request.get("semantic_expectations", [])
+        if str(item).strip()
+    ]
+    requested_item_keys = [
+        str(key).strip()
+        for key in compiled_request.get("requested_item_keys", [])
+        if str(key).strip()
+    ]
+
+    if selected_path:
+        lines.append(f"Use workflow path: {selected_path}")
+    if selected_type:
+        lines.append(f"Path type: {selected_type}")
+    if semantic_expectations:
+        lines.append(f"Semantic expectations: {', '.join(semantic_expectations)}")
+    if requested_item_keys:
+        lines.append(f"Requested item keys: {', '.join(requested_item_keys)}")
+    return "\n".join(lines).strip()
+
+
 def _build_clarification_response(compiled_request: dict[str, Any]) -> str:
     question = str(compiled_request.get("clarifying_question", "") or "").strip()
     if question:
         return question
     return "Нужна явная привязка к workflow-пути. Ответь, например: `используй wf.vars.some.path`."
+
+
+def _normalize_intent_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip().lower())
+
+
+def _text_has_any(text: str, markers: tuple[str, ...]) -> bool:
+    return any(marker in text for marker in markers)
+
+
+def _extract_message_code_block(user_input: str) -> str:
+    raw = str(user_input or "")
+    candidates: list[str] = []
+
+    for match in _INLINE_LOWCODE_BLOCK_RE.finditer(raw):
+        wrapped = match.group(0).strip()
+        if wrapped:
+            candidates.append(wrapped)
+
+    for block in _FENCED_CODE_BLOCK_RE.findall(raw):
+        candidate = str(block or "").strip()
+        if candidate:
+            candidates.append(candidate)
+
+    stripped = raw.strip()
+    if not candidates and "\n" in stripped:
+        code_markers = ("wf.vars", "wf.initVariables", "local ", "function ", "return ", " end", "=")
+        if any(marker in stripped for marker in code_markers):
+            candidates.append(stripped)
+
+    for candidate in candidates:
+        analysis = validate_lua_response(candidate)
+        normalized = str(analysis.get("normalized", "") or "").strip()
+        if not analysis.get("valid") or not normalized:
+            continue
+        if "\n" not in normalized and not _INLINE_LOWCODE_BLOCK_RE.search(candidate) and "wf." not in normalized:
+            continue
+        return normalized
+
+    return ""
+
+
+def _strip_message_code_blocks(user_input: str) -> str:
+    cleaned = _INLINE_LOWCODE_BLOCK_RE.sub("\n", str(user_input or ""))
+    cleaned = _FENCED_CODE_BLOCK_RE.sub("\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _collect_intent_features(
+    *,
+    user_input: str,
+    has_existing_code: bool,
+    base_prompt: str,
+) -> dict[str, Any]:
+    message_code = _extract_message_code_block(user_input)
+    cleaned_message = _strip_message_code_blocks(user_input) if message_code else str(user_input or "").strip()
+    normalized = _normalize_intent_text(cleaned_message or user_input)
+    task_text, raw_context = split_task_and_context(cleaned_message)
+
+    has_workflow_context = bool(raw_context.strip()) or any(
+        marker in user_input for marker in ('"wf"', "wf.vars", "wf.initVariables")
+    )
+    has_change_signal = _text_has_any(normalized, _INTENT_CHANGE_MARKERS)
+    has_create_signal = _text_has_any(normalized, _INTENT_CREATE_MARKERS)
+    has_inspect_signal = _text_has_any(normalized, _INTENT_INSPECT_MARKERS)
+    has_retry_signal = _text_has_any(normalized, _INTENT_RETRY_MARKERS)
+    has_question_signal = user_input.strip().endswith("?") or _text_has_any(normalized, _INTENT_QUESTION_MARKERS)
+    has_general_signal = _text_has_any(normalized, _INTENT_GENERAL_MARKERS)
+    has_error_signal = any(
+        marker in user_input.lower()
+        for marker in ("traceback", "runtime error", "syntax error", "stack traceback", "attempt to ", "bad argument")
+    )
+    has_task_code_signal = has_workflow_context or _text_has_any(normalized, _TASK_CODE_MARKERS)
+
+    effective_has_code = bool(has_existing_code or message_code)
+    has_pending_base_prompt = (
+        bool(str(base_prompt or "").strip())
+        and not effective_has_code
+        and str(base_prompt or "").strip() != str(user_input or "").strip()
+    )
+
+    return {
+        "message_code": message_code,
+        "cleaned_message": cleaned_message,
+        "normalized": normalized,
+        "task_text": task_text,
+        "raw_context": raw_context,
+        "has_workflow_context": has_workflow_context,
+        "has_change_signal": has_change_signal,
+        "has_create_signal": has_create_signal,
+        "has_inspect_signal": has_inspect_signal,
+        "has_retry_signal": has_retry_signal,
+        "has_question_signal": has_question_signal,
+        "has_general_signal": has_general_signal,
+        "has_error_signal": has_error_signal,
+        "has_task_code_signal": has_task_code_signal,
+        "has_existing_code": has_existing_code,
+        "has_message_code": bool(message_code),
+        "effective_has_code": effective_has_code,
+        "has_pending_base_prompt": has_pending_base_prompt,
+    }
+
+
+def _deterministic_intent_from_features(features: dict[str, Any]) -> tuple[str, str]:
+    if features.get("has_pending_base_prompt"):
+        return "create", "clarification_followup"
+
+    normalized = str(features.get("normalized", "") or "").strip()
+    if not normalized:
+        return "general", "empty_message"
+
+    effective_has_code = bool(features.get("effective_has_code"))
+    has_retry_signal = bool(features.get("has_retry_signal"))
+    has_change_signal = bool(features.get("has_change_signal"))
+    has_create_signal = bool(features.get("has_create_signal"))
+    has_inspect_signal = bool(features.get("has_inspect_signal"))
+    has_question_signal = bool(features.get("has_question_signal"))
+    has_general_signal = bool(features.get("has_general_signal"))
+    has_error_signal = bool(features.get("has_error_signal"))
+    has_task_code_signal = bool(features.get("has_task_code_signal"))
+    is_code_task = bool(
+        has_create_signal
+        or has_change_signal
+        or has_error_signal
+        or bool(features.get("has_workflow_context"))
+        or (has_task_code_signal and not has_question_signal and not has_inspect_signal)
+    )
+
+    if has_retry_signal:
+        return ("retry", "retry_with_code") if effective_has_code else ("create", "retry_without_code")
+
+    if has_inspect_signal and not (has_change_signal or has_create_signal or has_task_code_signal):
+        return ("inspect", "inspect_existing_code") if effective_has_code else ("question", "inspect_without_code")
+
+    if not effective_has_code:
+        if has_question_signal and not is_code_task:
+            return "question", "question_without_code"
+        if is_code_task:
+            return "create", "no_code_available"
+        if has_general_signal:
+            return "general", "general_message"
+        return "", ""
+
+    if has_error_signal or has_change_signal:
+        return "change", "modify_existing_code"
+
+    if has_inspect_signal and not has_create_signal:
+        return "inspect", "inspect_existing_code"
+
+    if has_create_signal and not has_change_signal:
+        return "create", "explicit_new_code_request"
+
+    if has_question_signal and not is_code_task:
+        return "question", "question_with_code_context"
+
+    if has_general_signal and not is_code_task:
+        return "general", "general_message"
+
+    return "", ""
 
 
 def split_task_and_context(user_input: str) -> tuple[str, str]:
@@ -328,24 +555,92 @@ def _join_prompt_sections(*sections: str) -> str:
     return "\n\n".join(section.strip() for section in sections if section and section.strip())
 
 
+def _code_signature(code: str) -> str:
+    return re.sub(r"\s+", "", str(code or ""))
+
+
+def _assess_fix_candidate(
+    *,
+    original_code: str,
+    candidate_code: str,
+    failure_stage: str,
+    diagnostics: dict[str, Any],
+    verification: dict[str, Any],
+    compiled_request: dict[str, Any],
+    verification_prompt: str,
+) -> list[str]:
+    reasons: list[str] = []
+    candidate = str(candidate_code or "").strip()
+    if not candidate:
+        return ["The fix attempt returned empty code."]
+
+    if _code_signature(candidate) == _code_signature(original_code):
+        reasons.append("The fix attempt did not materially change the code.")
+
+    analysis = validate_lua_response(candidate)
+    if not analysis.get("valid"):
+        reasons.append(str(analysis.get("reason", "") or "The fix attempt does not look like a valid standalone Lua file."))
+
+    if failure_stage == "requirements":
+        alignment = inspect_lowcode_request_alignment(
+            verification_prompt,
+            candidate,
+            compiled_request=compiled_request if isinstance(compiled_request, dict) else None,
+        )
+        remaining = [
+            str(item).strip()
+            for item in alignment.get("missing_requirements", [])
+            if str(item).strip()
+        ]
+        previous = {
+            str(item).strip()
+            for item in verification.get("missing_requirements", [])
+            if str(item).strip()
+        }
+        repeated = [item for item in remaining if item in previous]
+        if repeated:
+            reasons.append(
+                "The fix still violates the same deterministic requirements: " + ", ".join(repeated)
+            )
+        elif remaining:
+            reasons.append(
+                "The fix still fails deterministic requirement checks: " + ", ".join(remaining)
+            )
+
+    if failure_stage == "validation" and diagnostics.get("run_error"):
+        runtime_hints = [
+            str(item).strip()
+            for item in diagnostics.get("runtime_fix_hints", [])
+            if str(item).strip()
+        ]
+        if runtime_hints and _code_signature(candidate) == _code_signature(original_code):
+            reasons.append("The fix did not address the runtime diagnostics or runtime fix hints.")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for reason in reasons:
+        if reason not in seen:
+            seen.add(reason)
+            deduped.append(reason)
+    return deduped
+
+
 def _build_generation_prompt(compiled_request: dict[str, Any], target_context: str = "") -> str:
     task = str(compiled_request.get("task_text", "") or "").strip()
     provided_context = str(compiled_request.get("raw_context", "") or "").strip()
     clarification_text = str(compiled_request.get("clarification_text", "") or "").strip()
-    compiled_summary = _format_compiled_request_summary(compiled_request)
+    prompt_context = _format_prompt_workflow_context(compiled_request)
     sections = [
         f"Task:\n{task}",
-        f"Target file:\n{target_context}" if target_context else "",
         f"Clarification from user:\n{clarification_text}" if clarification_text else "",
-        f"Normalized workflow context:\n{compiled_summary}" if compiled_summary else "",
+        f"Workflow anchor:\n{prompt_context}" if prompt_context else "",
         (
             "Provided workflow context:\n"
             f"{provided_context}"
         ) if provided_context else "",
         _PROMPT_STYLE_RULES,
-        _PUBLIC_SAMPLE_FEWSHOT,
-        _NEGATIVE_STYLE_FEWSHOT,
-        "Return ONLY the final Lua file in JsonString format lua{...}lua.",
+        _PROMPT_SYNTHESIS_GUIDANCE,
+        LOWCODE_RESPONSE_FORMAT_REQUIREMENT,
     ]
     return _join_prompt_sections(*sections)
 
@@ -360,7 +655,7 @@ def _build_refine_prompt(
     compiled_request: dict[str, Any],
 ) -> str:
     original_task, provided_context = split_task_and_context(base_prompt or user_input)
-    compiled_summary = _format_compiled_request_summary(compiled_request)
+    prompt_context = _format_prompt_workflow_context(compiled_request)
     clarification_text = str(compiled_request.get("clarification_text", "") or "").strip()
     sections = [
         f"Original task:\n{original_task or user_input.strip()}",
@@ -369,8 +664,7 @@ def _build_refine_prompt(
             f"{provided_context}"
         ) if provided_context else "",
         f"Change clarification:\n{clarification_text}" if clarification_text else "",
-        f"Normalized workflow context:\n{compiled_summary}" if compiled_summary else "",
-        f"Primary target file:\n{target_path}",
+        f"Workflow anchor:\n{prompt_context}" if prompt_context else "",
         (
             "Existing functions you must preserve unless the user explicitly removes them:\n"
             f"{function_list}"
@@ -378,9 +672,8 @@ def _build_refine_prompt(
         f"Current code:\n{code}",
         f"Change request:\n{user_input}",
         _PROMPT_STYLE_RULES,
-        _PUBLIC_SAMPLE_FEWSHOT,
-        _NEGATIVE_STYLE_FEWSHOT,
-        "Return ONLY the complete updated Lua file in JsonString format lua{...}lua.",
+        _PROMPT_SYNTHESIS_GUIDANCE,
+        LOWCODE_RESPONSE_FORMAT_REQUIREMENT,
     ]
     return _join_prompt_sections(*sections)
 
@@ -393,9 +686,9 @@ def _build_fix_prompt(
     failure_kind: str,
     run_error: str,
     run_output: str,
-    runtime_fix_hints: str,
+    runtime_fix_hints: object,
     verification_summary: str,
-    missing_requirements: str,
+    missing_requirements: object,
     expected_paths: str,
     actual_paths: str,
     anti_patterns: str,
@@ -403,8 +696,24 @@ def _build_fix_prompt(
     compiled_request: dict[str, Any],
 ) -> str:
     original_task, provided_context = split_task_and_context(base_prompt)
-    compiled_summary = _format_compiled_request_summary(compiled_request)
+    def _items(value: object) -> list[str]:
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        text = str(value or "").strip()
+        if not text or text.lower() == "none":
+            return []
+        return [text]
+
+    prompt_context = _format_prompt_workflow_context(compiled_request)
     clarification_text = str(compiled_request.get("clarification_text", "") or "").strip()
+    mandatory_fixes: list[str] = []
+    if str(run_error or "").strip():
+        mandatory_fixes.append(f"Resolve runtime/syntax failure: {run_error}")
+    mandatory_fixes.extend(_items(runtime_fix_hints))
+    mandatory_fixes.extend(_items(missing_requirements))
+    if not mandatory_fixes and failure_stage:
+        mandatory_fixes.append(f"Resolve the current {failure_stage} failure.")
+    mandatory_fixes = list(dict.fromkeys(mandatory_fixes))
     sections = [
         f"Original task:\n{original_task or base_prompt.strip()}",
         (
@@ -412,28 +721,15 @@ def _build_fix_prompt(
             f"{provided_context}"
         ) if provided_context else "",
         f"Clarification from user:\n{clarification_text}" if clarification_text else "",
-        f"Normalized workflow context:\n{compiled_summary}" if compiled_summary else "",
-        f"Primary target file:\n{target_path}",
-        (
-            "Failure diagnostics:\n"
-            f"- Current failure stage: {failure_stage}\n"
-            f"- Failure kind: {failure_kind}\n"
-            f"- Runtime error: {run_error}\n"
-            f"- Runtime output: {run_output}\n"
-            f"- Runtime fix hints: {runtime_fix_hints}\n"
-            f"- Verification summary: {verification_summary}\n"
-            f"- Missing requirements: {missing_requirements}\n"
-            f"- Expected workflow paths: {expected_paths}\n"
-            f"- Actual workflow paths in code: {actual_paths}\n"
-            f"- Detected anti-patterns: {anti_patterns}"
-        ),
-        f"Current code:\n{code}",
+        f"Workflow anchor:\n{prompt_context}" if prompt_context else "",
+        "Mandatory fixes:\n" + "\n".join(f"- {item}" for item in mandatory_fixes),
+        "Rewrite the script from scratch so it satisfies every mandatory fix. Do not reuse the previous broken response pattern.",
         _PROMPT_STYLE_RULES,
-        _PUBLIC_SAMPLE_FEWSHOT,
-        _NEGATIVE_STYLE_FEWSHOT,
+        _PROMPT_SYNTHESIS_GUIDANCE,
         "When runtime diagnostics mention argument types, nil accesses, bad calls, arithmetic/type mismatches, or concatenation issues, fix the root cause instead of reusing the same failing API call shape.",
-        "Fix the code so it follows the provided workflow context and passes validation + requirement checks.",
-        "Return ONLY the complete corrected Lua file in JsonString format lua{...}lua.",
+        "If the task is shape-sensitive, a `next(...)` check by itself is not enough to prove that a table is an array.",
+        "Return ONLY the complete corrected Lua file.",
+        LOWCODE_RESPONSE_FORMAT_REQUIREMENT,
     ]
     return _join_prompt_sections(*sections)
 
@@ -503,46 +799,82 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
 
     async def route_intent(state: PipelineState) -> dict:
         has_code = bool(state.get("current_code", "").strip())
-        has_pending_base_prompt = bool(state.get("base_prompt", "").strip()) and not has_code
+        features = _collect_intent_features(
+            user_input=state["user_input"],
+            has_existing_code=has_code,
+            base_prompt=state.get("base_prompt", ""),
+        )
+        message_code = str(features.get("message_code", "") or "").strip()
+        effective_has_code = bool(features.get("effective_has_code"))
         logger.info(
             f"[{_AGENT_ROUTE_INTENT}] started",
             user_input=state["user_input"][:80],
             has_existing_code=has_code,
+            has_message_code=bool(message_code),
+            effective_has_code=effective_has_code,
         )
-        prompt = _ROUTE_USER.format(
-            has_code=str(has_code).lower(),
-            user_input=state["user_input"],
-        )
+        deterministic_intent, deterministic_reason = _deterministic_intent_from_features(features)
 
-        logger.info(
-            f"[{_AGENT_ROUTE_INTENT}/llm.generate_json] calling",
-            prompt_len=len(prompt),
-        )
-        result = await llm.generate_json(prompt, system=_ROUTE_SYSTEM)
-        intent = result.get("intent", "create")
-        confidence = float(result.get("confidence", 0.5))
-        logger.info(
-            f"[{_AGENT_ROUTE_INTENT}/llm.generate_json] done",
-            raw_intent=intent,
-            confidence=confidence,
-        )
+        llm_intent = ""
+        confidence = 0.0
+        intent_source = "deterministic"
+        if deterministic_intent:
+            intent = deterministic_intent
+        else:
+            allowed_intents = ["create", "question", "general"]
+            if effective_has_code:
+                allowed_intents = ["create", "change", "inspect", "question", "general", "retry"]
 
-        if has_pending_base_prompt and state.get("base_prompt", "").strip() != state["user_input"].strip():
-            intent = "create"
+            prompt = _ROUTE_USER.format(
+                allowed_intents=", ".join(allowed_intents),
+                has_code=str(has_code).lower(),
+                has_message_code=str(bool(message_code)).lower(),
+                effective_has_code=str(effective_has_code).lower(),
+                user_input=state["user_input"],
+            )
 
-        if has_code and confidence < 0.5:
-            intent = "change"
+            logger.info(
+                f"[{_AGENT_ROUTE_INTENT}/llm.generate_json] calling",
+                prompt_len=len(prompt),
+                allowed_intents=allowed_intents,
+            )
+            result = await llm.generate_json(prompt, system=_ROUTE_SYSTEM)
+            llm_intent = str(result.get("intent", "") or "").strip()
+            confidence = float(result.get("confidence", 0.5))
+            logger.info(
+                f"[{_AGENT_ROUTE_INTENT}/llm.generate_json] done",
+                raw_intent=llm_intent,
+                confidence=confidence,
+            )
+
+            intent = llm_intent or "create"
+            intent_source = "llm"
 
         valid_intents = {"create", "change", "inspect", "question", "general", "retry"}
         if intent not in valid_intents:
-            intent = "change" if has_code else "create"
+            intent = "change" if effective_has_code else "create"
+            intent_source = "fallback_invalid"
+
+        if intent not in {"create", "question", "general"} and not effective_has_code:
+            intent = "create"
+            intent_source = "fallback_no_code"
+
+        updates: dict[str, Any] = {"intent": intent}
+        if message_code and intent in {"change", "inspect", "retry"} and not has_code:
+            updates["current_code"] = message_code
+            cleaned_message = str(features.get("cleaned_message", "") or "").strip()
+            if cleaned_message and not state.get("base_prompt", "").strip():
+                updates["base_prompt"] = cleaned_message
 
         logger.info(
             f"[{_AGENT_ROUTE_INTENT}] completed",
             intent=intent,
             confidence=confidence,
+            source=intent_source,
+            deterministic_reason=deterministic_reason or "none",
+            llm_intent=llm_intent or "n/a",
         )
-        return {"intent": intent}
+        return updates
 
     async def prepare_generation_context(state: PipelineState) -> dict:
         user_input = state.get("user_input", "")
@@ -579,7 +911,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             selected_operation=compiled_request.get("selected_operation", ""),
             selected_primary_path=compiled_request.get("selected_primary_path", ""),
             needs_clarification=compiled_request.get("needs_clarification", False),
-            deterministic=compiled_request.get("use_deterministic_fast_path", False),
+            generation_mode="model_driven",
         )
 
         if compiled_request.get("needs_clarification", False):
@@ -612,6 +944,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         user_input = state["user_input"]
         base_prompt = state.get("base_prompt", "") or user_input
         target_path = state.get("target_path", "")
+        compiled_request = state.get("compiled_request", {})
         target_directory = state.get("target_directory", state.get("workspace_root", ""))
         target_explicit = state.get("target_explicit", False)
         compiled_request = state.get("compiled_request", {})
@@ -631,47 +964,17 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 "target_explicit": target_explicit,
             }
         )
-        if isinstance(compiled_request, dict) and compiled_request.get("use_deterministic_fast_path"):
-            code = str(compiled_request.get("deterministic_code", "")).strip()
-            logger.info(
-                f"[{_AGENT_GENERATE_CODE}] deterministic fast-path",
-                selected_operation=compiled_request.get("selected_operation", ""),
-                selected_primary_path=compiled_request.get("selected_primary_path", ""),
-            )
-            return {
-                "generated_code": code,
-                "base_prompt": base_prompt,
-                "compiled_request": compiled_request,
-                "fix_iterations": 0,
-                "target_path": target_path,
-                "target_directory": target_directory,
-                "target_explicit": target_explicit,
-                "failure_stage": "",
-                "verification": {},
-                "verification_passed": False,
-                "e2e_suite": {},
-                "e2e_results": {"summary": "E2E-проверка временно отключена."},
-                "e2e_passed": False,
-                "save_success": False,
-                "save_skipped": False,
-                "save_skip_reason": "",
-                "save_error": "",
-                "saved_to": "",
-                "saved_jsonstring_to": "",
-                "explanation": {},
-                "suggested_changes": [],
-                "clarifying_questions": [],
-            }
-
         prompt = _build_generation_prompt(compiled_request, target_context=target_context)
+        generation_temperature = _generation_temperature(compiled_request if isinstance(compiled_request, dict) else {})
 
         logger.info(
             f"[{_AGENT_GENERATE_CODE}/llm.generate] calling",
             prompt_len=len(prompt),
             target_path=target_path,
+            temperature=generation_temperature,
         )
-        raw = await llm.generate(prompt=prompt, system=_GENERATE_SYSTEM)
-        analysis = validate_lua_response(raw)
+        raw = await llm.generate(prompt=prompt, system=_GENERATE_SYSTEM, temperature=generation_temperature)
+        analysis = validate_lowcode_llm_output(raw)
         code = analysis["normalized"]
         logger.info(
             f"[{_AGENT_GENERATE_CODE}/llm.generate] done",
@@ -688,25 +991,25 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             strict_prompt = (
                 f"{prompt}\n\n"
                 f"Previous response issue: {analysis['reason']}\n"
-                "Return ONLY the full Lua file in JsonString format lua{...}lua."
+                f"{LOWCODE_RESPONSE_FORMAT_REQUIREMENT}"
             )
-            strict_system = (
-                f"{_GENERATE_SYSTEM} "
-                "The first non-whitespace characters must start with lua{."
-            )
+            strict_system = _GENERATE_SYSTEM
             logger.info(
                 f"[{_AGENT_GENERATE_CODE}/llm.generate] retry calling",
-                temperature=0.05,
+                temperature=0.0,
             )
             raw_retry = await llm.generate(
                 prompt=strict_prompt,
                 system=strict_system,
-                temperature=0.05,
+                temperature=0.0,
             )
-            code = smart_normalize(raw_retry)
+            retry_analysis = validate_lowcode_llm_output(raw_retry)
+            code = retry_analysis["normalized"]
             logger.info(
                 f"[{_AGENT_GENERATE_CODE}/llm.generate] retry done",
                 code_len=len(code),
+                valid=retry_analysis["valid"],
+                reason=retry_analysis.get("reason", ""),
             )
 
         if not code:
@@ -781,18 +1084,23 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             code=existing,
             compiled_request=compiled_request if isinstance(compiled_request, dict) else {},
         )
+        refine_temperature = _generation_temperature(compiled_request if isinstance(compiled_request, dict) else {})
 
         logger.info(
             f"[{_AGENT_REFINE_CODE}/llm.generate] calling",
             prompt_len=len(prompt),
             target_path=target_path,
+            temperature=refine_temperature,
         )
-        raw = await llm.generate(prompt=prompt, system=_REFINE_SYSTEM)
-        code = smart_normalize(raw)
+        raw = await llm.generate(prompt=prompt, system=_REFINE_SYSTEM, temperature=refine_temperature)
+        analysis = validate_lowcode_llm_output(raw)
+        code = analysis["normalized"]
         logger.info(
             f"[{_AGENT_REFINE_CODE}/llm.generate] done",
             raw_len=len(raw),
             normalized_len=len(code),
+            valid=analysis["valid"],
+            reason=analysis.get("reason", ""),
         )
         if not code:
             code = existing
@@ -905,33 +1213,6 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             target_path=state.get("target_path", "(not set)"),
         )
 
-        if isinstance(compiled_request, dict) and compiled_request.get("use_deterministic_fast_path"):
-            fixed = str(compiled_request.get("deterministic_code", "")).strip() or code
-            logger.info(
-                f"[{_AGENT_FIX_CODE}] deterministic recovery",
-                selected_operation=compiled_request.get("selected_operation", ""),
-                selected_primary_path=compiled_request.get("selected_primary_path", ""),
-            )
-            return {
-                "generated_code": fixed,
-                "compiled_request": compiled_request,
-                "fix_iterations": fix_iter + 1,
-                "failure_stage": "",
-                "validation_passed": False,
-                "verification_passed": False,
-                "e2e_passed": False,
-                "e2e_results": {"summary": "E2E-проверка временно отключена."},
-                "save_success": False,
-                "save_skipped": False,
-                "save_skip_reason": "",
-                "save_error": "",
-                "saved_to": "",
-                "saved_jsonstring_to": "",
-                "explanation": {},
-                "suggested_changes": [],
-                "clarifying_questions": [],
-            }
-
         prompt = _build_fix_prompt(
             base_prompt=base_prompt,
             target_path=state.get("target_path", "(not set)"),
@@ -939,37 +1220,83 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             failure_kind=diagnostics.get("failure_kind", "unknown"),
             run_error=diagnostics.get("run_error", "none"),
             run_output=diagnostics.get("run_output", "none"),
-            runtime_fix_hints=_format_values_for_prompt(diagnostics.get("runtime_fix_hints", [])),
+            runtime_fix_hints=diagnostics.get("runtime_fix_hints", []),
             verification_summary=verification.get("summary", "none"),
-            missing_requirements=_format_values_for_prompt(verification.get("missing_requirements", [])),
+            missing_requirements=verification.get("missing_requirements", []),
             expected_paths=_format_values_for_prompt(verification.get("expected_workflow_paths", [])),
             actual_paths=_format_values_for_prompt(verification.get("actual_workflow_paths", [])),
             anti_patterns=_format_values_for_prompt(verification.get("anti_patterns", [])),
             code=code,
             compiled_request=compiled_request if isinstance(compiled_request, dict) else {},
         )
+        verification_prompt = (
+            str(compiled_request.get("verification_prompt", "")).strip()
+            if isinstance(compiled_request, dict)
+            else ""
+        ) or base_prompt
 
         messages = [
             {"role": "system", "content": _FIX_SYSTEM},
             {"role": "user", "content": f"Original task:\n{base_prompt}"},
-            {"role": "assistant", "content": code},
             {"role": "user", "content": prompt},
         ]
         logger.info(
             f"[{_AGENT_FIX_CODE}/llm.chat] calling",
-            temperature=0.05,
+            temperature=0.0,
             messages_count=len(messages),
             failure_stage=failure_stage,
         )
-        raw = await llm.chat(messages, temperature=0.05)
-        fixed = smart_normalize(raw)
+        raw = await llm.chat(messages, temperature=0.0)
+        fixed_analysis = validate_lowcode_llm_output(raw)
+        fixed = fixed_analysis["normalized"]
         logger.info(
             f"[{_AGENT_FIX_CODE}/llm.chat] done",
             raw_len=len(raw),
             fixed_len=len(fixed),
+            valid=fixed_analysis["valid"],
+            reason=fixed_analysis.get("reason", ""),
         )
         if not fixed:
             fixed = code
+
+        retry_reasons = _assess_fix_candidate(
+            original_code=code,
+            candidate_code=fixed,
+            failure_stage=failure_stage,
+            diagnostics=diagnostics if isinstance(diagnostics, dict) else {},
+            verification=verification if isinstance(verification, dict) else {},
+            compiled_request=compiled_request if isinstance(compiled_request, dict) else {},
+            verification_prompt=verification_prompt,
+        )
+        if retry_reasons:
+            retry_prompt = _join_prompt_sections(
+                prompt,
+                "The previous fix attempt is still not acceptable for these reasons:",
+                "\n".join(f"- {reason}" for reason in retry_reasons),
+                "Return a materially different complete Lua script that explicitly resolves every listed issue.",
+            )
+            retry_messages = [
+                {"role": "system", "content": _FIX_SYSTEM},
+                {"role": "user", "content": f"Original task:\n{base_prompt}"},
+                {"role": "user", "content": retry_prompt},
+            ]
+            logger.info(
+                f"[{_AGENT_FIX_CODE}/llm.chat] retry calling",
+                temperature=0.0,
+                retry_reason_count=len(retry_reasons),
+            )
+            retry_raw = await llm.chat(retry_messages, temperature=0.0)
+            retry_analysis = validate_lowcode_llm_output(retry_raw)
+            retry_fixed = retry_analysis["normalized"]
+            logger.info(
+                f"[{_AGENT_FIX_CODE}/llm.chat] retry done",
+                raw_len=len(retry_raw),
+                fixed_len=len(retry_fixed),
+                valid=retry_analysis["valid"],
+                reason=retry_analysis.get("reason", ""),
+            )
+            if retry_fixed:
+                fixed = retry_fixed
 
         logger.info(
             f"[{_AGENT_FIX_CODE}] completed",
@@ -1030,6 +1357,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 prompt=verification_prompt,
                 code=code,
                 run_output=diagnostics.get("run_output", ""),
+                deterministic_context=deterministic,
             )
             logger.info(
                 f"[{_AGENT_VERIFY_REQUIREMENTS}/async_verify_requirements] done",
@@ -1052,7 +1380,18 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 "error": True,
             }
 
-        llm_passed = bool(verification.get("passed")) or int(verification.get("score", 0) or 0) >= 70
+        verification_checks = verification.get("checks", {}) if isinstance(verification, dict) else {}
+        failed_checks = [
+            name
+            for name, payload in verification_checks.items()
+            if isinstance(payload, dict) and payload.get("status") == "fail"
+        ]
+        unclear_checks = [
+            name
+            for name, payload in verification_checks.items()
+            if isinstance(payload, dict) and payload.get("status") == "unclear"
+        ]
+        llm_passed = (bool(verification.get("passed")) or int(verification.get("score", 0) or 0) >= 70) and not failed_checks and not unclear_checks
         combined_missing = [
             *deterministic.get("missing_requirements", []),
             *[
@@ -1069,6 +1408,20 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 if item not in deterministic.get("warnings", [])
             ],
         ]
+        for check_name in failed_checks:
+            reason = str(verification_checks.get(check_name, {}).get("reason", "")).strip()
+            message = f"Verification checklist failed: {check_name}"
+            if reason:
+                message = f"{message} — {reason}"
+            if message not in combined_missing:
+                combined_missing.append(message)
+        for check_name in unclear_checks:
+            reason = str(verification_checks.get(check_name, {}).get("reason", "")).strip()
+            message = f"Verification checklist is unclear: {check_name}"
+            if reason:
+                message = f"{message} — {reason}"
+            if message not in combined_warnings:
+                combined_warnings.append(message)
         llm_summary = str(verification.get("summary", "")).strip()
         deterministic_summary = str(deterministic.get("summary", "")).strip()
         compiled_request_summary = ""
@@ -1080,13 +1433,23 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 f"selected_path={compiled_request.get('selected_primary_path', 'none') or 'none'}, "
                 f"needs_clarification={bool(compiled_request.get('needs_clarification', False))}"
             )
+        llm_conflict = False
         if verification.get("error"):
             summary_parts = [compiled_request_summary, deterministic_summary]
             if llm_summary:
                 summary_parts.append(llm_summary)
         else:
-            summary_parts = [part for part in (compiled_request_summary, deterministic_summary, llm_summary) if part]
+            llm_conflict = not deterministic.get("passed", False) and llm_passed
+            summary_parts = [part for part in (compiled_request_summary, deterministic_summary) if part]
+            if llm_conflict:
+                summary_parts.append("LLM verifier disagreed with deterministic checks and was overruled.")
+            elif llm_summary:
+                summary_parts.append(llm_summary)
         combined_summary = " ".join(part for part in summary_parts if part).strip()
+        if llm_conflict:
+            conflict_warning = "llm_verifier_conflict_with_deterministic_checks"
+            if conflict_warning not in combined_warnings:
+                combined_warnings.append(conflict_warning)
 
         passed = deterministic.get("passed", False) and (llm_passed or verification.get("error"))
         verification = {
@@ -1099,6 +1462,8 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             "actual_workflow_paths": deterministic.get("actual_workflow_paths", []),
             "anti_patterns": deterministic.get("anti_patterns", []),
             "deterministic_summary": deterministic_summary,
+            "deterministic_passed": deterministic.get("passed", False),
+            "llm_verifier_conflict": llm_conflict,
             "selected_operation": compiled_request.get("selected_operation", "") if isinstance(compiled_request, dict) else "",
             "selected_primary_path": compiled_request.get("selected_primary_path", "") if isinstance(compiled_request, dict) else "",
             "needs_clarification": compiled_request.get("needs_clarification", False) if isinstance(compiled_request, dict) else False,
@@ -1134,6 +1499,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
     async def save_code(state: PipelineState) -> dict:
         code = state.get("generated_code", "")
         target_path = state.get("target_path", "")
+        compiled_request = state.get("compiled_request", {})
 
         logger.info(
             f"[{_AGENT_SAVE_CODE}] started",
@@ -1172,7 +1538,11 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             saved = save_final_output(
                 target_path,
                 code,
-                jsonstring_code=format_lowcode_jsonstring(code),
+                jsonstring_code=format_lowcode_json_payload(
+                    code,
+                    compiled_request=compiled_request if isinstance(compiled_request, dict) else None,
+                    target_path=target_path,
+                ),
             )
             logger.info(
                 f"[{_AGENT_SAVE_CODE}/save_final_output] done",
@@ -1323,6 +1693,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         code = state.get("generated_code", "")
         diagnostics = state.get("diagnostics", {})
         verification = state.get("verification", {})
+        compiled_request = state.get("compiled_request", {})
         saved_to = state.get("saved_to", "")
         saved_jsonstring_to = state.get("saved_jsonstring_to", "")
         save_skipped = state.get("save_skipped", False)
@@ -1374,7 +1745,11 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         elif save_error:
             lines.append(f"Сохранение не удалось: {save_error}\n")
 
-        lines.append(f"```text\n{format_lowcode_jsonstring(code)}\n```")
+        lines.append(
+            "```json\n"
+            f"{format_lowcode_json_payload(code, compiled_request=compiled_request if isinstance(compiled_request, dict) else None, target_path=saved_to or state.get('target_path', ''))}\n"
+            "```"
+        )
 
         run_output = diagnostics.get("run_output", "").strip()
         if run_output:
