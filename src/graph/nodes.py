@@ -167,6 +167,21 @@ for _, obj in ipairs(wf.vars.json.IDOC.ZCDF_HEAD.ZCDF_PACKAGES) do
 end
 
 return wf.vars.json.IDOC.ZCDF_HEAD.ZCDF_PACKAGES
+}lua
+
+Example 5
+Task: Remove keys ID, ENTITY_ID, CALL from each object in wf.vars.RESTbody.result.
+Good output:
+lua{
+local result = wf.vars.RESTbody.result
+for _, item in ipairs(result) do
+    if type(item) == "table" then
+        item.ID = nil
+        item.ENTITY_ID = nil
+        item.CALL = nil
+    end
+end
+return result
 }lua"""
 _PROMPT_STYLE_RULES = """Hard rules:
 - Use the exact wf.vars / wf.initVariables paths from the task or provided workflow context.
@@ -174,6 +189,7 @@ _PROMPT_STYLE_RULES = """Hard rules:
 - Do not build an app, service, API, menu, tutorial, or CLI wrapper.
 - Do not use print(), io.write(), io.read(), or console prompts.
 - Simple extraction/computation tasks should usually be 1-3 lines with a direct return.
+- If the task asks to remove/clear/filter keys inside workflow objects, transform those objects before return; do not return the source path unchanged.
 - If the task explicitly asks to save/update wf.vars, keep the script minimal and still use the exact workflow paths."""
 _NEGATIVE_STYLE_FEWSHOT = """Bad style example:
 
@@ -234,6 +250,20 @@ def _format_compiled_request_summary(compiled_request: dict[str, Any]) -> str:
     lines.append(f"- selected operation: {operation}")
     lines.append(f"- selected primary path: {selected_path}")
     lines.append(f"- confidence: {confidence:.2f}")
+    requested_item_keys = [
+        str(key).strip()
+        for key in compiled_request.get("requested_item_keys", [])
+        if str(key).strip()
+    ]
+    if requested_item_keys:
+        lines.append(f"- requested item keys: {', '.join(requested_item_keys)}")
+    inferred_explicit_paths = [
+        str(path).strip()
+        for path in compiled_request.get("inferred_explicit_paths", [])
+        if str(path).strip()
+    ]
+    if inferred_explicit_paths:
+        lines.append(f"- inferred explicit paths: {', '.join(inferred_explicit_paths)}")
 
     inventory = compiled_request.get("workflow_path_inventory", [])
     if isinstance(inventory, list) and inventory:
@@ -363,6 +393,7 @@ def _build_fix_prompt(
     failure_kind: str,
     run_error: str,
     run_output: str,
+    runtime_fix_hints: str,
     verification_summary: str,
     missing_requirements: str,
     expected_paths: str,
@@ -389,6 +420,7 @@ def _build_fix_prompt(
             f"- Failure kind: {failure_kind}\n"
             f"- Runtime error: {run_error}\n"
             f"- Runtime output: {run_output}\n"
+            f"- Runtime fix hints: {runtime_fix_hints}\n"
             f"- Verification summary: {verification_summary}\n"
             f"- Missing requirements: {missing_requirements}\n"
             f"- Expected workflow paths: {expected_paths}\n"
@@ -399,6 +431,7 @@ def _build_fix_prompt(
         _PROMPT_STYLE_RULES,
         _PUBLIC_SAMPLE_FEWSHOT,
         _NEGATIVE_STYLE_FEWSHOT,
+        "When runtime diagnostics mention argument types, nil accesses, bad calls, arithmetic/type mismatches, or concatenation issues, fix the root cause instead of reusing the same failing API call shape.",
         "Fix the code so it follows the provided workflow context and passes validation + requirement checks.",
         "Return ONLY the complete corrected Lua file in JsonString format lua{...}lua.",
     ]
@@ -561,6 +594,8 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 "verification": {},
                 "verification_passed": False,
                 "save_success": False,
+                "save_skipped": False,
+                "save_skip_reason": "",
                 "save_error": "",
             }
 
@@ -587,25 +622,6 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             base_prompt_len=len(base_prompt),
             target_path=target_path,
         )
-
-        if not target_path:
-            logger.info(
-                f"[{_AGENT_GENERATE_CODE}/resolve_lua_target] calling (fallback)",
-                workspace_root=state.get("workspace_root", ""),
-                allow_fallback=True,
-            )
-            fallback = resolve_lua_target(
-                user_input,
-                workspace_root=state.get("workspace_root", ""),
-                allow_fallback=True,
-            )
-            target_path = fallback["target_path"]
-            target_directory = fallback["target_directory"]
-            target_explicit = fallback["target_explicit"]
-            logger.info(
-                f"[{_AGENT_GENERATE_CODE}/resolve_lua_target] done",
-                target_path=target_path,
-            )
 
         target_context = _target_context(
             {
@@ -637,6 +653,8 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 "e2e_results": {"summary": "E2E-проверка временно отключена."},
                 "e2e_passed": False,
                 "save_success": False,
+                "save_skipped": False,
+                "save_skip_reason": "",
                 "save_error": "",
                 "saved_to": "",
                 "saved_jsonstring_to": "",
@@ -714,6 +732,8 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             "e2e_results": {"summary": "E2E-проверка временно отключена."},
             "e2e_passed": False,
             "save_success": False,
+            "save_skipped": False,
+            "save_skip_reason": "",
             "save_error": "",
             "saved_to": "",
             "saved_jsonstring_to": "",
@@ -811,6 +831,8 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             "e2e_results": {"summary": "E2E-проверка временно отключена."},
             "e2e_passed": False,
             "save_success": False,
+            "save_skipped": False,
+            "save_skip_reason": "",
             "save_error": "",
             "saved_to": "",
             "saved_jsonstring_to": "",
@@ -900,6 +922,8 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 "e2e_passed": False,
                 "e2e_results": {"summary": "E2E-проверка временно отключена."},
                 "save_success": False,
+                "save_skipped": False,
+                "save_skip_reason": "",
                 "save_error": "",
                 "saved_to": "",
                 "saved_jsonstring_to": "",
@@ -915,6 +939,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             failure_kind=diagnostics.get("failure_kind", "unknown"),
             run_error=diagnostics.get("run_error", "none"),
             run_output=diagnostics.get("run_output", "none"),
+            runtime_fix_hints=_format_values_for_prompt(diagnostics.get("runtime_fix_hints", [])),
             verification_summary=verification.get("summary", "none"),
             missing_requirements=_format_values_for_prompt(verification.get("missing_requirements", [])),
             expected_paths=_format_values_for_prompt(verification.get("expected_workflow_paths", [])),
@@ -961,6 +986,8 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             "e2e_passed": False,
             "e2e_results": {"summary": "E2E-проверка временно отключена."},
             "save_success": False,
+            "save_skipped": False,
+            "save_skip_reason": "",
             "save_error": "",
             "saved_to": "",
             "saved_jsonstring_to": "",
@@ -1118,15 +1145,20 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             logger.warning(f"[{_AGENT_SAVE_CODE}] code is empty — cannot save")
             return {
                 "save_success": False,
+                "save_skipped": False,
+                "save_skip_reason": "",
                 "save_error": "Empty code cannot be saved.",
                 "saved_to": "",
                 "saved_jsonstring_to": "",
             }
         if not target_path:
-            logger.warning(f"[{_AGENT_SAVE_CODE}] target_path is not set — cannot save")
+            logger.info(f"[{_AGENT_SAVE_CODE}] target_path is not set — skipping save")
             return {
+                "current_code": code,
                 "save_success": False,
-                "save_error": "Target path is not set.",
+                "save_skipped": True,
+                "save_skip_reason": "Путь не указан в чате, поэтому код показан только в ответе и не сохранен в файл.",
+                "save_error": "",
                 "saved_to": "",
                 "saved_jsonstring_to": "",
             }
@@ -1156,6 +1188,8 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             return {
                 "current_code": code,
                 "save_success": False,
+                "save_skipped": False,
+                "save_skip_reason": "",
                 "save_error": str(exc),
                 "saved_to": "",
                 "saved_jsonstring_to": "",
@@ -1169,6 +1203,8 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         return {
             "current_code": code,
             "save_success": True,
+            "save_skipped": False,
+            "save_skip_reason": "",
             "save_error": "",
             "saved_to": saved.get("lua_path", target_path),
             "saved_jsonstring_to": saved.get("jsonstring_path", ""),
@@ -1289,6 +1325,8 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         verification = state.get("verification", {})
         saved_to = state.get("saved_to", "")
         saved_jsonstring_to = state.get("saved_jsonstring_to", "")
+        save_skipped = state.get("save_skipped", False)
+        save_skip_reason = state.get("save_skip_reason", "")
         save_error = state.get("save_error", "")
         explanation = state.get("explanation", {})
         suggested_changes = state.get("suggested_changes", [])
@@ -1314,6 +1352,9 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         lines: list[str] = []
         if state.get("save_success", False):
             lines.append("Код сгенерирован, прошел проверки и сохранен.\n")
+        elif save_skipped:
+            lines.append("Код сгенерирован и прошел проверки.\n")
+            lines.append(f"{save_skip_reason or 'Путь не указан, поэтому файл не сохранялся.'}\n")
         else:
             lines.append("Код подготовлен, но финальные условия сохранения не выполнены.\n")
             if failure_stage:

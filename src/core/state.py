@@ -42,6 +42,8 @@ class PipelineState(TypedDict):
     e2e_results: dict[str, Any]
     e2e_passed: bool
     save_success: bool
+    save_skipped: bool
+    save_skip_reason: str
     save_error: str
     saved_to: str
     saved_jsonstring_to: str

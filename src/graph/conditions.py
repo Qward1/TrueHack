@@ -26,7 +26,8 @@ def route_after_preparation(state: PipelineState) -> str:
         return "clarify"
 
     intent = state.get("intent", "")
-    if intent in ("change", "retry"):
+    has_existing_code = bool(str(state.get("current_code", "") or "").strip())
+    if intent in ("change", "retry") and has_existing_code:
         return "refine"
     return "generate"
 

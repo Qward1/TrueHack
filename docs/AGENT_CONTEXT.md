@@ -23,18 +23,22 @@
   - explicit `.lua` path;
   - директория -> slug-папка + slug.lua;
   - active target текущего чата;
-  - fallback target для нового create turn без пути.
   - невалидные Windows-сегменты пути санитизируются до сохранения.
 - `generate_code` / `refine_code` возвращают полный Lua-файл.
 - `validate_code` запускает локальную диагностику через `lua` в temporary LowCode harness:
   - создаёт mock `wf.vars` / `wf.initVariables`;
   - добавляет `_utils.array.*` stubs;
-  - строит nested mock paths для найденных `wf.vars.*` / `wf.initVariables.*`, включая alias-derived field access.
+  - строит nested mock paths для найденных `wf.vars.*` / `wf.initVariables.*`, включая alias-derived field access;
+  - извлекает общие runtime repair hints из типовых Lua ошибок для следующего fix-шага.
 - `fix_code` выполняет итеративные правки по стадии ошибки:
   - validation;
   - requirements;
 - `verify_requirements` — семантическая LLM-проверка соответствия исходному запросу.
+- Для задач cleanup/remove/filter по ключам в workflow object/array deterministic guard требует реальную трансформацию данных, а не простой `return` исходного пути.
+- Если в тексте задачи указан bare field name без полного `wf.vars.*` / `wf.initVariables.*`, compiler пытается однозначно разрешить его через parseable workflow context и добавить в expected workflow paths.
+- Если intent классифицирован как `change`, но текущий код отсутствует, pipeline идёт в `generate_code`, а не в `refine_code`.
 - `save_code` выполняется только после успешной локальной валидации и проверки требований.
+- если новый чат не содержит явного path и active target ещё не выбран, `save_code` не пишет файл и помечает save как intentionally skipped.
 - `save_code` сохраняет два артефакта:
   - чистый `.lua` файл в canonical target path;
   - sidecar `*.jsonstring.txt` с представлением `lua{...}lua` рядом с ним.

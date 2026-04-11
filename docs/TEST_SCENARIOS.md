@@ -10,9 +10,9 @@
 `resolve_target -> route_intent(create) -> generate -> validate -> verify -> save -> explain_solution -> respond`
 
 ### Pass criteria
-- fallback target создан в workspace
-- код сохранен на диск как `.lua`
-- рядом создан JsonString sidecar `*.jsonstring.txt`
+- новый file target не создается
+- код не сохраняется на диск
+- pipeline не возвращает save-error только из-за отсутствия path
 - в ответе есть код в формате `lua{ ... }lua`, explanation и предложения улучшений
 - код следует LowCode contract: direct access, `wf.vars`, `wf.initVariables`
 
@@ -166,7 +166,21 @@ return emails[#emails]
 - pipeline enters `fix_code` instead of saving immediately;
 - the corrected result switches to direct `wf.vars` usage before save.
 
-## 13. Explicit workflow path mismatch blocks save
+## 13. Remove-key task rejects plain direct return
+### Prompt
+`Для полученных данных из предыдущего REST запроса очисти значения переменных ID, ENTITY_ID, CALL.` plus pasted workflow context with `wf.vars.RESTbody.result`.
+
+### Bad output example
+```lua
+return wf.vars.RESTbody.result
+```
+
+### Pass criteria
+- deterministic verification does not accept the code just because the path is correct;
+- pipeline enters `fix_code` instead of saving immediately;
+- corrected code explicitly transforms object items before return and references the requested keys.
+
+## 14. Explicit workflow path mismatch blocks save
 ### Prompt
 `Use wf.initVariables.recallTime and return the converted value.`
 
@@ -180,7 +194,7 @@ return recallTime
 - deterministic verification lists `wf.initVariables.recallTime` as a missing direct workflow path;
 - save does not happen until the script uses the expected workflow path directly.
 
-## 14. Deterministic fast-path for array count
+## 15. Deterministic fast-path for array count
 ### Prompt
 `Посчитай количество товаров в корзине.` plus pasted workflow context with `wf.vars.cart.items`.
 
@@ -189,7 +203,7 @@ return recallTime
 - generated code is exactly `return #wf.vars.cart.items`;
 - validate -> verify -> save still run normally after deterministic compilation.
 
-## 15. Deterministic fast-path for last element
+## 16. Deterministic fast-path for last element
 ### Prompt
 `Return the last email from the provided workflow context.` plus pasted workflow context with `wf.vars.emails`.
 
@@ -197,7 +211,7 @@ return recallTime
 - pipeline does not call main LLM generation;
 - generated code is exactly `return wf.vars.emails[#wf.vars.emails]`.
 
-## 16. Ambiguous path selection asks before generation
+## 17. Ambiguous path selection asks before generation
 ### Prompt
 `Посчитай количество товаров.` plus pasted workflow context containing both `wf.vars.cart.items` and `wf.vars.wishlist.items`.
 
@@ -206,3 +220,36 @@ return recallTime
 - save is not attempted;
 - clarification text contains both candidate workflow paths;
 - after the user answers with an explicit workflow path, the pipeline reuses the original base prompt/context and continues from the same chat.
+
+## 18. Change intent without existing code routes to generate
+### Prompt
+`Улучши обработку email и верни последний email из workflow context.` plus pasted workflow context with `wf.vars.emails`, but no current code in chat/file.
+
+### Pass criteria
+- intent may still be `change`;
+- pipeline does not enter `refine_code` just because of that intent;
+- request goes directly through generate -> validate -> verify -> save without fallback warning.
+
+## 19. Bare field name resolves to a unique workflow path
+### Prompt
+`Конвертируй время в переменной recallTime в unix-формат.` plus pasted workflow context with `wf.initVariables.recallTime`.
+
+### Bad output example
+```lua
+return wf.vars.RESTbody.result
+```
+
+### Pass criteria
+- compiler infers `wf.initVariables.recallTime` as the expected workflow path even though the prompt does not contain the full path;
+- deterministic verification rejects code that uses a different workflow path;
+- pipeline enters `fix_code` instead of saving the wrong script.
+
+## 20. Runtime bad-argument diagnostics produce generic repair hints
+### Prompt
+Any workflow task where generated code triggers a Lua runtime error like `bad argument #1 to 'time' (table expected, got string)`.
+
+### Pass criteria
+- validation returns failure with `failure_kind=runtime`;
+- diagnostics contain normalized fix hints about expected argument type and required conversion/validation;
+- `fix_code` prompt includes these hints together with raw runtime error;
+- corrected code passes validation and save gate without hardcoding to one specific stdlib function.

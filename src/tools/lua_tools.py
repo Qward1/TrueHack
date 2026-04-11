@@ -148,6 +148,7 @@ SEMANTIC_STEM_GROUPS: dict[str, tuple[str, ...]] = {
     "string": ("string", "text", "строк", "текст"),
     "name": ("name", "title", "назв", "имя"),
     "total": ("total", "sum", "итог", "сумм"),
+    "remove_keys": ("remove", "delete", "drop", "clear", "clean", "очист", "удал", "убери", "выкин"),
 }
 SIMPLE_OPERATION_ALLOWED_TYPES: dict[str, set[str]] = {
     "count": {"array_scalar", "array_object"},
@@ -171,9 +172,18 @@ LOWCODE_CONSOLE_INPUT_PATTERNS = (
 )
 LOWCODE_CONSOLE_OUTPUT_PATTERNS = ()
 _DELETE_KEYWORDS = (
-    "remove", "delete", "drop",
-    "убери", "удали", "удалить", "уберите", "выкинь",
+    "remove", "delete", "drop", "clear", "clean",
+    "убери", "удали", "удалить", "уберите", "выкинь", "очисти", "очистить", "очистка",
 )
+LUA_BAD_ARGUMENT_RE = re.compile(
+    r"bad argument #(?P<arg>\d+) to ['`](?P<func>[^'`]+)['`] \((?P<expected>[^)]+?) expected, got (?P<got>[^)]+?)\)",
+    re.IGNORECASE,
+)
+LUA_ATTEMPT_INDEX_NIL_RE = re.compile(r"attempt to index a nil value", re.IGNORECASE)
+LUA_ATTEMPT_CALL_NIL_RE = re.compile(r"attempt to call a nil value", re.IGNORECASE)
+LUA_ATTEMPT_ARITHMETIC_RE = re.compile(r"attempt to perform arithmetic on a (?P<got>[^ ]+) value", re.IGNORECASE)
+LUA_ATTEMPT_COMPARE_RE = re.compile(r"attempt to compare (?P<left>[^ ]+) with (?P<right>[^ ]+)", re.IGNORECASE)
+LUA_ATTEMPT_CONCAT_RE = re.compile(r"attempt to concatenate a (?P<got>[^ ]+) value", re.IGNORECASE)
 
 
 def merge_process_output(stdout: str, stderr: str) -> str:
@@ -317,6 +327,70 @@ def classify_failure_kind(diagnostics: dict[str, Any]) -> str:
     if diagnostics.get("run_error"):
         return "runtime"
     return "unknown"
+
+
+def infer_runtime_fix_hints(run_error: str) -> list[str]:
+    """Extract general-purpose repair hints from common Lua runtime errors."""
+    text = str(run_error or "").strip()
+    if not text:
+        return []
+
+    hints: list[str] = []
+
+    bad_argument_match = LUA_BAD_ARGUMENT_RE.search(text)
+    if bad_argument_match:
+        func_name = bad_argument_match.group("func")
+        arg_index = bad_argument_match.group("arg")
+        expected = bad_argument_match.group("expected")
+        got = bad_argument_match.group("got")
+        hints.append(
+            f"Function `{func_name}` expects argument #{arg_index} of type `{expected}`, but the code passes `{got}`."
+        )
+        hints.append(
+            f"Before calling `{func_name}`, validate or convert the workflow value to the expected `{expected}` type instead of passing it through unchanged."
+        )
+
+    if LUA_ATTEMPT_INDEX_NIL_RE.search(text):
+        hints.append(
+            "A field/table access hit nil. Guard missing workflow fields before indexing them."
+        )
+    if LUA_ATTEMPT_CALL_NIL_RE.search(text):
+        hints.append(
+            "The code tries to call a nil value. Check that the function exists and was not overwritten by a variable."
+        )
+
+    arithmetic_match = LUA_ATTEMPT_ARITHMETIC_RE.search(text)
+    if arithmetic_match:
+        got = arithmetic_match.group("got")
+        hints.append(
+            f"Arithmetic is applied to `{got}`. Convert inputs with `tonumber(...)` or guard nil/non-numeric values before the operation."
+        )
+
+    compare_match = LUA_ATTEMPT_COMPARE_RE.search(text)
+    if compare_match:
+        left = compare_match.group("left")
+        right = compare_match.group("right")
+        hints.append(
+            f"Comparison uses incompatible values (`{left}` vs `{right}`). Normalize types before comparing."
+        )
+
+    concat_match = LUA_ATTEMPT_CONCAT_RE.search(text)
+    if concat_match:
+        got = concat_match.group("got")
+        hints.append(
+            f"String concatenation uses `{got}`. Convert values with `tostring(...)` or guard nil before concatenation."
+        )
+
+    if "stack overflow" in text.lower():
+        hints.append("The script recurses indefinitely or grows the call stack without a stop condition.")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for hint in hints:
+        if hint not in seen:
+            seen.add(hint)
+            deduped.append(hint)
+    return deduped
 
 
 def build_mock_init_value(name: str) -> str:
@@ -581,11 +655,67 @@ def _entry_semantic_tokens(entry: dict[str, Any]) -> dict[str, set[str]]:
     }
 
 
+def extract_requested_item_keys(task_text: str, available_keys: list[str]) -> list[str]:
+    """Infer object keys explicitly mentioned by the user from known available keys."""
+    if not available_keys:
+        return []
+
+    normalized_text = str(task_text or "")
+    task_tokens = {token.lower() for token in _extract_task_tokens(normalized_text)}
+    requested: list[str] = []
+    seen: set[str] = set()
+
+    for key in available_keys:
+        key_text = str(key).strip()
+        if not key_text:
+            continue
+        key_lower = key_text.lower()
+        key_tokens = {token.lower() for token in _extract_task_tokens(key_text)}
+        if key_lower in normalized_text.lower() or (key_tokens and key_tokens.issubset(task_tokens)):
+            if key_text not in seen:
+                seen.add(key_text)
+                requested.append(key_text)
+    return requested
+
+
+def infer_explicit_paths_from_bare_field_names(task_text: str, inventory: list[dict[str, Any]]) -> list[str]:
+    """Map uniquely mentioned bare field names from the task to workflow paths."""
+    if not inventory:
+        return []
+
+    task_tokens = {token.lower() for token in _extract_task_tokens(task_text)}
+    if not task_tokens:
+        return []
+
+    field_to_paths: dict[str, set[str]] = {}
+    for entry in inventory:
+        path = str(entry.get("path", "")).strip()
+        segments = [str(segment).strip() for segment in entry.get("segments", []) if str(segment).strip()]
+        if not path or not segments:
+            continue
+        leaf = segments[-1].lower()
+        field_to_paths.setdefault(leaf, set()).add(path)
+
+    inferred: list[str] = []
+    seen_paths: set[str] = set()
+    for token in sorted(task_tokens):
+        matches = field_to_paths.get(token, set())
+        if len(matches) != 1:
+            continue
+        path = next(iter(matches))
+        if path not in seen_paths:
+            seen_paths.add(path)
+            inferred.append(path)
+    return inferred
+
+
 def detect_lowcode_operation(task_text: str) -> dict[str, Any]:
     """Detect the dominant simple operation requested by the user."""
     tokens = _canonicalize_tokens(_extract_task_tokens(task_text))
     numbers = [int(match) for match in re.findall(r"\b\d+\b", str(task_text or ""))]
 
+    if "remove_keys" in tokens:
+        return {"operation": "remove_keys", "argument": None}
     if "increment" in tokens:
         return {"operation": "increment", "argument": numbers[0] if numbers else 1}
     if "decrement" in tokens:
@@ -657,6 +787,12 @@ def rank_workflow_paths(
             if operation == "string_length" and not _path_looks_string(entry):
                 score -= 6
 
+        if operation == "remove_keys":
+            if path_type not in {"object", "array_object"}:
+                continue
+            if item_overlap or child_overlap:
+                score += 10
+
         if operation == "return" and path_type == "scalar":
             score += 4
         if operation == "count" and path.endswith(".items"):
@@ -681,6 +817,8 @@ def compile_deterministic_lowcode_script(
     selected_primary_path: str,
     operation_argument: Any = None,
     selected_save_path: str = "",
+    selected_primary_type: str = "",
+    requested_item_keys: list[str] | None = None,
 ) -> str:
     """Compile a simple single-target data task into a minimal workflow script."""
     expr = ""
@@ -700,6 +838,33 @@ def compile_deterministic_lowcode_script(
         expr = f"({selected_primary_path} or 0) - {delta}"
     elif selected_operation == "string_length":
         expr = f"string.len({selected_primary_path} or \"\")"
+    elif selected_operation == "remove_keys":
+        keys = [str(key).strip() for key in (requested_item_keys or []) if str(key).strip()]
+        if not keys:
+            return ""
+        if selected_primary_type == "object":
+            lines = [f"local result = {selected_primary_path}"]
+            for key in keys:
+                lines.append(f"result[{json.dumps(key)}] = nil")
+            lines.append("return result")
+            return "\n".join(lines)
+        if selected_primary_type == "array_object":
+            lines = [
+                f"local result = {selected_primary_path}",
+                "for _, item in ipairs(result) do",
+                '    if type(item) == "table" then',
+            ]
+            for key in keys:
+                lines.append(f"        item[{json.dumps(key)}] = nil")
+            lines.extend(
+                [
+                    "    end",
+                    "end",
+                    "return result",
+                ]
+            )
+            return "\n".join(lines)
+        return ""
     else:
         return ""
 
@@ -723,11 +888,15 @@ def compile_lowcode_request(
     merged_text = "\n".join(part for part in (task_text.strip(), clarification_text.strip()) if part.strip())
     operation_info = detect_lowcode_operation(merged_text)
     operation = str(operation_info.get("operation", "llm"))
-    explicit_paths = flatten_lowcode_paths(extract_workflow_paths_from_text(merged_text))
+    explicit_paths_raw = flatten_lowcode_paths(extract_workflow_paths_from_text(merged_text))
+    inferred_explicit_paths = infer_explicit_paths_from_bare_field_names(merged_text, inventory)
+    explicit_paths = list(dict.fromkeys([*explicit_paths_raw, *inferred_explicit_paths]))
     ranked_candidates = rank_workflow_paths(merged_text, inventory, operation, explicit_paths)
 
     selected_primary_path = ""
     selected_save_path = ""
+    selected_primary_type = ""
+    requested_item_keys: list[str] = []
     needs_clarification = False
     clarification_candidates = ranked_candidates[:3]
     confidence = 0.0
@@ -749,6 +918,19 @@ def compile_lowcode_request(
             needs_clarification = operation in SIMPLE_OPERATION_ALLOWED_TYPES and parsed_context["has_parseable_context"]
         else:
             selected_primary_path = str(top["path"])
+            selected_primary_type = str(top.get("type", "") or "")
+
+    if selected_primary_path:
+        selected_entry = next((entry for entry in inventory if entry.get("path") == selected_primary_path), None)
+        if isinstance(selected_entry, dict):
+            if not selected_primary_type:
+                selected_primary_type = str(selected_entry.get("type", "") or "")
+            candidate_keys = []
+            if selected_primary_type == "array_object":
+                candidate_keys = [str(key) for key in selected_entry.get("item_keys", [])]
+            elif selected_primary_type == "object":
+                candidate_keys = [str(key) for key in selected_entry.get("child_keys", [])]
+            requested_item_keys = extract_requested_item_keys(merged_text, candidate_keys)
 
     if request_explicitly_saves_to_workflow(merged_text):
         save_candidates = [
@@ -772,6 +954,8 @@ def compile_lowcode_request(
             selected_primary_path=selected_primary_path,
             operation_argument=operation_info.get("argument"),
             selected_save_path=selected_save_path,
+            selected_primary_type=selected_primary_type,
+            requested_item_keys=requested_item_keys,
         )
         use_deterministic_fast_path = bool(deterministic_code)
 
@@ -795,7 +979,9 @@ def compile_lowcode_request(
         "selected_operation": operation,
         "operation_argument": operation_info.get("argument"),
         "selected_primary_path": selected_primary_path,
+        "selected_primary_type": selected_primary_type,
         "selected_save_path": selected_save_path,
+        "requested_item_keys": requested_item_keys,
         "candidate_paths_ranked": clarification_candidates,
         "confidence": confidence,
         "needs_clarification": needs_clarification,
@@ -804,6 +990,8 @@ def compile_lowcode_request(
         "deterministic_code": deterministic_code,
         "use_deterministic_fast_path": use_deterministic_fast_path,
         "explicit_paths": explicit_paths,
+        "explicit_paths_raw": explicit_paths_raw,
+        "inferred_explicit_paths": inferred_explicit_paths,
     }
 
 
@@ -829,6 +1017,17 @@ def _tail_non_comment_lines(lua_code: str, limit: int = 6) -> list[str]:
 def has_direct_return(lua_code: str) -> bool:
     """Check whether the last executable lines contain a direct return."""
     return any(line.startswith("return") for line in _tail_non_comment_lines(lua_code))
+
+
+def _code_has_key_cleanup(lua_code: str, key: str) -> bool:
+    escaped = re.escape(str(key))
+    patterns = (
+        rf"\.\s*{escaped}\s*=\s*nil\b",
+        rf"\[\s*['\"]{escaped}['\"]\s*\]\s*=\s*nil\b",
+        rf"~=\s*['\"]{escaped}['\"]",
+        rf"==\s*['\"]{escaped}['\"]",
+    )
+    return any(re.search(pattern, lua_code) for pattern in patterns)
 
 
 def request_explicitly_saves_to_workflow(prompt: str) -> bool:
@@ -915,10 +1114,37 @@ def inspect_lowcode_request_alignment(
         )
 
     selected_operation = str((compiled_request or {}).get("selected_operation", "")).strip()
+    selected_primary_path = str((compiled_request or {}).get("selected_primary_path", "")).strip()
+    selected_primary_type = str((compiled_request or {}).get("selected_primary_type", "")).strip()
+    requested_item_keys = [
+        str(key).strip()
+        for key in (compiled_request or {}).get("requested_item_keys", [])
+        if str(key).strip()
+    ]
     if workflow_context and not request_explicitly_saves_to_workflow(prompt):
         if not WF_ASSIGN_RE.search(code) and not has_direct_return(code):
             missing_requirements.append(
                 "Return the computed workflow value directly instead of only defining locals/functions."
+            )
+
+    if selected_operation == "remove_keys":
+        if selected_primary_path and normalize_lua_code(code) == normalize_lua_code(f"return {selected_primary_path}"):
+            missing_requirements.append(
+                "Do not return the source workflow data unchanged; remove/clear the requested keys before return."
+            )
+        if selected_primary_type == "array_object" and not re.search(r"(?m)^\s*for\b", code):
+            missing_requirements.append(
+                "Iterate over the workflow array items and transform each object before return."
+            )
+        if requested_item_keys:
+            unhandled_keys = [key for key in requested_item_keys if not _code_has_key_cleanup(code, key)]
+            if unhandled_keys:
+                missing_requirements.append(
+                    "Remove/clear the requested workflow object keys: " + ", ".join(unhandled_keys)
+                )
+        else:
+            warnings.append(
+                "The request looks like object-key cleanup, but requested keys were not identified deterministically."
             )
 
     if selected_operation in SIMPLE_OPERATION_ALLOWED_TYPES and has_direct_return(code):
@@ -1054,6 +1280,7 @@ def _sync_run_diagnostics(
     mocked_var_paths: list[str] = []
     contract_blockers: list[str] = []
     contract_warnings: list[str] = []
+    runtime_fix_hints: list[str] = []
 
     try:
         with open(lua_file, "r", encoding="utf-8", errors="replace") as file:
@@ -1084,6 +1311,7 @@ def _sync_run_diagnostics(
             "run_output": "",
             "run_error": run_error,
             "run_warning": "",
+            "runtime_fix_hints": [],
             "luacheck_output": "",
             "luacheck_error": "",
             "luacheck_warning": "",
@@ -1141,6 +1369,8 @@ def _sync_run_diagnostics(
     except (FileNotFoundError, RuntimeError) as exc:
         run_error = repair_mojibake(str(exc))
 
+    runtime_fix_hints = infer_runtime_fix_hints(run_error)
+
     diagnostics = {
         "success": started_ok or not run_error,
         "started_ok": started_ok,
@@ -1154,6 +1384,7 @@ def _sync_run_diagnostics(
         "run_output": run_output,
         "run_error": run_error,
         "run_warning": run_warning,
+        "runtime_fix_hints": runtime_fix_hints,
         "luacheck_output": "",
         "luacheck_error": "",
         "luacheck_warning": "",

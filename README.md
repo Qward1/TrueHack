@@ -8,12 +8,12 @@
 - запускает локальную проверку через `lua` в temporary LowCode harness;
 - делает fix loop при ошибках;
 - выполняет LLM-проверку соответствия исходному запросу;
-- сохраняет код после успешной локальной валидации и проверки требований:
+- если в чате указан явный target path или уже есть active target, сохраняет код после успешной локальной валидации и проверки требований:
   - как чистый целевой `.lua` файл;
   - как sidecar JsonString `lua{...}lua` рядом с ним;
 - возвращает:
   - код;
-  - путь сохранения;
+  - путь сохранения, если он был задан;
   - объяснение реализации;
   - предложения улучшений;
   - уточняющие вопросы.
@@ -112,6 +112,15 @@ C:\Work\LuaProjects\<slug>\<slug>.lua
 
 Система переиспользует active target текущего чата.
 
+### 4. Без явного пути
+Пример:
+
+```text
+Верни последний email из wf.vars.emails
+```
+
+Система выполнит полный цикл `generate/refine -> validate -> verify -> explain/respond`, но не будет создавать `.lua` файл и sidecar, если в этом чате ещё нет active target.
+
 ## LowCode contract
 - generation target: `Lua 5.5`
 - script description format in prompts/user-facing output: `lua{ ... }lua`
@@ -144,7 +153,7 @@ resolve_target -> route_intent -> generate/refine -> validate -> verify -> save 
 ## Что видно в ответе
 - итоговый скрипт в формате `lua{ ... }lua`;
 - статус local validation / verification;
-- путь сохранения `.lua` и sidecar JsonString;
+- путь сохранения `.lua` и sidecar JsonString, если сохранение выполнялось;
 - объяснение (что есть в коде и как работает);
 - предложения улучшений;
 - уточняющие вопросы.
@@ -184,4 +193,8 @@ Canonical runtime — Ollama с OpenAI-compatible API на `http://127.0.0.1:114
 - `luacheck` сейчас не используется в каноническом runtime;
 - generation/refine/fix ориентированы на workflow/LUS scripts, а не на console/CLI apps;
 - naming для auto-created folder/file и title чата строится из очищенного prompt и санитизируется под Windows;
+- без явного пути в новом чате runtime больше не создаёт fallback file target и показывает код только в ответе;
+- задачи очистки/удаления ключей внутри workflow-объектов больше не считаются простым `return`-сценарием и проходят дополнительную deterministic-проверку на реальную трансформацию данных;
+- если пользователь в задаче упоминает bare field name из parseable workflow context, runtime пытается однозначно привязать его к `wf.vars.*` или `wf.initVariables.*` и использует это в verification/save gate;
+- fix-loop теперь получает не только raw Lua runtime error, но и нормализованные repair hints для типовых ошибок аргументов, nil access/call, arithmetic/type mismatch и concatenation;
 - README фиксирует текущее состояние кода, а не желаемое будущее.

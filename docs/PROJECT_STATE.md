@@ -7,9 +7,10 @@
 
 `generate/refine -> local validate -> fix -> requirement verify -> save -> explain/respond`
 
-Сохранение итогового кода происходит после успешной локальной валидации и проверки требований:
+Если в чате есть явный target path или уже выбран active target, сохранение итогового кода происходит после успешной локальной валидации и проверки требований:
 - canonical artifact: чистый `.lua` файл;
 - дополнительный artifact: sidecar `*.jsonstring.txt` с `lua{...}lua`.
+Если path не указан и active target отсутствует, код проходит pipeline и возвращается в чат без записи на диск.
 
 ## Что работает
 - единый LangGraph pipeline без дублирующего orchestration path
@@ -17,6 +18,7 @@
   - explicit `.lua` path;
   - директория -> slug-папка + slug.lua;
   - active target в рамках чата
+  - отсутствие неявного fallback-save для нового чата без пути
   - санитизация невалидных Windows-сегментов пути перед созданием файлов и папок
 - dual-save результата:
   - чистый `.lua` файл для runtime;
@@ -32,7 +34,17 @@
 - локальная валидация через `lua` с temporary LowCode harness
 - nested mock paths для `wf.vars` / `wf.initVariables` в validation harness
 - fix loop по стадиям ошибок
+- normalized runtime repair hints для common Lua errors (`bad argument`, `nil` access/call, arithmetic/type mismatch, concatenation)
 - LLM verification требований
+- deterministic guard для object-key cleanup задач:
+  - plain `return wf.vars...` больше не считается корректным результатом;
+  - перед save требуется явная трансформация/очистка запрошенных ключей
+- route guard для `change` without code:
+  - если existing code отсутствует, pipeline не уходит в `refine_code` и не пишет warning fallback;
+  - вместо этого запрос обрабатывается как generate-path с сохранением intent
+- bare field resolution по parseable context:
+  - уникальное имя поля из prompt может быть автоматически разрешено в `wf.vars.*` / `wf.initVariables.*`;
+  - verification использует это как обязательный expected path even when the user did not write the full workflow path
 - улучшенный naming:
   - более информативный slug для auto-created project folder / Lua file;
   - очищенный title чата без сырого пути из prompt

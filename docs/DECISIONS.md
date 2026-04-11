@@ -201,6 +201,82 @@ LLM-only verification was insufficient for public-sample tasks: the model could 
 
 ## 2026-04-11
 ### Decision
+Не создаём fallback file target для нового чата без явного пути.
+
+### Why
+Пользовательское ожидание разделено на два режима:
+- без явного path код нужен только как ответ в чате;
+- с явным path система должна работать как file-based Lua builder.
+Автоматическое сохранение в workspace без явного запроса смешивало эти режимы и создавало лишние файлы.
+
+### Consequences
+- `resolve_target` по-прежнему умеет:
+  - explicit `.lua` path;
+  - директорию;
+  - active target текущего чата.
+- Если новый turn не содержит path и active target ещё не задан, pipeline всё равно выполняет `validate -> verify -> explain/respond`, но `save_code` намеренно пропускает запись на диск.
+- Пользователь получает код в чате без save-error.
+
+---
+
+## 2026-04-11
+### Decision
+Cleanup/remove-key задачи в workflow object data не считаются простыми `return`-операциями.
+
+### Why
+Фраза вида `очисти/удали ключи ...` может сослаться на правильный workflow path, но всё равно требовать реальную трансформацию массива/объекта. Старый deterministic guard пропускал `return wf.vars.some.path`, если путь был выбран верно.
+
+### Consequences
+- Operation detection выделяет key-cleanup запросы отдельно от простого `return`.
+- Для таких задач простой `return` исходного workflow path блокирует save.
+- Verification требует явного упоминания и обработки запрошенных ключей перед возвратом результата.
+
+---
+
+## 2026-04-11
+### Decision
+Intent `change` без existing code не должен заходить в refine-path.
+
+### Why
+LLM intent classifier может выбрать `change` для новых задач со словами `улучши`, `исправь`, `очисти`, даже если в чате или target file ещё нет текущего кода. В этом случае вход в `refine_code` создавал ложный warning и тут же падал обратно в `generate_code`.
+
+### Consequences
+- routing после preparation теперь учитывает не только intent, но и наличие `current_code`;
+- `change`/`retry` без existing code идут сразу в `generate_code`;
+- warning `no existing code — falling back to generate_code` остаётся только как defensive fallback, а не как штатный путь.
+
+---
+
+## 2026-04-11
+### Decision
+Bare field names from the task can be resolved to workflow paths using the pasted context.
+
+### Why
+Пользователь часто пишет `recallTime`, `emails`, `DATUM`, `TIME` без полного `wf.vars.*` / `wf.initVariables.*`. Если parseable workflow context уже есть в сообщении, отсутствие такого разрешения делает deterministic verification слишком слабой и позволяет сохранить код с неправильным workflow path.
+
+### Consequences
+- compiler добавляет inferred explicit paths, если bare field name однозначно соответствует одному workflow path в pasted context;
+- verification использует эти inferred paths как expected workflow paths;
+- это остаётся общим правилом по parseable context, а не special-case под конкретный prompt.
+
+---
+
+## 2026-04-11
+### Decision
+Fix-loop should receive normalized repair hints for common Lua runtime errors.
+
+### Why
+Raw stderr alone is often too noisy. For recurring Lua failures such as `bad argument`, `attempt to index/call nil`, arithmetic/type mismatch, or concatenation errors, the system needs a more stable signal about the root cause.
+
+### Consequences
+- validation diagnostics now include generic repair hints extracted from runtime errors;
+- `fix_code` prompt includes these hints together with raw stderr;
+- this remains API-agnostic and is not hardcoded to one function like `os.time`.
+
+---
+
+## 2026-04-11
+### Decision
 Simple workflow data tasks are compiled deterministically from parsed context before main LLM generation.
 
 ### Why
