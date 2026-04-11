@@ -18,6 +18,7 @@ import structlog
 
 from console_utils import configure_console_utf8
 from src.core.llm import LLMProvider
+from src.core.logging_runtime import configure_logging, new_turn_id, write_runtime_audit
 from src.graph.engine import PipelineEngine
 from src.tools.target_tools import build_chat_title
 
@@ -1265,6 +1266,16 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_REQUEST_TIMEOUT,
         help="Seconds to wait for the local runtime.",
     )
+    parser.add_argument(
+        "--log-dir",
+        default=os.getenv("APP_LOG_DIR", "logs"),
+        help="Directory for runtime logs (default: logs).",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=os.getenv("APP_LOG_LEVEL", "INFO"),
+        help="Logging level (DEBUG, INFO, WARNING, ERROR).",
+    )
     return parser.parse_args()
 
 
@@ -1387,6 +1398,13 @@ class AppRuntime:
             return self.build_full_payload()
 
         with self.lock:
+            write_runtime_audit(
+                "chat_user_message_received",
+                chat_id=self.current_chat_id,
+                chars=len(text),
+                is_command=text.startswith("/"),
+                message=text,
+            )
             # Save user message
             self.store.add_message(self.current_chat_id, "user", "Пользователь", text)
 
@@ -1400,6 +1418,12 @@ class AppRuntime:
                 self.store.add_message(
                     self.current_chat_id, "assistant", "Ответ", response_text.strip()
                 )
+            if response_text.strip():
+                write_runtime_audit(
+                    "chat_assistant_message_saved",
+                    chat_id=self.current_chat_id,
+                    chars=len(response_text.strip()),
+                )
             self._save_current_chat()
             return self.build_full_payload()
 
@@ -1410,11 +1434,30 @@ class AppRuntime:
             text,
             sd.get("last_suggested_changes", []),
         )
+        if effective_text != text:
+            write_runtime_audit(
+                "chat_prompt_expanded_from_suggestion",
+                chat_id=self.current_chat_id,
+                original_chars=len(text),
+                effective_chars=len(effective_text),
+                original_message=text,
+                effective_message=effective_text,
+            )
+        turn_id = new_turn_id()
+        write_runtime_audit(
+            "chat_pipeline_dispatch",
+            chat_id=self.current_chat_id,
+            turn_id=turn_id,
+            has_current_code=bool(sd.get("current_code", "").strip()),
+            has_base_prompt=bool(sd.get("base_prompt", "").strip()),
+            target_path=sd.get("target_path", ""),
+        )
 
         try:
             result = self._run_async(
                 self.engine.process_message(
                     chat_id=self.current_chat_id,
+                    turn_id=turn_id,
                     user_input=effective_text,
                     current_code=sd.get("current_code", ""),
                     base_prompt=sd.get("base_prompt", ""),
@@ -1424,8 +1467,25 @@ class AppRuntime:
                 )
             )
         except Exception as exc:
+            write_runtime_audit(
+                "chat_pipeline_failed",
+                chat_id=self.current_chat_id,
+                turn_id=turn_id,
+                error=str(exc),
+            )
             logger.error("pipeline_error", error=str(exc))
             return f"Ошибка: {exc}"
+
+        write_runtime_audit(
+            "chat_pipeline_result",
+            chat_id=self.current_chat_id,
+            turn_id=turn_id,
+            intent=result.get("intent", ""),
+            response_type=result.get("response_type", ""),
+            save_success=result.get("save_success", False),
+            validation_passed=result.get("validation_passed", False),
+            verification_passed=bool(result.get("verification", {}).get("passed", False)),
+        )
 
         # Update state from pipeline result
         sd["current_code"] = result.get("current_code", sd.get("current_code", ""))
@@ -1644,6 +1704,15 @@ def main() -> int:
     args = parse_args()
     if args.max_attempts < 1:
         raise SystemExit("--max-attempts must be at least 1")
+
+    logging_meta = configure_logging(log_dir=args.log_dir, level=args.log_level)
+    write_runtime_audit(
+        "runtime_logging_configured",
+        log_level=logging_meta["log_level"],
+        log_dir=logging_meta["log_dir"],
+        runtime_log=logging_meta["runtime_log_path"],
+        llm_prompt_log=logging_meta["llm_prompt_log_path"],
+    )
 
     runtime = AppRuntime(args)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(runtime))
