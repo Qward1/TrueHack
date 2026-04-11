@@ -51,23 +51,25 @@
 - direct legacy LLM client path
 
 ## Что еще не закрыто
-- migration на Ollama как финальный runtime
 - фиксация финального demo flow под жюри
 - подтверждение VRAM-лимита `<= 8 GB` на целевом конфиге
 - возврат e2e-gate после отдельного решения по нему
 - автоматизированные regression tests (пока только smoke/manual checks)
+- REST API `/generate` endpoint по OpenAPI spec
 
 ## Runtime status
-- локальный OpenAI-compatible endpoint
-- default `base_url`: `http://127.0.0.1:1234/v1`
-- текущий runtime валиден как dev-state, но не как финальный Ollama-target
+- Ollama как canonical LLM runtime
+- default `base_url`: `http://127.0.0.1:11434/v1`
+- default model: `qwen2.5-coder:7b-instruct`
+- параметры хакатона зафиксированы в `Modelfile` (num_ctx=4096, num_predict=256, num_gpu=99)
+- смена модели через `--model`, `OLLAMA_MODEL` или кастомный Modelfile
 
 ## Demo reproducibility
 README описывает канонический запуск через `app.py` и текущий pipeline.
 Для воспроизведения нужны:
 - Python deps из `requirements.txt`
 - `lua`
-- доступный локальный LLM endpoint
+- Ollama + модель `qwen2.5-coder:7b-instruct`
 
 ## Open risks
 - эвристики path resolution пока не покрыты автоматическими тестами
@@ -78,8 +80,41 @@ README описывает канонический запуск через `app.
 - mock values в validation harness остаются эвристическими и не заменяют реальные platform variables
 
 ## Next tasks
-- перевести canonical runtime на Ollama-конфигурацию хакатона
 - добавить автотесты для:
   - target resolution;
   - save gate без e2e;
   - follow-up применения предложений
+
+---
+
+## 2026-04-11 update: LowCode generation alignment
+- The pipeline now assembles prompts around task/context splitting instead of sending raw user text as-is.
+- Public-sample few-shot patterns are embedded locally in `src/graph/nodes.py` and steer output toward short workflow chunks instead of demo applications.
+- Requirement verification now has a deterministic guard:
+  - compare expected `wf.vars.*` / `wf.initVariables.*` paths from the prompt with actual workflow paths in code;
+  - reject invented demo tables like `local data = {...}` / `local emails = {...}` when workflow context was provided;
+  - require direct `return` for simple workflow extraction/computation tasks unless the prompt explicitly asks to save into `wf.vars`.
+- Save is now blocked on deterministic workflow-contract failures, including the case where semantic LLM verification is unavailable.
+- Automated regression coverage exists in `tests/` via stdlib `unittest`:
+  - prompt/context splitting;
+  - deterministic LowCode alignment guard;
+  - pipeline scenario: app-style generation goes into fix-loop;
+  - pipeline scenario: public-sample-style generation passes validate -> verify -> save.
+
+## 2026-04-11 update: hybrid compiler for workflow data tasks
+- The canonical pipeline now inserts `prepare_generation_context` between intent routing and code generation/refinement.
+- Parsed workflow JSON is normalized into a compiled request object and used as the main source of truth for:
+  - path inventory and types;
+  - operation detection;
+  - primary-path selection;
+  - clarification gating on ambiguity;
+  - deterministic fast-path generation for simple data tasks.
+- Current deterministic simple scope:
+  - count array;
+  - first/last element from array;
+  - direct field/scalar extraction;
+  - increment/decrement numeric scalar;
+  - string length.
+- Example target behavior now covered by tests:
+  - `Посчитай количество товаров в корзине` + workflow context -> `return #wf.vars.cart.items`
+- Ambiguous requests with multiple matching paths now return a clarification response instead of guessing and instead of saving invalid code.

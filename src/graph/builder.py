@@ -9,6 +9,7 @@ from src.core.state import PipelineState
 from src.graph.conditions import (
     check_validation,
     check_verification,
+    route_after_preparation,
     route_by_intent,
 )
 from src.graph.nodes import create_nodes
@@ -20,7 +21,8 @@ def build_graph(llm: LLMProvider):
     Flow:
         START -> resolve_target
         resolve_target -> route_intent
-        route_intent -> [generate_code | refine_code | answer_question]
+        route_intent -> [prepare_generation_context | answer_question]
+        prepare_generation_context -> [generate_code | refine_code | prepare_response(clarify)]
         generate_code -> validate_code
         refine_code -> validate_code
         validate_code -> [verify_requirements | fix_code | prepare_response(force)]
@@ -43,9 +45,18 @@ def build_graph(llm: LLMProvider):
         "route_intent",
         route_by_intent,
         {
+            "prepare": "prepare_generation_context",
+            "answer": "answer_question",
+        },
+    )
+
+    graph.add_conditional_edges(
+        "prepare_generation_context",
+        route_after_preparation,
+        {
             "generate": "generate_code",
             "refine": "refine_code",
-            "answer": "answer_question",
+            "clarify": "prepare_response",
         },
     )
 

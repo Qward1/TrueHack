@@ -11,7 +11,7 @@ import time
 from typing import TypedDict
 
 
-DEFAULT_LUA_BIN = "lua"
+DEFAULT_LUA_BIN = os.getenv("LUA_BIN", "lua55")
 DEFAULT_LUACHECK_BIN = "luacheck"
 EXECUTABLE_EXTENSIONS = {".exe", ".bat", ".cmd", ".com"}
 SHELL_WRAPPER_EXTENSIONS = {".bat", ".cmd"}

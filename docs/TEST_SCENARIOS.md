@@ -143,3 +143,66 @@
 - `/retry` повторно запускает validate/verify/save цикл без e2e gate
 - `luacheck` не требуется для прохождения сценариев canonical runtime
 - список чатов показывает очищенные title без шумного полного пути из prompt
+
+## 11. Pasted workflow context -> direct workflow path usage
+### Prompt
+`Return the last email from the provided workflow context.` plus pasted JSON-like workflow data with `wf.vars.emails`.
+
+### Pass criteria
+- generation returns a short workflow chunk, not a demo application;
+- code reads directly from `wf.vars.emails`;
+- code returns the computed value directly;
+- save succeeds without requiring a manual follow-up correction.
+
+## 12. App-style output is rejected before save
+### Simulated bad generation
+```lua
+local emails = {"user1@example.com", "user2@example.com", "user3@example.com"}
+return emails[#emails]
+```
+
+### Pass criteria
+- deterministic verification reports missing workflow-context alignment;
+- pipeline enters `fix_code` instead of saving immediately;
+- the corrected result switches to direct `wf.vars` usage before save.
+
+## 13. Explicit workflow path mismatch blocks save
+### Prompt
+`Use wf.initVariables.recallTime and return the converted value.`
+
+### Bad output example
+```lua
+local recallTime = "2026-04-10T12:00:00"
+return recallTime
+```
+
+### Pass criteria
+- deterministic verification lists `wf.initVariables.recallTime` as a missing direct workflow path;
+- save does not happen until the script uses the expected workflow path directly.
+
+## 14. Deterministic fast-path for array count
+### Prompt
+`Посчитай количество товаров в корзине.` plus pasted workflow context with `wf.vars.cart.items`.
+
+### Pass criteria
+- pipeline does not call main LLM generation;
+- generated code is exactly `return #wf.vars.cart.items`;
+- validate -> verify -> save still run normally after deterministic compilation.
+
+## 15. Deterministic fast-path for last element
+### Prompt
+`Return the last email from the provided workflow context.` plus pasted workflow context with `wf.vars.emails`.
+
+### Pass criteria
+- pipeline does not call main LLM generation;
+- generated code is exactly `return wf.vars.emails[#wf.vars.emails]`.
+
+## 16. Ambiguous path selection asks before generation
+### Prompt
+`Посчитай количество товаров.` plus pasted workflow context containing both `wf.vars.cart.items` and `wf.vars.wishlist.items`.
+
+### Pass criteria
+- pipeline returns a clarification response instead of code;
+- save is not attempted;
+- clarification text contains both candidate workflow paths;
+- after the user answers with an explicit workflow path, the pipeline reuses the original base prompt/context and continues from the same chat.

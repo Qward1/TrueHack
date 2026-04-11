@@ -82,10 +82,45 @@
 ## Runtime зависимости
 - Python 3.12+
 - `lua` в PATH
-- локальный OpenAI-compatible endpoint (по умолчанию `http://127.0.0.1:1234/v1`)
+- Ollama (по умолчанию `http://127.0.0.1:11434/v1`)
+- Модель: `qwen2.5-coder:7b-instruct` (или `3b-instruct` для 4GB VRAM)
+
+## Настройка модели
+Три способа (по приоритету):
+1. CLI аргумент: `python app.py --model <name>`
+2. Env-переменная: `OLLAMA_MODEL=<name>`
+3. Дефолт: `qwen2.5-coder:7b-instruct`
+
+Параметры хакатона (num_ctx=4096, num_predict=256) зафиксированы в `Modelfile`.
 
 ## Важно
-- Ollama migration под финальные требования хакатона пока не завершен.
-- Текущий runtime локальный и единый, но это dev-state, а не финальный Ollama-target.
 - E2E agent flow временно отключен в каноническом pipeline.
 - `luacheck` временно отключен в канонической локальной валидации.
+
+---
+
+## 2026-04-11 update: public-sample alignment
+- Prompt assembly now splits the user message into `task` and pasted workflow context.
+- Generation, refine, and fix prompts now include embedded few-shot examples derived from the public sample and enforce short workflow-script style.
+- The canonical style is: direct `wf.vars` / `wf.initVariables` access, no recreated demo input tables, no console wrappers, and direct `return` for simple extraction/computation tasks.
+- Deterministic verification now supplements LLM verification with:
+  - expected workflow path matching;
+  - anti-pattern detection for invented sample data and app/service wrappers;
+  - save-gate blocking when deterministic requirements fail, even if the semantic verifier is unavailable.
+- `docs/_pdf_text.txt` remains an offline working aid only and is not read at runtime.
+
+## 2026-04-11 update: compiled workflow context
+- The pipeline now has an explicit generation-context preparation stage before `generate_code` / `refine_code`.
+- Parsed workflow JSON is compiled into an internal request object with:
+  - path inventory;
+  - path types;
+  - sample values;
+  - selected operation;
+  - selected primary path;
+  - ranked candidate paths;
+  - deterministic simple-task code when available.
+- Simple single-target data tasks now bypass main LLM generation and are compiled directly into minimal workflow Lua, for example:
+  - count array -> `return #wf.vars.path`
+  - first/last element -> `return wf.vars.path[1]` / `return wf.vars.path[#wf.vars.path]`
+  - direct scalar extraction -> `return wf.vars.path`
+- If the workflow path cannot be selected confidently, the pipeline stops before generation, asks a clarification question, and does not save code.

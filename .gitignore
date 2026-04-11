@@ -2,3 +2,6 @@
 __pycache__/
 .pytest_cache/
 *.pyc
+.env
+.lua_console_chats.db
+.lua_console_chat.json
