@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from langgraph.graph import END, START, StateGraph
 
+from src.agents.planner import create_planner_node
 from src.core.llm import LLMProvider
 from src.core.state import PipelineState
 from src.graph.conditions import (
     check_validation,
     check_verification,
+    route_after_planning,
     route_after_preparation,
     route_by_intent,
+    route_from_start,
 )
 from src.graph.nodes import create_nodes
 
@@ -33,20 +36,37 @@ def build_graph(llm: LLMProvider):
         prepare_response -> END
     """
     nodes = create_nodes(llm)
+    nodes["plan_request"] = create_planner_node(llm)
 
     graph = StateGraph(PipelineState)
     for name, fn in nodes.items():
         graph.add_node(name, fn)
 
-    graph.add_edge(START, "resolve_target")
+    graph.add_conditional_edges(
+        START,
+        route_from_start,
+        {
+            "normal": "resolve_target",
+            "planner_followup": "plan_request",
+        },
+    )
     graph.add_edge("resolve_target", "route_intent")
 
     graph.add_conditional_edges(
         "route_intent",
         route_by_intent,
         {
-            "prepare": "prepare_generation_context",
+            "prepare": "plan_request",
             "answer": "answer_question",
+        },
+    )
+
+    graph.add_conditional_edges(
+        "plan_request",
+        route_after_planning,
+        {
+            "continue": "prepare_generation_context",
+            "clarify": "prepare_response",
         },
     )
 

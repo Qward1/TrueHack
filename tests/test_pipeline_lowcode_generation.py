@@ -19,7 +19,7 @@ class StubLLM:
         generate_responses: list[str],
         fix_response: str | list[str],
         route_intent: str = "create",
-        verify_response: str | None = None,
+        verify_response: str | list[str] | None = None,
     ) -> None:
         self._generate_responses = list(generate_responses)
         if isinstance(fix_response, list):
@@ -27,7 +27,12 @@ class StubLLM:
         else:
             self._fix_responses = [fix_response]
         self._route_intent = route_intent
-        self._verify_response = verify_response
+        if isinstance(verify_response, list):
+            self._verify_responses = list(verify_response)
+        elif verify_response is None:
+            self._verify_responses = []
+        else:
+            self._verify_responses = [verify_response]
         self.fix_calls = 0
         self.generate_calls = 0
         self.last_fix_prompt = ""
@@ -35,6 +40,7 @@ class StubLLM:
         self.last_generate_system = ""
         self.last_generate_temperature = None
         self.last_chat_temperature = None
+        self.last_verify_messages: list[dict] = []
 
     async def generate(self, prompt: str, system: str = "", temperature: float = 0.2, max_tokens: int | None = None) -> str:
         if system.startswith(ROUTE_SYSTEM_PREFIX):
@@ -66,8 +72,9 @@ class StubLLM:
         system = str(messages[0].get("content", "")) if messages else ""
         self.last_chat_temperature = temperature
         if system.startswith(VERIFY_SYSTEM_PREFIX):
-            if self._verify_response is not None:
-                return self._verify_response
+            self.last_verify_messages = list(messages)
+            if self._verify_responses:
+                return self._verify_responses.pop(0)
             return (
                 '{"passed": true, "score": 100, "summary": "LLM verification passed.", '
                 '"missing_requirements": [], "warnings": [], '
@@ -104,6 +111,9 @@ def _success_diagnostics() -> dict:
         "run_error": "",
         "run_warning": "",
         "runtime_fix_hints": [],
+        "runtime_context": {},
+        "result_value": None,
+        "result_preview": "",
         "luacheck_output": "",
         "luacheck_error": "",
         "luacheck_warning": "",
@@ -382,6 +392,19 @@ _utils.array.markAsArray(wf.vars.contacts)
 return wf.vars.contacts
 }lua"""
             ],
+            verify_response=(
+                '{"passed": false, "score": 15, "summary": "The code mutates and returns the original object instead of producing a safe array result.", '
+                '"missing_requirements": ["Wrap wf.vars.contacts into a new array and return that array instead of rewriting the source value in place."], '
+                '"warnings": [], '
+                '"checks": {'
+                '"workflow_path_usage": {"status": "pass", "reason": ""}, '
+                '"source_shape_understood": {"status": "fail", "reason": "The solution does not distinguish object-like tables from array-like tables."}, '
+                '"target_shape_satisfied": {"status": "fail", "reason": "The returned value is not guaranteed to be a proper array result."}, '
+                '"logic_correctness": {"status": "fail", "reason": "The script marks the source value as an array in place."}, '
+                '"helper_api_usage": {"status": "fail", "reason": "_utils.array.new is used with inline arguments."}, '
+                '"edge_case_handling": {"status": "fail", "reason": "Object tables are not handled safely."}'
+                '}}'
+            ),
             fix_response="""lua{
 local contacts = wf.vars.contacts
 if type(contacts) ~= "table" then
@@ -438,8 +461,10 @@ return arr
         self.assertTrue(result["save_success"])
         self.assertIn("_utils.array.new()", result["generated_code"])
         self.assertIn("for key in pairs(contacts) do", result["generated_code"])
-        self.assertIn("Differentiate object-like tables from array-like tables", llm.last_fix_prompt)
-        self.assertIn("Call `_utils.array.new()` without inline arguments", llm.last_fix_prompt)
+        self.assertIn(
+            "Wrap wf.vars.contacts into a new array and return that array instead of rewriting the source value in place.",
+            llm.last_fix_prompt,
+        )
         self.assertIn("Current broken code with line numbers:", llm.last_fix_prompt)
         self.assertIn("return wf.vars.contacts", llm.last_fix_prompt)
         self.assertNotIn("Rewrite the script from scratch", llm.last_fix_prompt)
@@ -464,6 +489,19 @@ end
 return wf.vars.contacts
 }lua"""
             ],
+            verify_response=(
+                '{"passed": false, "score": 20, "summary": "The code still returns the original workflow value without proving array semantics.", '
+                '"missing_requirements": ["Wrap object-like wf.vars.contacts into a new array instead of relabeling the source value in place."], '
+                '"warnings": [], '
+                '"checks": {'
+                '"workflow_path_usage": {"status": "pass", "reason": ""}, '
+                '"source_shape_understood": {"status": "fail", "reason": "next(...) only distinguishes empty vs non-empty tables."}, '
+                '"target_shape_satisfied": {"status": "fail", "reason": "The script may still return an object table."}, '
+                '"logic_correctness": {"status": "fail", "reason": "The source workflow value is marked as an array in place."}, '
+                '"helper_api_usage": {"status": "pass", "reason": ""}, '
+                '"edge_case_handling": {"status": "fail", "reason": "Object-like tables are not wrapped into a new array."}'
+                '}}'
+            ),
             fix_response="""lua{
 local contacts = wf.vars.contacts
 if type(contacts) ~= "table" then
@@ -518,11 +556,13 @@ return arr
 
         self.assertEqual(llm.fix_calls, 1)
         self.assertTrue(result["save_success"])
-        self.assertIn("Checking `next(value)` only distinguishes empty vs non-empty tables", llm.last_fix_prompt)
-        self.assertIn("Do not relabel the original workflow value as an array in place", llm.last_fix_prompt)
-        self.assertNotIn("Verification summary:", llm.last_fix_prompt)
+        self.assertIn(
+            "Wrap object-like wf.vars.contacts into a new array instead of relabeling the source value in place.",
+            llm.last_fix_prompt,
+        )
+        self.assertIn("Current broken code with line numbers:", llm.last_fix_prompt)
 
-    def test_fix_code_retries_when_first_fix_still_repeats_shape_failures(self) -> None:
+    def test_fix_code_accepts_single_repair_when_requirement_failure_is_addressed(self) -> None:
         async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
             return _success_diagnostics()
 
@@ -535,15 +575,29 @@ return arr
         llm = StubLLM(
             generate_responses=[
                 """lua{
-local contacts = wf.vars.contacts
-if type(contacts) ~= "table" or next(contacts, nil) == nil then
-    contacts = _utils.array.new()
-    table.insert(contacts, wf.vars.contacts)
-    _utils.array.markAsArray(contacts)
+local filtered = _utils.array.new()
+for _, item in ipairs(wf.vars.parsedCsv) do
+    if item.Discount ~= nil or item.Markdown ~= nil then
+        table.insert(filtered, item)
+    end
 end
-return contacts
+_utils.array.markAsArray(filtered)
+return filtered
 }lua"""
             ],
+            verify_response=(
+                '{"passed": false, "score": 20, "summary": "The result does not satisfy the shape requirement.", '
+                '"missing_requirements": ["Return an array-shaped result for contacts and handle object-like tables explicitly."], '
+                '"warnings": [], '
+                '"checks": {'
+                '"workflow_path_usage": {"status": "fail", "reason": "The script works on wf.vars.parsedCsv instead of wf.vars.contacts."}, '
+                '"source_shape_understood": {"status": "fail", "reason": "The request is about contacts array normalization."}, '
+                '"target_shape_satisfied": {"status": "fail", "reason": "The returned value does not match the requested contacts array shape."}, '
+                '"logic_correctness": {"status": "fail", "reason": "The script is solving a different task."}, '
+                '"helper_api_usage": {"status": "pass", "reason": ""}, '
+                '"edge_case_handling": {"status": "fail", "reason": "The contacts object case is not handled."}'
+                '}}'
+            ),
             fix_response=[
                 """```lua
 local contacts = wf.vars.contacts
@@ -607,15 +661,26 @@ return arr
                 )
             )
 
-        self.assertEqual(llm.fix_calls, 2)
+        self.assertEqual(llm.fix_calls, 1)
         self.assertTrue(result["save_success"])
-        self.assertIn("for key in pairs(contacts) do", result["generated_code"])
-        self.assertNotIn("next(contacts, nil)", result["generated_code"])
+        self.assertIn("local contacts = wf.vars.contacts", result["generated_code"])
+        self.assertIn("next(contacts, nil)", result["generated_code"])
         self.assertNotIn("assistant", llm.last_fix_prompt.lower())
 
-    def test_deterministic_fail_overrules_hallucinated_llm_verifier_pass(self) -> None:
-        async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
-            return _success_diagnostics()
+    def test_verifier_second_pass_can_overrule_false_positive_first_pass(self) -> None:
+        async def fake_run_diagnostics(
+            code: str,
+            lua_bin: str = "lua55",
+            startup_timeout: float = 3.0,
+            workflow_context: dict | None = None,
+        ) -> dict:
+            diagnostics = _success_diagnostics()
+            diagnostics["result_value"] = {
+                "name": "Ivan",
+                "phone": "+79990001122",
+            }
+            diagnostics["result_preview"] = '{"name":"Ivan","phone":"+79990001122"}'
+            return diagnostics
 
         def fake_save_output(target_path: str, code: str, jsonstring_code: str = "") -> dict:
             return {
@@ -636,18 +701,33 @@ return contacts
 }lua"""
             ],
             fix_response="",
-            verify_response=(
-                '{"passed": true, "score": 100, "summary": "The Lua script correctly checks if the contacts field is not an array and wraps it in an array if necessary.", '
-                '"missing_requirements": [], "warnings": [], '
-                '"checks": {'
-                '"workflow_path_usage": {"status": "pass", "reason": ""}, '
-                '"source_shape_understood": {"status": "pass", "reason": ""}, '
-                '"target_shape_satisfied": {"status": "pass", "reason": ""}, '
-                '"logic_correctness": {"status": "pass", "reason": ""}, '
-                '"helper_api_usage": {"status": "pass", "reason": ""}, '
-                '"edge_case_handling": {"status": "pass", "reason": ""}'
-                '}}'
-            ),
+            verify_response=[
+                (
+                    '{"passed": true, "score": 100, "summary": "Looks correct.", '
+                    '"missing_requirements": [], "warnings": [], '
+                    '"checks": {'
+                    '"workflow_path_usage": {"status": "pass", "reason": ""}, '
+                    '"source_shape_understood": {"status": "pass", "reason": ""}, '
+                    '"target_shape_satisfied": {"status": "pass", "reason": ""}, '
+                    '"logic_correctness": {"status": "pass", "reason": ""}, '
+                    '"helper_api_usage": {"status": "pass", "reason": ""}, '
+                    '"edge_case_handling": {"status": "pass", "reason": ""}'
+                    '}}'
+                ),
+                (
+                    '{"passed": false, "score": 20, "summary": "Runtime result is still an object table, not an array wrapper.", '
+                    '"missing_requirements": ["Wrap wf.vars.contacts into a new array and return that array instead of returning the original object table."], '
+                    '"warnings": [], '
+                    '"checks": {'
+                    '"workflow_path_usage": {"status": "pass", "reason": ""}, '
+                    '"source_shape_understood": {"status": "pass", "reason": ""}, '
+                    '"target_shape_satisfied": {"status": "fail", "reason": "The returned result is an object with keys name/phone instead of an array."}, '
+                    '"logic_correctness": {"status": "fail", "reason": "The code returns wf.vars.contacts unchanged when it is a non-empty object table."}, '
+                    '"helper_api_usage": {"status": "pass", "reason": ""}, '
+                    '"edge_case_handling": {"status": "fail", "reason": "Object-like tables are not wrapped into an array."}'
+                    '}}'
+                ),
+            ],
         )
         target_path = self.tmp_path / "contacts.lua"
         prompt = """Сделай Если поле contacts не массив, оберни его в массив.
@@ -679,10 +759,11 @@ return contacts
 
         self.assertFalse(result["verification"]["passed"])
         self.assertFalse(result["save_success"])
-        self.assertTrue(result["verification"]["llm_verifier_conflict"])
-        self.assertFalse(result["verification"]["deterministic_passed"])
-        self.assertIn("LLM verifier disagreed with deterministic checks and was overruled.", result["verification"]["summary"])
-        self.assertIn("llm_verifier_conflict_with_deterministic_checks", result["verification"]["warnings"])
+        self.assertIn("object table", result["verification"]["summary"])
+        self.assertIn(
+            "Wrap wf.vars.contacts into a new array and return that array instead of returning the original object table.",
+            result["verification"]["missing_requirements"],
+        )
 
     def test_generation_normalizes_json_envelope_with_lua_field(self) -> None:
         async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
@@ -743,6 +824,140 @@ json
             "return _utils.array.find(wf.vars.orders, function(order) return order.status == 'NEW' end).id",
         )
         self.assertEqual(llm.fix_calls, 0)
+
+    def test_verifier_receives_runtime_result_context_for_logic_checks(self) -> None:
+        async def fake_run_diagnostics(
+            code: str,
+            lua_bin: str = "lua55",
+            startup_timeout: float = 3.0,
+            workflow_context: dict | None = None,
+        ) -> dict:
+            diagnostics = _success_diagnostics()
+            diagnostics["result_value"] = [
+                {"SKU": "A001", "Discount": "10%", "Markdown": ""},
+                {"SKU": "A002", "Discount": "", "Markdown": "5%"},
+                {"SKU": "A004", "Discount": "", "Markdown": ""},
+            ]
+            diagnostics["result_preview"] = (
+                '[{"SKU":"A001","Discount":"10%","Markdown":""},'
+                '{"SKU":"A002","Discount":"","Markdown":"5%"},'
+                '{"SKU":"A004","Discount":"","Markdown":""}]'
+            )
+            return diagnostics
+
+        llm = StubLLM(
+            generate_responses=[
+                """lua{
+local function filterParsedCsv(parsedCsv)
+    local filteredArray = {}
+    for _, item in ipairs(parsedCsv) do
+        if item.Discount or item.Markdown then
+            table.insert(filteredArray, item)
+        end
+    end
+    return filteredArray
+end
+
+return filterParsedCsv(wf.vars.parsedCsv)
+}lua"""
+            ],
+            fix_response="",
+            verify_response=(
+                '{"passed": false, "score": 25, "summary": "Returned result still contains rows with empty values.", '
+                '"missing_requirements": ["Filter out rows where both Discount and Markdown are empty."], '
+                '"warnings": [], '
+                '"checks": {'
+                '"workflow_path_usage": {"status": "pass", "reason": ""}, '
+                '"source_shape_understood": {"status": "pass", "reason": ""}, '
+                '"target_shape_satisfied": {"status": "fail", "reason": "Runtime result still includes rows that should be excluded."}, '
+                '"logic_correctness": {"status": "fail", "reason": "A004 is still present even though both fields are empty strings."}, '
+                '"helper_api_usage": {"status": "pass", "reason": ""}, '
+                '"edge_case_handling": {"status": "fail", "reason": "Empty-string handling is incorrect."}'
+                '}}'
+            ),
+        )
+        prompt = """Отфильтруй элементы из массива, чтобы включить только те, у которых есть значения в
+полях Discount или Markdown.
+
+{
+}
+"wf": {
+  "vars": {
+    "parsedCsv": [
+      { "SKU": "A001", "Discount": "10%", "Markdown": "" },
+      { "SKU": "A002", "Discount": "", "Markdown": "5%" },
+      { "SKU": "A003", "Discount": null, "Markdown": null },
+      { "SKU": "A004", "Discount": "", "Markdown": "" }
+    ]
+  }
+}"""
+
+        with patch("src.graph.nodes.async_run_diagnostics", new=fake_run_diagnostics):
+            engine = PipelineEngine(llm=llm, max_fix_iterations=0)
+            result = asyncio.run(
+                engine.process_message(
+                    chat_id=1,
+                    user_input=prompt,
+                    workspace_root=str(self.tmp_path),
+                    target_path="",
+                )
+            )
+
+        verify_messages_text = "\n".join(str(message.get("content", "")) for message in llm.last_verify_messages)
+        self.assertIn("Actual runtime result on the provided workflow context", verify_messages_text)
+        self.assertIn("A004", verify_messages_text)
+        self.assertFalse(result["verification"]["passed"])
+        self.assertFalse(result["save_success"])
+
+    def test_failed_validation_still_returns_code_payload(self) -> None:
+        async def failing_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
+            diagnostics = _success_diagnostics()
+            diagnostics["success"] = False
+            diagnostics["run_error"] = "syntax error near '}'"
+            diagnostics["runtime_fix_hints"] = ["Remove wrapper noise and return valid standalone Lua."]
+            diagnostics["failure_kind"] = "syntax"
+            return diagnostics
+
+        def fail_if_save_called(target_path: str, code: str, jsonstring_code: str = "") -> dict:
+            raise AssertionError("save_final_output must not be called when validation never passes")
+
+        llm = StubLLM(
+            generate_responses=["lua{return wf.vars.emails[#wf.vars.emails]}lua"],
+            fix_response=["lua{return wf.vars.emails[#wf.vars.emails]}lua"] * 10,
+        )
+        target_path = self.tmp_path / "sample.lua"
+        previous_code = "return wf.vars.previous"
+        prompt = """Верни последний email.
+
+{
+  "wf": {
+    "vars": {
+      "emails": ["user1@example.com", "user2@example.com"]
+    }
+  }
+}"""
+
+        with patch("src.graph.nodes.async_run_diagnostics", new=failing_run_diagnostics), patch(
+            "src.graph.nodes.save_final_output",
+            new=fail_if_save_called,
+        ):
+            engine = PipelineEngine(llm=llm)
+            result = asyncio.run(
+                engine.process_message(
+                    chat_id=1,
+                    user_input=prompt,
+                    workspace_root=str(self.tmp_path),
+                    target_path=str(target_path),
+                    current_code=previous_code,
+                )
+            )
+
+        self.assertFalse(result["validation_passed"])
+        self.assertFalse(result["save_success"])
+        self.assertEqual(result["response_type"], "code")
+        self.assertIn("syntax error near", result["response"])
+        self.assertIn("```json", result["response"])
+        self.assertEqual(result["current_code"], "return wf.vars.emails[#wf.vars.emails]")
 
     def test_without_explicit_path_returns_code_but_skips_save(self) -> None:
         async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
@@ -937,6 +1152,19 @@ local payload = {
 print(payload.DATUM .. payload.TIME)
 }lua"""
             ],
+            verify_response=(
+                '{"passed": false, "score": 10, "summary": "The script invents demo input and prints instead of returning the ISO value from workflow data.", '
+                '"missing_requirements": ["Use wf.vars.json.IDOC.ZCDF_HEAD.DATUM and wf.vars.json.IDOC.ZCDF_HEAD.TIME directly and return the converted ISO 8601 string."], '
+                '"warnings": [], '
+                '"checks": {'
+                '"workflow_path_usage": {"status": "fail", "reason": "The solution does not use the provided workflow paths directly."}, '
+                '"source_shape_understood": {"status": "fail", "reason": "The code recreates payload instead of reading workflow data."}, '
+                '"target_shape_satisfied": {"status": "fail", "reason": "The script prints text instead of returning the requested value."}, '
+                '"logic_correctness": {"status": "fail", "reason": "The requested conversion is not performed on workflow data."}, '
+                '"helper_api_usage": {"status": "pass", "reason": ""}, '
+                '"edge_case_handling": {"status": "unclear", "reason": "No workflow-based conversion logic is present."}'
+                '}}'
+            ),
             fix_response="""lua{
 local DATUM = wf.vars.json.IDOC.ZCDF_HEAD.DATUM
 local TIME = wf.vars.json.IDOC.ZCDF_HEAD.TIME
@@ -978,7 +1206,7 @@ return string.format("%s-%s-%sT%s:%s:%s.00000Z", string.sub(DATUM, 1, 4), string
         self.assertEqual(llm.fix_calls, 1)
         self.assertTrue(result["save_success"])
         self.assertIn("wf.vars.json.IDOC.ZCDF_HEAD.DATUM", result["generated_code"])
-        self.assertEqual(result["verification"]["anti_patterns"], [])
+        self.assertTrue(result["verification"]["passed"])
 
     def test_remove_keys_task_rejects_plain_return_and_enters_fix_loop(self) -> None:
         async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
@@ -992,6 +1220,19 @@ return string.format("%s-%s-%sT%s:%s:%s.00000Z", string.sub(DATUM, 1, 4), string
 
         llm = StubLLM(
             generate_responses=["lua{return wf.vars.RESTbody.result}lua"],
+            verify_response=(
+                '{"passed": false, "score": 20, "summary": "The script returns the original array without removing the requested keys.", '
+                '"missing_requirements": ["Remove ID, ENTITY_ID, and CALL from each item in wf.vars.RESTbody.result before return."], '
+                '"warnings": [], '
+                '"checks": {'
+                '"workflow_path_usage": {"status": "pass", "reason": ""}, '
+                '"source_shape_understood": {"status": "pass", "reason": ""}, '
+                '"target_shape_satisfied": {"status": "fail", "reason": "The returned items still contain the forbidden keys."}, '
+                '"logic_correctness": {"status": "fail", "reason": "No cleanup logic is applied."}, '
+                '"helper_api_usage": {"status": "pass", "reason": ""}, '
+                '"edge_case_handling": {"status": "unclear", "reason": "The plain return does not prove per-item cleanup."}'
+                '}}'
+            ),
             fix_response="""lua{
 local result = wf.vars.RESTbody.result
 for _, item in ipairs(result) do
@@ -1077,6 +1318,19 @@ end
 return result
 }lua"""
             ],
+            verify_response=(
+                '{"passed": false, "score": 15, "summary": "The script uses the wrong workflow source and does not convert recallTime.", '
+                '"missing_requirements": ["Use wf.initVariables.recallTime as the input source for the unix-time conversion."], '
+                '"warnings": [], '
+                '"checks": {'
+                '"workflow_path_usage": {"status": "fail", "reason": "The solution reads wf.vars.RESTbody.result instead of wf.initVariables.recallTime."}, '
+                '"source_shape_understood": {"status": "fail", "reason": "The request is about the recallTime scalar."}, '
+                '"target_shape_satisfied": {"status": "fail", "reason": "The requested unix timestamp is never produced."}, '
+                '"logic_correctness": {"status": "fail", "reason": "The script solves a different task."}, '
+                '"helper_api_usage": {"status": "pass", "reason": ""}, '
+                '"edge_case_handling": {"status": "unclear", "reason": "No recallTime handling is present."}'
+                '}}'
+            ),
             fix_response="""lua{
 local iso_time = wf.initVariables.recallTime
 if not iso_time then
@@ -1133,7 +1387,7 @@ return epoch
         self.assertTrue(result["save_success"])
         self.assertEqual(result["verification"]["selected_primary_path"], "wf.initVariables.recallTime")
         self.assertIn("wf.initVariables.recallTime", result["generated_code"])
-        self.assertEqual(result["verification"]["expected_workflow_paths"], ["wf.initVariables.recallTime"])
+        self.assertTrue(result["verification"]["passed"])
 
     def test_runtime_bad_argument_error_adds_general_fix_hints(self) -> None:
         async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:

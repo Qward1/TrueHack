@@ -49,15 +49,17 @@ DEFAULT_VERIFICATION_SYSTEM_PROMPT = (
     "You review whether a Lua solution fully satisfies the user's request. "
     "The code must be a workflow Lua script, not a console app. "
     "Judge against the user request and workflow context, not against whether the code merely sounds plausible. "
-    "If deterministic pre-check findings are provided, treat them as hard constraints to validate against rather than optional hints. "
-    "Do not return passed=true when the code still violates those deterministic findings. "
+    "If concrete example input or actual runtime result is provided, start from that concrete evidence and validate the logic against it instead of only reading the code. "
+    "For filter/select/leave-only tasks, inspect the returned items one by one and fail if any item violates the requested rule. "
+    "If parsed input and runtime result are both provided, compare them item-by-item and mention concrete violating identifiers such as id, SKU, email, or name when available. "
     "Do not return passed=true if the answer is wrapped in quotes or markdown fences. "
     "Do not return passed=true if `next(...)` is the only array check in a shape-sensitive task. "
+    "If the request says a field must have a value / be non-empty / be filled, empty strings and whitespace-only strings do not satisfy that requirement unless the user explicitly says otherwise. "
     "Explicitly verify workflow path usage, source shape understanding, target/output shape, logic correctness, helper API usage, and edge-case handling. "
     "Return strict JSON only with the keys: passed, score, summary, missing_requirements, warnings, checks. "
     "The `checks` object must contain: workflow_path_usage, source_shape_understood, target_shape_satisfied, logic_correctness, helper_api_usage, edge_case_handling. "
     "Each check value must be an object with keys: status (`pass` | `fail` | `unclear`) and reason. "
-    "Use passed=true only if all critical checks pass."
+    "Use passed=true only if all critical checks pass and no missing_requirements remain."
 )
 
 ZERO_WIDTH_PATTERN = re.compile(r"[\u200b\u200c\u200d\ufeff]")
@@ -112,28 +114,9 @@ WF_ALIAS_ASSIGN_RE = re.compile(
     r"(?:local\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
     r"(wf\.(?:vars|initVariables)(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*|\s*\[\s*['\"][^'\"]+['\"]\s*\])+)"
 )
-WF_ASSIGN_RE = re.compile(
-    r"\bwf\.(vars|initVariables)"
-    r"(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*|\s*\[\s*['\"][^'\"]+['\"]\s*\])+"
-    r"\s*="
-)
 WORKFLOW_CONTEXT_HINT_RE = re.compile(r"(?i)(?:\bwf\b|\"wf\"|'wf')")
 WORKFLOW_ROOT_HINT_RE = re.compile(
     r"(?i)(?:\bvars\b|\binitVariables\b|\"vars\"|'vars'|\"initVariables\"|'initVariables')"
-)
-LOWCODE_DEMO_TABLE_PATTERNS = (
-    (re.compile(r"(?m)^\s*local\s+data\s*=\s*\{"), "invented demo table `local data = {...}`"),
-    (re.compile(r"(?m)^\s*local\s+users\s*=\s*\{"), "invented demo table `local users = {...}`"),
-    (re.compile(r"(?m)^\s*local\s+emails\s*=\s*\{"), "invented demo table `local emails = {...}`"),
-    (re.compile(r"(?m)^\s*local\s+items\s*=\s*\{"), "invented demo table `local items = {...}`"),
-)
-LOWCODE_APP_WRAPPER_PATTERNS = (
-    (re.compile(r"(?i)\b(http|server|router|endpoint|listen|request|response)\b"), "app/service wrapper vocabulary"),
-    (re.compile(r"(?m)^\s*local\s+app\s*="), "application wrapper declaration"),
-)
-LOWCODE_RETURN_RE = re.compile(r"(?m)^\s*return\b")
-LOWCODE_SAVE_INTENT_RE = re.compile(
-    r"(?i)\b(save|update|set|assign|store|write|persist)\b|сохрани|запиши|обнови|установи|присвой"
 )
 TASK_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9_]+")
 SEMANTIC_STEM_GROUPS: dict[str, tuple[str, ...]] = {
@@ -196,10 +179,10 @@ LUA_ATTEMPT_COMPARE_RE = re.compile(r"attempt to compare (?P<left>[^ ]+) with (?
 LUA_ATTEMPT_CONCAT_RE = re.compile(r"attempt to concatenate a (?P<got>[^ ]+) value", re.IGNORECASE)
 LUA_UNEXPECTED_SYMBOL_RE = re.compile(r"unexpected symbol near ['`](?P<token>[^'`]+)['`]", re.IGNORECASE)
 LUA_UNFINISHED_RE = re.compile(r"unfinished (?:string|long string|comment|long comment)", re.IGNORECASE)
-LOWCODE_ARRAY_NEW_CALL_RE = re.compile(r"_utils\.array\.new\s*\((?P<args>[^)]*)\)", re.DOTALL)
-LOWCODE_MARK_AS_ARRAY_CALL_RE = re.compile(r"_utils\.array\.markAsArray\s*\((?P<arg>[^)]*)\)", re.DOTALL)
 RUNTIME_CONTEXT_START = "__TRUEHACK_CONTEXT_START__"
 RUNTIME_CONTEXT_END = "__TRUEHACK_CONTEXT_END__"
+RUNTIME_RESULT_START = "__TRUEHACK_RESULT_START__"
+RUNTIME_RESULT_END = "__TRUEHACK_RESULT_END__"
 
 
 def merge_process_output(stdout: str, stderr: str) -> str:
@@ -557,6 +540,9 @@ def _extract_json_like_value(text: str) -> Any | None:
         return None
 
     candidates = [cleaned]
+    fenced = _strip_markdown_fence(cleaned)
+    if fenced and fenced not in candidates:
+        candidates.append(fenced)
     start = min(
         [index for index in (cleaned.find("{"), cleaned.find("[")) if index != -1],
         default=-1,
@@ -567,12 +553,78 @@ def _extract_json_like_value(text: str) -> Any | None:
     if start != -1 and end > start:
         candidates.append(cleaned[start : end + 1])
 
+    wf_wrapped = _wrap_loose_workflow_fragment(cleaned)
+    if wf_wrapped and wf_wrapped not in candidates:
+        candidates.append(wf_wrapped)
+    if fenced:
+        wf_wrapped_fenced = _wrap_loose_workflow_fragment(fenced)
+        if wf_wrapped_fenced and wf_wrapped_fenced not in candidates:
+            candidates.append(wf_wrapped_fenced)
+
     for candidate in candidates:
         try:
             return json.loads(candidate)
         except Exception:
             continue
     return None
+
+
+def _extract_balanced_json_block(text: str, start_index: int) -> str:
+    if start_index < 0 or start_index >= len(text):
+        return ""
+
+    opening = text[start_index]
+    closing = "}" if opening == "{" else "]" if opening == "[" else ""
+    if not closing:
+        return ""
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start_index, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+        if char == opening:
+            depth += 1
+        elif char == closing:
+            depth -= 1
+            if depth == 0:
+                return text[start_index : index + 1]
+    return ""
+
+
+def _wrap_loose_workflow_fragment(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+
+    wf_match = re.search(r'(?P<key>["\']?wf["\']?)\s*:', cleaned)
+    if wf_match:
+        brace_index = cleaned.find("{", wf_match.end())
+        block = _extract_balanced_json_block(cleaned, brace_index)
+        if block:
+            return '{"wf": ' + block + "}"
+
+    root_match = re.search(r'(?P<key>["\']?(?:vars|initVariables)["\']?)\s*:', cleaned)
+    if root_match:
+        brace_index = cleaned.find("{", root_match.end())
+        block = _extract_balanced_json_block(cleaned, brace_index)
+        if block:
+            key_name = root_match.group("key").strip("\"'")
+            return '{"wf": {"' + key_name + '": ' + block + "}}"
+
+    return ""
 
 
 def _compact_sample_value(value: Any, limit: int = 120) -> str:
@@ -1020,248 +1072,11 @@ def has_direct_return(lua_code: str) -> bool:
     return any(line.startswith("return") for line in _tail_non_comment_lines(lua_code))
 
 
-def _code_has_key_cleanup(lua_code: str, key: str) -> bool:
-    escaped = re.escape(str(key))
-    patterns = (
-        rf"\.\s*{escaped}\s*=\s*nil\b",
-        rf"\[\s*['\"]{escaped}['\"]\s*\]\s*=\s*nil\b",
-        rf"~=\s*['\"]{escaped}['\"]",
-        rf"==\s*['\"]{escaped}['\"]",
-    )
-    return any(re.search(pattern, lua_code) for pattern in patterns)
-
-
 def request_explicitly_saves_to_workflow(prompt: str) -> bool:
     """Heuristic: detect prompts that explicitly ask to update workflow state."""
     lowered = str(prompt or "").lower()
     save_markers = ("save", "update", "set", "assign", "store", "write", "сохрани", "запиши", "обнови", "установи", "присвой")
     return "wf.vars" in lowered and any(marker in lowered for marker in save_markers)
-
-
-def detect_lowcode_anti_patterns(
-    prompt: str,
-    lua_code: str,
-    actual_paths: list[str] | None = None,
-    compiled_request: dict[str, Any] | None = None,
-) -> list[str]:
-    """Detect code shapes that violate the expected workflow-script style."""
-    anti_patterns: list[str] = []
-    workflow_context = bool(compiled_request and compiled_request.get("has_parseable_context")) or has_workflow_context(prompt)
-    actual = list(actual_paths or [])
-    if not workflow_context:
-        return anti_patterns
-
-    generic_demo_table = re.search(
-        r"(?m)^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{",
-        lua_code,
-    )
-    if generic_demo_table:
-        anti_patterns.append(
-            f"invented top-level table `local {generic_demo_table.group(1)} = {{...}}`"
-        )
-    else:
-        for pattern, label in LOWCODE_DEMO_TABLE_PATTERNS:
-            if pattern.search(lua_code):
-                anti_patterns.append(label)
-
-    if not actual:
-        for pattern, label in LOWCODE_APP_WRAPPER_PATTERNS:
-            if pattern.search(lua_code):
-                anti_patterns.append(label)
-
-    if workflow_context and not actual and not anti_patterns:
-        anti_patterns.append("workflow context was provided but the code does not read from wf.vars / wf.initVariables")
-
-    return anti_patterns
-
-
-def _array_new_has_inline_arguments(lua_code: str) -> bool:
-    for match in LOWCODE_ARRAY_NEW_CALL_RE.finditer(lua_code):
-        if str(match.group("args") or "").strip():
-            return True
-    return False
-
-
-def _mark_as_array_targets(lua_code: str) -> list[str]:
-    targets: list[str] = []
-    for match in LOWCODE_MARK_AS_ARRAY_CALL_RE.finditer(lua_code):
-        target = str(match.group("arg") or "").strip()
-        if target:
-            targets.append(target)
-    return targets
-
-
-def _normalize_expression(expr: str) -> str:
-    return re.sub(r"\s+", "", str(expr or ""))
-
-
-def _aliases_for_selected_path(lua_code: str, selected_primary_path: str) -> set[str]:
-    aliases: set[str] = set()
-    normalized_target = _normalize_expression(selected_primary_path)
-    for match in WF_ALIAS_ASSIGN_RE.finditer(lua_code):
-        alias = str(match.group(1) or "").strip()
-        source = str(match.group(2) or "").strip()
-        if alias and _normalize_expression(source) == normalized_target:
-            aliases.add(alias)
-    return aliases
-
-
-def _marks_source_value_as_array(lua_code: str, selected_primary_path: str) -> bool:
-    if not selected_primary_path:
-        return False
-    normalized_target = _normalize_expression(selected_primary_path)
-    aliases = _aliases_for_selected_path(lua_code, selected_primary_path)
-    for target in _mark_as_array_targets(lua_code):
-        normalized_arg = _normalize_expression(target)
-        if normalized_arg == normalized_target or target.strip() in aliases:
-            return True
-    return False
-
-
-def _uses_next_empty_check(lua_code: str) -> bool:
-    return bool(re.search(r"\bnext\s*\(", lua_code))
-
-
-def _code_uses_array_shape_detection(lua_code: str) -> bool:
-    return bool(
-        re.search(r"\b(?:pairs|ipairs)\s*\(", lua_code)
-        or "math.floor" in lua_code
-        or re.search(r"type\s*\([^)]*\)\s*==\s*['\"]number['\"]", lua_code)
-    )
-
-
-def inspect_lowcode_request_alignment(
-    prompt: str,
-    code: str,
-    compiled_request: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Deterministically verify that the code follows the workflow paths from the request."""
-    if compiled_request and compiled_request.get("selected_primary_path"):
-        expected_paths = [str(compiled_request.get("selected_primary_path", "")).strip()]
-    elif compiled_request and compiled_request.get("explicit_paths"):
-        expected_paths = [str(path).strip() for path in compiled_request.get("explicit_paths", []) if str(path).strip()]
-    else:
-        expected_paths = flatten_lowcode_paths(extract_workflow_paths_from_text(prompt))
-    actual_paths = flatten_lowcode_paths(collect_lowcode_access_paths(code))
-    workflow_context = bool(compiled_request and compiled_request.get("has_parseable_context")) or has_workflow_context(prompt)
-    anti_patterns = detect_lowcode_anti_patterns(prompt, code, actual_paths, compiled_request=compiled_request)
-    missing_requirements: list[str] = []
-    warnings: list[str] = []
-
-    if expected_paths:
-        unmatched = [
-            path for path in expected_paths
-            if not any(_workflow_path_matches(path, actual) for actual in actual_paths)
-        ]
-        if unmatched:
-            missing_requirements.append(
-                "Use the workflow paths mentioned in the request/context directly: "
-                + ", ".join(unmatched)
-            )
-
-    if workflow_context and not actual_paths:
-        missing_requirements.append(
-            "The request includes workflow context, so the script must read from wf.vars / wf.initVariables instead of invented local input data."
-        )
-
-    if anti_patterns:
-        missing_requirements.append(
-            "Remove workflow anti-patterns: " + ", ".join(anti_patterns)
-        )
-
-    selected_operation = str((compiled_request or {}).get("selected_operation", "")).strip()
-    selected_primary_path = str((compiled_request or {}).get("selected_primary_path", "")).strip()
-    selected_primary_type = str((compiled_request or {}).get("selected_primary_type", "")).strip()
-    requested_item_keys = [
-        str(key).strip()
-        for key in (compiled_request or {}).get("requested_item_keys", [])
-        if str(key).strip()
-    ]
-    semantic_expectations = [
-        str(item).strip()
-        for item in (compiled_request or {}).get("semantic_expectations", [])
-        if str(item).strip()
-    ]
-    if workflow_context and not request_explicitly_saves_to_workflow(prompt):
-        if not WF_ASSIGN_RE.search(code) and not has_direct_return(code):
-            missing_requirements.append(
-                "Return the computed workflow value directly instead of only defining locals/functions."
-            )
-
-    if selected_operation == "remove_keys":
-        if selected_primary_path and normalize_lua_code(code) == normalize_lua_code(f"return {selected_primary_path}"):
-            missing_requirements.append(
-                "Do not return the source workflow data unchanged; remove/clear the requested keys before return."
-            )
-        if selected_primary_type == "array_object" and not re.search(r"(?m)^\s*for\b", code):
-            missing_requirements.append(
-                "Iterate over the workflow array items and transform each object before return."
-            )
-        if requested_item_keys:
-            unhandled_keys = [key for key in requested_item_keys if not _code_has_key_cleanup(code, key)]
-            if unhandled_keys:
-                missing_requirements.append(
-                    "Remove/clear the requested workflow object keys: " + ", ".join(unhandled_keys)
-                )
-        else:
-            warnings.append(
-                "The request looks like object-key cleanup, but requested keys were not identified deterministically."
-            )
-
-    if "array_normalization" in semantic_expectations:
-        if selected_primary_path and normalize_lua_code(code) == normalize_lua_code(f"return {selected_primary_path}"):
-            missing_requirements.append(
-                "Do not return the source workflow value unchanged; normalize it to the requested array shape first."
-            )
-        if _array_new_has_inline_arguments(code):
-            missing_requirements.append(
-                "Call `_utils.array.new()` without inline arguments; populate the array explicitly before `_utils.array.markAsArray(arr)`."
-            )
-        if "_utils.array.markAsArray" not in code:
-            missing_requirements.append(
-                "When creating a new workflow array, call `_utils.array.markAsArray(arr)` before return/store."
-            )
-        if selected_primary_type in {"object", "scalar"} and "_utils.array.new" not in code:
-            missing_requirements.append(
-                "This task requires explicit array creation via `_utils.array.new()` for non-array input values."
-            )
-        if selected_primary_type in {"object", "scalar"} and _marks_source_value_as_array(code, selected_primary_path):
-            missing_requirements.append(
-                "Do not relabel the original workflow value as an array in place; create a new array value and put the source value inside it."
-            )
-        if selected_primary_type in {"object", "array_object", "array_scalar"}:
-            has_table_only_guard = bool(re.search(r"type\s*\([^)]*\)\s*~=\s*['\"]table['\"]", code))
-            if has_table_only_guard and not _code_uses_array_shape_detection(code):
-                missing_requirements.append(
-                    "Differentiate object-like tables from array-like tables with numeric keys instead of relying only on `type(x) == 'table'`."
-                )
-            if _uses_next_empty_check(code) and not _code_uses_array_shape_detection(code):
-                missing_requirements.append(
-                    "Checking `next(value)` only distinguishes empty vs non-empty tables; it does not distinguish object-like tables from array-like tables with numeric keys."
-                )
-
-    if actual_paths and not LOWCODE_RETURN_RE.search(code) and not WF_ASSIGN_RE.search(code):
-        warnings.append("No explicit return or wf.vars assignment detected.")
-
-    if missing_requirements:
-        summary = "Deterministic workflow guard failed."
-    elif expected_paths:
-        summary = "Deterministic workflow guard passed: workflow paths are used directly."
-    elif workflow_context:
-        summary = "Deterministic workflow guard passed: workflow context is used."
-    else:
-        summary = "Deterministic workflow guard found no explicit workflow-path requirements."
-
-    return {
-        "passed": not missing_requirements,
-        "summary": summary,
-        "missing_requirements": missing_requirements,
-        "warnings": warnings,
-        "expected_workflow_paths": expected_paths,
-        "actual_workflow_paths": actual_paths,
-        "anti_patterns": anti_patterns,
-        "has_workflow_context": workflow_context,
-    }
 
 
 def build_mock_leaf_value(path_segments: list[str]) -> str:
@@ -1387,6 +1202,31 @@ def _extract_runtime_context(run_output: str) -> tuple[str, dict[str, Any]]:
     return cleaned_output, runtime_context
 
 
+def _extract_runtime_result(run_output: str) -> tuple[str, Any | None, str]:
+    """Strip structured runtime-result markers and parse the serialized return value."""
+    text = str(run_output or "")
+    start_marker = f"{RUNTIME_RESULT_START}\n"
+    end_marker = f"\n{RUNTIME_RESULT_END}"
+    start_index = text.find(start_marker)
+    if start_index == -1:
+        return text, None, ""
+
+    content_start = start_index + len(start_marker)
+    end_index = text.find(end_marker, content_start)
+    if end_index == -1:
+        return text, None, ""
+
+    raw_block = text[content_start:end_index].strip()
+    cleaned_output = (text[:start_index] + text[end_index + len(end_marker):]).strip()
+    parsed_value = _extract_json_like_value(raw_block)
+    if parsed_value is None and raw_block:
+        try:
+            parsed_value = json.loads(raw_block)
+        except Exception:
+            parsed_value = raw_block
+    return cleaned_output, parsed_value, raw_block
+
+
 def build_lowcode_validation_harness(
     lua_file: str,
     lua_code: str,
@@ -1424,6 +1264,79 @@ def build_lowcode_validation_harness(
         "    _utils.array.markAsArray = function(arr)\n"
         "        return arr\n"
         "    end\n"
+        "end\n"
+        "local function _json_escape_runtime(value)\n"
+        "    local escaped = tostring(value)\n"
+        "    escaped = escaped:gsub('\\\\', '\\\\\\\\')\n"
+        "    escaped = escaped:gsub('\"', '\\\\\"')\n"
+        "    escaped = escaped:gsub('\\n', '\\\\n')\n"
+        "    escaped = escaped:gsub('\\r', '\\\\r')\n"
+        "    escaped = escaped:gsub('\\t', '\\\\t')\n"
+        "    return escaped\n"
+        "end\n"
+        "local function _is_runtime_array(value)\n"
+        "    if type(value) ~= 'table' then\n"
+        "        return false\n"
+        "    end\n"
+        "    local count = 0\n"
+        "    for key, _ in pairs(value) do\n"
+        "        if type(key) ~= 'number' or key < 1 or key ~= math.floor(key) then\n"
+        "            return false\n"
+        "        end\n"
+        "        count = count + 1\n"
+        "    end\n"
+        "    for index = 1, count do\n"
+        "        if value[index] == nil then\n"
+        "            return false\n"
+        "        end\n"
+        "    end\n"
+        "    return true\n"
+        "end\n"
+        "local function _serialize_runtime_result(value, depth, seen)\n"
+        "    depth = depth or 0\n"
+        "    seen = seen or {}\n"
+        "    local value_type = type(value)\n"
+        "    if value_type == 'nil' then\n"
+        "        return 'null'\n"
+        "    end\n"
+        "    if value_type == 'boolean' then\n"
+        "        return value and 'true' or 'false'\n"
+        "    end\n"
+        "    if value_type == 'number' then\n"
+        "        return tostring(value)\n"
+        "    end\n"
+        "    if value_type == 'string' then\n"
+        "        return '\"' .. _json_escape_runtime(value) .. '\"'\n"
+        "    end\n"
+        "    if value_type ~= 'table' then\n"
+        "        return '\"<' .. value_type .. '>\"'\n"
+        "    end\n"
+        "    if seen[value] then\n"
+        "        return '\"<cycle>\"'\n"
+        "    end\n"
+        "    if depth >= 5 then\n"
+        "        return '\"<max_depth>\"'\n"
+        "    end\n"
+        "    seen[value] = true\n"
+        "    if _is_runtime_array(value) then\n"
+        "        local parts = {}\n"
+        "        for index = 1, #value do\n"
+        "            parts[#parts + 1] = _serialize_runtime_result(value[index], depth + 1, seen)\n"
+        "        end\n"
+        "        seen[value] = nil\n"
+        "        return '[' .. table.concat(parts, ',') .. ']'\n"
+        "    end\n"
+        "    local keys = {}\n"
+        "    for key, _ in pairs(value) do\n"
+        "        keys[#keys + 1] = tostring(key)\n"
+        "    end\n"
+        "    table.sort(keys)\n"
+        "    local parts = {}\n"
+        "    for _, key in ipairs(keys) do\n"
+        "        parts[#parts + 1] = '\"' .. _json_escape_runtime(key) .. '\":' .. _serialize_runtime_result(value[key], depth + 1, seen)\n"
+        "    end\n"
+        "    seen[value] = nil\n"
+        "    return '{' .. table.concat(parts, ',') .. '}'\n"
         "end\n"
         f"{assignments_block}"
         "local function _safe_runtime_value(value)\n"
@@ -1508,14 +1421,18 @@ def build_lowcode_validation_harness(
         "    end\n"
         "    return tostring(err)\n"
         "end\n"
-        "local ok, err = xpcall(function()\n"
-        f"    dofile({user_path_literal})\n"
+        "local ok, result = xpcall(function()\n"
+        f"    return dofile({user_path_literal})\n"
         "end, _traceback)\n"
         "if not ok then\n"
-        "    io.stderr:write(tostring(err))\n"
+        "    io.stderr:write(tostring(result))\n"
         "    io.stderr:write('\\n')\n"
         "    os.exit(1)\n"
         "end\n"
+        f"io.stderr:write('{RUNTIME_RESULT_START}\\n')\n"
+        "io.stderr:write(_serialize_runtime_result(result, 0, {}))\n"
+        "io.stderr:write('\\n')\n"
+        f"io.stderr:write('{RUNTIME_RESULT_END}\\n')\n"
     )
     mocked_paths = {
         "vars": [".".join(path) for path in access_paths["vars"]],
@@ -1544,6 +1461,8 @@ def _sync_run_diagnostics(
     contract_warnings: list[str] = []
     runtime_fix_hints: list[str] = []
     runtime_context: dict[str, Any] = {}
+    result_value: Any | None = None
+    result_preview = ""
 
     try:
         with open(lua_file, "r", encoding="utf-8", errors="replace") as file:
@@ -1575,6 +1494,9 @@ def _sync_run_diagnostics(
             "run_error": run_error,
             "run_warning": "",
             "runtime_fix_hints": [],
+            "runtime_context": {},
+            "result_value": None,
+            "result_preview": "",
             "luacheck_output": "",
             "luacheck_error": "",
             "luacheck_warning": "",
@@ -1607,6 +1529,7 @@ def _sync_run_diagnostics(
         )
         raw_run_output = merge_process_output(run_result["stdout"], run_result["stderr"])
         run_output = repair_mojibake(raw_run_output)
+        run_output, result_value, result_preview = _extract_runtime_result(run_output)
         run_output, runtime_context = _extract_runtime_context(run_output)
         timed_out = run_result["timed_out"]
         no_runtime_stderr = not run_result["stderr"].strip()
@@ -1654,6 +1577,8 @@ def _sync_run_diagnostics(
         "run_warning": run_warning,
         "runtime_fix_hints": runtime_fix_hints,
         "runtime_context": runtime_context,
+        "result_value": result_value,
+        "result_preview": result_preview,
         "luacheck_output": "",
         "luacheck_error": "",
         "luacheck_warning": "",
@@ -1724,6 +1649,26 @@ def strip_explanatory_preamble(cleaned: str) -> str:
     while trimmed.endswith("```"):
         trimmed = trimmed[:-3].rstrip()
     return trimmed
+
+
+def _strip_markdown_fence(text: str) -> str:
+    """Remove a surrounding markdown fence while preserving malformed wrapper payloads."""
+    cleaned = str(text or "").strip()
+    if not cleaned.startswith("```") or not cleaned.endswith("```"):
+        return cleaned
+
+    inner = cleaned[3:-3].strip()
+    if not inner:
+        return ""
+
+    info_match = re.match(r"^(?P<info>[A-Za-z0-9_-]+)[ \t]*\r?\n(?P<body>[\s\S]*)$", inner)
+    if info_match:
+        return str(info_match.group("body") or "").strip()
+
+    if inner.startswith("\n") or inner.startswith("\r"):
+        return inner.lstrip("\r\n").strip()
+
+    return inner
 
 
 def unwrap_lowcode_jsonstring(text: str) -> str:
@@ -1882,30 +1827,60 @@ def extract_embedded_lua_payload(text: str) -> str:
     return ""
 
 
+def _unwrap_malformed_lowcode_wrapper(text: str) -> str:
+    """Recover Lua body from common wrapper fragments left by malformed fenced output."""
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+
+    malformed_patterns = (
+        (r"^\{\s*([\s\S]*?)\s*\}lua$", 1),
+        (r"^lua\{\s*([\s\S]*?)\s*\}$", 1),
+    )
+    for pattern, group_index in malformed_patterns:
+        match = re.match(pattern, cleaned, re.IGNORECASE)
+        if not match:
+            continue
+        candidate = str(match.group(group_index) or "").strip()
+        if candidate and _looks_like_lua_source(candidate):
+            return candidate
+    return cleaned
+
+
 def normalize_lua_code(text: str) -> str:
     """Normalize model output into a standalone Lua file."""
     cleaned = ZERO_WIDTH_PATTERN.sub("", text).replace("\r\n", "\n").replace("\r", "\n").strip()
-    fenced = re.search(r"```(?:[A-Za-z0-9_-]+)?\s*(.*?)```", cleaned, flags=re.IGNORECASE | re.DOTALL)
-    fenced_inner = fenced.group(1).strip() if fenced else ""
-
-    for candidate in (cleaned, fenced_inner):
-        if not candidate:
-            continue
-        embedded_payload = extract_embedded_lua_payload(candidate)
-        if embedded_payload:
-            cleaned = embedded_payload.strip()
+    previous = None
+    for _ in range(8):
+        if not cleaned or cleaned == previous:
             break
-    else:
-        if fenced_inner:
-            cleaned = fenced_inner
-        cleaned = unwrap_lowcode_jsonstring(cleaned)
+        previous = cleaned
+
+        fenced = _strip_markdown_fence(cleaned)
+        if fenced != cleaned:
+            cleaned = fenced
+            continue
+
         embedded_payload = extract_embedded_lua_payload(cleaned)
-        if embedded_payload:
+        if embedded_payload and embedded_payload != cleaned:
             cleaned = embedded_payload.strip()
-        elif fenced:
-            cleaned = fenced_inner
-        else:
-            cleaned = strip_explanatory_preamble(cleaned)
+            continue
+
+        unwrapped = unwrap_lowcode_jsonstring(cleaned)
+        if unwrapped != cleaned:
+            cleaned = unwrapped.strip()
+            continue
+
+        malformed = _unwrap_malformed_lowcode_wrapper(cleaned)
+        if malformed != cleaned:
+            cleaned = malformed.strip()
+            continue
+
+        stripped = strip_explanatory_preamble(cleaned)
+        if stripped != cleaned:
+            cleaned = stripped.strip()
+            continue
+
     return cleaned.strip()
 
 
@@ -1961,6 +1936,8 @@ def analyze_lua_response(text: str) -> dict[str, Any]:
 
     if prose_prefix and not starts_like_lua:
         reason = "Model prefixed the response with explanatory text instead of starting with Lua code."
+    elif first_line.startswith("{") or first_line.startswith("["):
+        reason = "Response still contains wrapper or JSON/object syntax instead of standalone Lua code."
     elif cyrillic_count >= 8 and lua_signal_count == 0:
         reason = "Model returned natural-language text instead of Lua code."
     elif not starts_like_lua and lua_signal_count == 0:
@@ -2072,35 +2049,19 @@ async def async_verify_requirements(
     prompt: str,
     code: str,
     run_output: str = "",
-    deterministic_context: dict[str, Any] | None = None,
+    extra_context: str = "",
 ) -> dict[str, Any]:
     """Run requirement verification using the same local LLM provider as the graph."""
     messages = [
         {"role": "system", "content": DEFAULT_VERIFICATION_SYSTEM_PROMPT},
         {"role": "user", "content": f"User request:\n{prompt}\n\n{LOWCODE_CONTRACT_TEXT}"},
     ]
-    deterministic_info = deterministic_context if isinstance(deterministic_context, dict) else {}
-    deterministic_missing = _ensure_string_list(deterministic_info.get("missing_requirements"))
-    deterministic_warnings = _ensure_string_list(deterministic_info.get("warnings"))
-    expected_paths = _ensure_string_list(deterministic_info.get("expected_workflow_paths"))
-    actual_paths = _ensure_string_list(deterministic_info.get("actual_workflow_paths"))
-    anti_patterns = _ensure_string_list(deterministic_info.get("anti_patterns"))
-    deterministic_summary = str(deterministic_info.get("summary", "")).strip()
-    if deterministic_summary or deterministic_missing or deterministic_warnings or expected_paths or actual_paths or anti_patterns:
+    extra_context_text = str(extra_context or "").strip()
+    if extra_context_text:
         messages.append(
             {
                 "role": "user",
-                "content": (
-                    "Deterministic pre-check findings:\n"
-                    f"- passed: {bool(deterministic_info.get('passed', False))}\n"
-                    f"- summary: {deterministic_summary or 'none'}\n"
-                    f"- missing_requirements: {', '.join(deterministic_missing) if deterministic_missing else 'none'}\n"
-                    f"- warnings: {', '.join(deterministic_warnings) if deterministic_warnings else 'none'}\n"
-                    f"- expected_workflow_paths: {', '.join(expected_paths) if expected_paths else 'none'}\n"
-                    f"- actual_workflow_paths: {', '.join(actual_paths) if actual_paths else 'none'}\n"
-                    f"- anti_patterns: {', '.join(anti_patterns) if anti_patterns else 'none'}\n"
-                    "If any deterministic missing_requirements remain valid, your verdict must not be passed=true."
-                ),
+                "content": extra_context_text,
             }
         )
     if run_output.strip():
@@ -2112,7 +2073,7 @@ async def async_verify_requirements(
         )
     messages.extend(
         [
-            {"role": "assistant", "content": format_lowcode_jsonstring(code)},
+            {"role": "user", "content": f"Lua solution under review:\n```lua\n{code}\n```"},
             {
                 "role": "user",
                 "content": (
@@ -2140,6 +2101,44 @@ async def async_verify_requirements(
 
     raw = await llm.chat(messages, temperature=DEFAULT_VERIFICATION_TEMPERATURE)
     normalized = _normalize_verification_result(_extract_json_block(raw))
+    if normalized["passed"] and extra_context_text and "Actual runtime result on the provided workflow context" in extra_context_text:
+        challenge_messages = [
+            {
+                "role": "system",
+                "content": (
+                    DEFAULT_VERIFICATION_SYSTEM_PROMPT
+                    + " Perform a second-pass contradiction hunt. Assume the first verdict may be wrong. "
+                    + "Search the concrete runtime result for any counterexample. If any returned item/value violates the request, you must return passed=false and explain exactly what is wrong."
+                ),
+            },
+            {"role": "user", "content": f"User request:\n{prompt}\n\n{LOWCODE_CONTRACT_TEXT}"},
+            {"role": "user", "content": extra_context_text},
+            {"role": "user", "content": f"Lua solution under review:\n```lua\n{code}\n```"},
+            {
+                "role": "user",
+                "content": (
+                    "The previous provisional verdict said the solution passed. "
+                    "Challenge that verdict. Use the concrete runtime result to look for any wrong extra items, missing required transformations, or incorrect handling of empty values. "
+                    "Return the same strict JSON shape."
+                ),
+            },
+        ]
+        if run_output.strip():
+            challenge_messages.append(
+                {
+                    "role": "user",
+                    "content": f"Runtime output:\n{run_output or 'none'}",
+                }
+            )
+        challenge_raw = await llm.chat(challenge_messages, temperature=DEFAULT_VERIFICATION_TEMPERATURE)
+        challenge = _normalize_verification_result(_extract_json_block(challenge_raw))
+        challenge_checks = challenge.get("checks", {}) if isinstance(challenge, dict) else {}
+        has_failed_or_unclear = any(
+            isinstance(payload, dict) and payload.get("status") in {"fail", "unclear"}
+            for payload in challenge_checks.values()
+        )
+        if not challenge.get("passed", False) or challenge.get("missing_requirements") or has_failed_or_unclear:
+            normalized = challenge
     if not normalized["summary"]:
         normalized["summary"] = "Verification completed."
     return normalized

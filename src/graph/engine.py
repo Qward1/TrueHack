@@ -41,6 +41,10 @@ class PipelineEngine:
         change_requests: list[str] | None = None,
         workspace_root: str = "",
         target_path: str = "",
+        awaiting_planner_clarification: bool = False,
+        planner_pending_questions: list[str] | None = None,
+        planner_original_input: str = "",
+        planner_clarification_attempts: int = 0,
     ) -> dict[str, Any]:
         """Run the full pipeline for one user turn."""
         resolved_turn_id = turn_id or new_turn_id()
@@ -77,6 +81,12 @@ class PipelineEngine:
             "clarifying_questions": [],
             "response": "",
             "response_type": "text",
+            "planner_result": {},
+            "planner_skipped": False,
+            "awaiting_planner_clarification": awaiting_planner_clarification,
+            "planner_pending_questions": list(planner_pending_questions or []),
+            "planner_original_input": planner_original_input,
+            "planner_clarification_attempts": planner_clarification_attempts,
         }
 
         clear_log_context()
@@ -134,6 +144,12 @@ class PipelineEngine:
                 "explanation": result.get("explanation", {}),
                 "suggested_changes": result.get("suggested_changes", []),
                 "clarifying_questions": result.get("clarifying_questions", []),
+                "planner_result": result.get("planner_result", {}),
+                "planner_skipped": result.get("planner_skipped", False),
+                "awaiting_planner_clarification": result.get("awaiting_planner_clarification", False),
+                "planner_pending_questions": result.get("planner_pending_questions", []),
+                "planner_original_input": result.get("planner_original_input", ""),
+                "planner_clarification_attempts": result.get("planner_clarification_attempts", 0),
             }
 
             logger.info(

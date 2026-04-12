@@ -5,6 +5,20 @@ from __future__ import annotations
 from src.core.state import PipelineState
 
 
+def route_from_start(state: PipelineState) -> str:
+    """START router: bypass resolve_target/route_intent if planner awaits clarification."""
+    if state.get("awaiting_planner_clarification"):
+        return "planner_followup"
+    return "normal"
+
+
+def route_after_planning(state: PipelineState) -> str:
+    """After plan_request -> respond with clarification or continue to compiler."""
+    if state.get("awaiting_planner_clarification"):
+        return "clarify"
+    return "continue"
+
+
 def route_by_intent(state: PipelineState) -> str:
     """After intent classification -> choose the next high-level step.
 
@@ -51,12 +65,7 @@ def check_verification(state: PipelineState) -> str:
     fix_iter = state.get("fix_iterations", 0)
     max_fix = state.get("max_fix_iterations", 5)
 
-    # If semantic verification is unavailable, allow saving only when deterministic guards passed.
     if verification.get("error"):
-        if not missing_requirements:
-            return "save"
-        if fix_iter < max_fix:
-            return "fix"
         return "force_respond"
 
     if missing_requirements:
@@ -65,8 +74,7 @@ def check_verification(state: PipelineState) -> str:
         return "force_respond"
 
     passed = verification.get("passed", False)
-    score = verification.get("score", 0)
-    if passed or score >= 70:
+    if passed:
         return "save"
 
     if fix_iter < max_fix:

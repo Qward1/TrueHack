@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from typing import Any, Callable
@@ -20,7 +21,6 @@ from src.tools.lua_tools import (
     extract_function_names,
     format_lowcode_json_payload,
     format_lowcode_jsonstring,
-    inspect_lowcode_request_alignment,
     restore_lost_functions,
     smart_normalize,
     validate_lowcode_llm_output,
@@ -288,6 +288,130 @@ def _format_prompt_workflow_context(compiled_request: dict[str, Any]) -> str:
     if requested_item_keys:
         lines.append(f"Requested item keys: {', '.join(requested_item_keys)}")
     return "\n".join(lines).strip()
+
+
+def _format_planner_section(compiled_request: dict[str, Any]) -> str:
+    """Render planner_result as a prompt section.
+
+    Pulled from compiled_request["planner_result"] so the existing prompt
+    builders can stay single-argument.
+    """
+    if not isinstance(compiled_request, dict):
+        return ""
+    planner = compiled_request.get("planner_result") or {}
+    if not isinstance(planner, dict) or not planner:
+        return ""
+
+    parts: list[str] = []
+    reformulated = str(planner.get("reformulated_task", "") or "").strip()
+    if reformulated:
+        parts.append(f"Reformulated task:\n{reformulated}")
+    operation = str(planner.get("target_operation", "") or "").strip()
+    if operation and operation != "custom":
+        parts.append(f"Target operation: {operation}")
+    paths = [
+        str(p).strip()
+        for p in planner.get("identified_workflow_paths", []) or []
+        if str(p).strip()
+    ]
+    if paths:
+        parts.append(f"Planner-identified workflow paths: {', '.join(paths)}")
+    types = planner.get("data_types") or {}
+    if isinstance(types, dict) and types:
+        type_lines = [
+            f"  - {k}: {v}"
+            for k, v in types.items()
+            if str(k).strip() and str(v).strip()
+        ]
+        if type_lines:
+            parts.append("Path types:\n" + "\n".join(type_lines))
+    expected_action = str(planner.get("expected_result_action", "") or "").strip()
+    if expected_action:
+        parts.append(f"Expected result action: {expected_action}")
+    return "\n\n".join(parts)
+
+
+def _compact_json_for_prompt(value: object, limit: int = 4000) -> str:
+    try:
+        rendered = json.dumps(value, ensure_ascii=False, indent=2)
+    except Exception:
+        rendered = str(value)
+    if len(rendered) <= limit:
+        return rendered
+    return rendered[: limit - 3].rstrip() + "..."
+
+
+def _build_verification_extra_context(
+    compiled_request: dict[str, Any],
+    diagnostics: dict[str, Any],
+) -> str:
+    if not isinstance(compiled_request, dict):
+        compiled_request = {}
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+
+    sections: list[str] = []
+    planner_section = _format_planner_section(compiled_request)
+    if planner_section:
+        sections.append("Planner/task analysis:\n" + planner_section)
+
+    selected_operation = str(compiled_request.get("selected_operation", "") or "").strip().lower()
+    planner_result = compiled_request.get("planner_result") or {}
+    if isinstance(planner_result, dict):
+        planner_operation = str(planner_result.get("target_operation", "") or "").strip().lower()
+        if planner_operation and planner_operation != "custom":
+            selected_operation = planner_operation
+
+    requested_item_keys = [
+        str(key).strip()
+        for key in compiled_request.get("requested_item_keys", [])
+        if str(key).strip()
+    ]
+    semantic_expectations = [
+        str(item).strip()
+        for item in compiled_request.get("semantic_expectations", [])
+        if str(item).strip()
+    ]
+    verifier_instructions: list[str] = []
+    if selected_operation == "filter":
+        verifier_instructions.append(
+            "This is a filter/select task: every returned item must satisfy the requested condition."
+        )
+        verifier_instructions.append(
+            "For 'has value' / 'non-empty' conditions, treat nil, empty strings, and whitespace-only strings as empty values."
+        )
+        verifier_instructions.append(
+            "If any returned item violates the requested filter rule, set passed=false and name the violating item by identifiers like id, SKU, email, or name when available."
+        )
+    if requested_item_keys:
+        verifier_instructions.append(
+            "Relevant workflow item fields to inspect: " + ", ".join(requested_item_keys)
+        )
+    if semantic_expectations:
+        verifier_instructions.append(
+            "Semantic expectations detected from the task: " + ", ".join(semantic_expectations)
+        )
+    if verifier_instructions:
+        sections.append("Verification instructions:\n- " + "\n- ".join(verifier_instructions))
+
+    parsed_context = compiled_request.get("parsed_context")
+    if compiled_request.get("has_parseable_context") and parsed_context is not None:
+        sections.append(
+            "Parsed workflow context used during validation:\n"
+            + _compact_json_for_prompt(parsed_context)
+        )
+
+    if diagnostics.get("result_value") is not None:
+        sections.append(
+            "Actual runtime result on the provided workflow context:\n"
+            + _compact_json_for_prompt(diagnostics.get("result_value"))
+        )
+        sections.append(
+            "Judge logic correctness against the concrete runtime result above, not only against the code shape. "
+            "If the returned value still contains rows/items that should have been filtered out or transformed, fail the logic checks."
+        )
+
+    return "\n\n".join(section for section in sections if section.strip())
 
 
 def _build_clarification_response(compiled_request: dict[str, Any]) -> str:
@@ -618,11 +742,12 @@ def _assess_fix_candidate(
     verification_prompt: str,
 ) -> list[str]:
     reasons: list[str] = []
-    candidate = str(candidate_code or "").strip()
+    candidate = _normalize_runtime_candidate(candidate_code)
+    original = _normalize_runtime_candidate(original_code)
     if not candidate:
         return ["The fix attempt returned empty code."]
 
-    if _code_signature(candidate) == _code_signature(original_code):
+    if _code_signature(candidate) == _code_signature(original):
         reasons.append("The fix attempt did not materially change the code.")
 
     analysis = validate_lua_response(candidate)
@@ -630,29 +755,24 @@ def _assess_fix_candidate(
         reasons.append(str(analysis.get("reason", "") or "The fix attempt does not look like a valid standalone Lua file."))
 
     if failure_stage == "requirements":
-        alignment = inspect_lowcode_request_alignment(
-            verification_prompt,
-            candidate,
-            compiled_request=compiled_request if isinstance(compiled_request, dict) else None,
-        )
-        remaining = [
-            str(item).strip()
-            for item in alignment.get("missing_requirements", [])
-            if str(item).strip()
-        ]
-        previous = {
+        previous = [
             str(item).strip()
             for item in verification.get("missing_requirements", [])
             if str(item).strip()
-        }
-        repeated = [item for item in remaining if item in previous]
-        if repeated:
+        ]
+        if previous and _code_signature(candidate) == _code_signature(original):
             reasons.append(
-                "The fix still violates the same deterministic requirements: " + ", ".join(repeated)
+                "The fix did not address the previous requirement failures: " + ", ".join(previous)
             )
-        elif remaining:
+        verification_checks = verification.get("checks", {}) if isinstance(verification, dict) else {}
+        failed_checks = [
+            f"{name}: {str(payload.get('reason', '')).strip() or 'failed'}"
+            for name, payload in verification_checks.items()
+            if isinstance(payload, dict) and payload.get("status") == "fail"
+        ]
+        if failed_checks and _code_signature(candidate) == _code_signature(original):
             reasons.append(
-                "The fix still fails deterministic requirement checks: " + ", ".join(remaining)
+                "The fix did not resolve the previous logic/requirement check failures: " + ", ".join(failed_checks)
             )
 
     if failure_stage == "validation" and diagnostics.get("run_error"):
@@ -661,7 +781,7 @@ def _assess_fix_candidate(
             for item in diagnostics.get("runtime_fix_hints", [])
             if str(item).strip()
         ]
-        if runtime_hints and _code_signature(candidate) == _code_signature(original_code):
+        if runtime_hints and _code_signature(candidate) == _code_signature(original):
             reasons.append("The fix did not address the runtime diagnostics or runtime fix hints.")
 
     deduped: list[str] = []
@@ -678,10 +798,12 @@ def _build_generation_prompt(compiled_request: dict[str, Any]) -> str:
     provided_context = str(compiled_request.get("raw_context", "") or "").strip()
     clarification_text = str(compiled_request.get("clarification_text", "") or "").strip()
     prompt_context = _format_prompt_workflow_context(compiled_request)
+    planner_section = _format_planner_section(compiled_request)
     sections = [
         f"Task:\n{task}",
         f"Clarification from user:\n{clarification_text}" if clarification_text else "",
         f"Workflow anchor:\n{prompt_context}" if prompt_context else "",
+        f"Planner analysis:\n{planner_section}" if planner_section else "",
         (
             "Provided workflow context:\n"
             f"{provided_context}"
@@ -703,6 +825,7 @@ def _build_refine_prompt(
 ) -> str:
     original_task, provided_context = split_task_and_context(base_prompt or user_input)
     prompt_context = _format_prompt_workflow_context(compiled_request)
+    planner_section = _format_planner_section(compiled_request)
     clarification_text = str(compiled_request.get("clarification_text", "") or "").strip()
     sections = [
         f"Original task:\n{original_task or user_input.strip()}",
@@ -712,6 +835,7 @@ def _build_refine_prompt(
         ) if provided_context else "",
         f"Change clarification:\n{clarification_text}" if clarification_text else "",
         f"Workflow anchor:\n{prompt_context}" if prompt_context else "",
+        f"Planner analysis:\n{planner_section}" if planner_section else "",
         (
             "Existing functions you must preserve unless the user explicitly removes them:\n"
             f"{function_list}"
@@ -747,6 +871,7 @@ def _build_fix_prompt(
         return [text]
 
     prompt_context = _format_prompt_workflow_context(compiled_request)
+    planner_section = _format_planner_section(compiled_request)
     clarification_text = str(compiled_request.get("clarification_text", "") or "").strip()
     runtime_line_number = _extract_runtime_line_number(run_error)
     runtime_line_hint = _extract_runtime_line_hint(run_error)
@@ -768,6 +893,7 @@ def _build_fix_prompt(
         ) if provided_context else "",
         f"Clarification from user:\n{clarification_text}" if clarification_text else "",
         f"Workflow anchor:\n{prompt_context}" if prompt_context else "",
+        f"Planner analysis:\n{planner_section}" if planner_section else "",
         f"Failure stage: {failure_stage or 'unknown'}",
         f"Failure kind: {failure_kind or 'unknown'}",
         f"Runtime failure excerpt:\n{run_error}" if str(run_error or "").strip() else "",
@@ -961,6 +1087,30 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             raw_context=raw_context,
             clarification_text=clarification_text,
         )
+
+        # Soft enrichment from planner: re-compile with the reformulated task
+        # if the original compile did not lock onto a workflow path.
+        planner_result = state.get("planner_result", {}) or {}
+        reformulated_task = ""
+        if isinstance(planner_result, dict):
+            reformulated_task = str(planner_result.get("reformulated_task", "") or "").strip()
+        if (
+            reformulated_task
+            and reformulated_task != (task_text or task_source_prompt).strip()
+            and not compiled_request.get("has_parseable_context")
+        ):
+            compiled_request_v2 = compile_lowcode_request(
+                task_text=reformulated_task,
+                raw_context=raw_context,
+                clarification_text=clarification_text,
+            )
+            current_paths = len(compiled_request.get("expected_workflow_paths", []) or [])
+            v2_paths = len(compiled_request_v2.get("expected_workflow_paths", []) or [])
+            if v2_paths > current_paths:
+                compiled_request = compiled_request_v2
+
+        compiled_request["planner_result"] = planner_result if isinstance(planner_result, dict) else {}
+
         verification_prompt = task_source_prompt.strip()
         if current_code.strip() and existing_base_prompt.strip():
             verification_prompt = f"{existing_base_prompt.strip()}\n\nChange request:\n{user_input.strip()}"
@@ -1320,8 +1470,9 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             verification_prompt=verification_prompt,
         )
         if failure_stage == "validation" and fixed.strip():
+            normalized_fixed = _normalize_runtime_candidate(fixed)
             candidate_diagnostics = await _run_diagnostics_with_optional_context(
-                fixed,
+                normalized_fixed,
                 compiled_request if isinstance(compiled_request, dict) else {},
             )
             if candidate_diagnostics.get("success", False):
@@ -1334,7 +1485,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                     run_error=candidate_diagnostics.get("run_error", "none"),
                     runtime_fix_hints=candidate_diagnostics.get("runtime_fix_hints", []),
                     missing_requirements=verification.get("missing_requirements", []),
-                    code=fixed,
+                    code=normalized_fixed,
                     compiled_request=compiled_request if isinstance(compiled_request, dict) else {},
                     runtime_context=candidate_diagnostics.get("runtime_context", {}),
                 )
@@ -1419,17 +1570,17 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             if isinstance(compiled_request, dict)
             else ""
         ) or base_prompt
-        deterministic = inspect_lowcode_request_alignment(
-            verification_prompt,
-            code,
-            compiled_request=compiled_request if isinstance(compiled_request, dict) else None,
+        verification_extra_context = _build_verification_extra_context(
+            compiled_request if isinstance(compiled_request, dict) else {},
+            diagnostics if isinstance(diagnostics, dict) else {},
         )
 
         logger.info(
             f"[{_AGENT_VERIFY_REQUIREMENTS}] started",
             code_len=len(code),
             base_prompt_len=len(base_prompt),
-            deterministic_expected_paths=deterministic.get("expected_workflow_paths", []),
+            selected_operation=compiled_request.get("selected_operation", "") if isinstance(compiled_request, dict) else "",
+            selected_primary_path=compiled_request.get("selected_primary_path", "") if isinstance(compiled_request, dict) else "",
         )
 
         try:
@@ -1437,13 +1588,14 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 f"[{_AGENT_VERIFY_REQUIREMENTS}/async_verify_requirements] calling",
                 prompt_len=len(verification_prompt),
                 has_run_output=bool(diagnostics.get("run_output", "")),
+                has_runtime_result=bool(isinstance(diagnostics, dict) and diagnostics.get("result_preview", "")),
             )
             verification = await async_verify_requirements(
                 llm,
                 prompt=verification_prompt,
                 code=code,
                 run_output=diagnostics.get("run_output", ""),
-                deterministic_context=deterministic,
+                extra_context=verification_extra_context,
             )
             logger.info(
                 f"[{_AGENT_VERIFY_REQUIREMENTS}/async_verify_requirements] done",
@@ -1458,12 +1610,13 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 error=str(exc),
             )
             verification = {
-                "passed": deterministic.get("passed", False),
+                "passed": False,
                 "score": 0,
                 "summary": f"LLM verification unavailable: {exc}",
-                "missing_requirements": [],
+                "missing_requirements": ["Semantic verification unavailable or invalid response."],
                 "warnings": ["verification_unavailable"],
                 "error": True,
+                "checks": {},
             }
 
         verification_checks = verification.get("checks", {}) if isinstance(verification, dict) else {}
@@ -1477,22 +1630,16 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             for name, payload in verification_checks.items()
             if isinstance(payload, dict) and payload.get("status") == "unclear"
         ]
-        llm_passed = (bool(verification.get("passed")) or int(verification.get("score", 0) or 0) >= 70) and not failed_checks and not unclear_checks
+        llm_passed = bool(verification.get("passed")) and not failed_checks and not unclear_checks
         combined_missing = [
-            *deterministic.get("missing_requirements", []),
-            *[
-                item
-                for item in verification.get("missing_requirements", [])
-                if item not in deterministic.get("missing_requirements", [])
-            ],
+            str(item).strip()
+            for item in verification.get("missing_requirements", [])
+            if str(item).strip()
         ]
         combined_warnings = [
-            *deterministic.get("warnings", []),
-            *[
-                item
-                for item in verification.get("warnings", [])
-                if item not in deterministic.get("warnings", [])
-            ],
+            str(item).strip()
+            for item in verification.get("warnings", [])
+            if str(item).strip()
         ]
         for check_name in failed_checks:
             reason = str(verification_checks.get(check_name, {}).get("reason", "")).strip()
@@ -1509,7 +1656,6 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             if message not in combined_warnings:
                 combined_warnings.append(message)
         llm_summary = str(verification.get("summary", "")).strip()
-        deterministic_summary = str(deterministic.get("summary", "")).strip()
         compiled_request_summary = ""
         if isinstance(compiled_request, dict) and compiled_request:
             compiled_request_summary = (
@@ -1519,37 +1665,15 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 f"selected_path={compiled_request.get('selected_primary_path', 'none') or 'none'}, "
                 f"needs_clarification={bool(compiled_request.get('needs_clarification', False))}"
             )
-        llm_conflict = False
-        if verification.get("error"):
-            summary_parts = [compiled_request_summary, deterministic_summary]
-            if llm_summary:
-                summary_parts.append(llm_summary)
-        else:
-            llm_conflict = not deterministic.get("passed", False) and llm_passed
-            summary_parts = [part for part in (compiled_request_summary, deterministic_summary) if part]
-            if llm_conflict:
-                summary_parts.append("LLM verifier disagreed with deterministic checks and was overruled.")
-            elif llm_summary:
-                summary_parts.append(llm_summary)
+        summary_parts = [part for part in (compiled_request_summary, llm_summary) if part]
         combined_summary = " ".join(part for part in summary_parts if part).strip()
-        if llm_conflict:
-            conflict_warning = "llm_verifier_conflict_with_deterministic_checks"
-            if conflict_warning not in combined_warnings:
-                combined_warnings.append(conflict_warning)
-
-        passed = deterministic.get("passed", False) and (llm_passed or verification.get("error"))
+        passed = not verification.get("error") and llm_passed and not combined_missing
         verification = {
             **verification,
             "passed": passed,
-            "summary": combined_summary or deterministic_summary or llm_summary or "Verification completed.",
+            "summary": combined_summary or llm_summary or "Verification completed.",
             "missing_requirements": combined_missing,
             "warnings": combined_warnings,
-            "expected_workflow_paths": deterministic.get("expected_workflow_paths", []),
-            "actual_workflow_paths": deterministic.get("actual_workflow_paths", []),
-            "anti_patterns": deterministic.get("anti_patterns", []),
-            "deterministic_summary": deterministic_summary,
-            "deterministic_passed": deterministic.get("passed", False),
-            "llm_verifier_conflict": llm_conflict,
             "selected_operation": compiled_request.get("selected_operation", "") if isinstance(compiled_request, dict) else "",
             "selected_primary_path": compiled_request.get("selected_primary_path", "") if isinstance(compiled_request, dict) else "",
             "needs_clarification": compiled_request.get("needs_clarification", False) if isinstance(compiled_request, dict) else False,
@@ -1559,26 +1683,22 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         diagnostics_updated["verification_summary"] = verification.get("summary", "")
         diagnostics_updated["verification_checked"] = not verification.get("error", False)
         diagnostics_updated["verification_passed"] = passed
-        diagnostics_updated["deterministic_verification_summary"] = deterministic_summary
-        diagnostics_updated["expected_workflow_paths"] = verification.get("expected_workflow_paths", [])
-        diagnostics_updated["actual_workflow_paths"] = verification.get("actual_workflow_paths", [])
-        diagnostics_updated["anti_patterns"] = verification.get("anti_patterns", [])
         diagnostics_updated["selected_operation"] = verification.get("selected_operation", "")
         diagnostics_updated["selected_primary_path"] = verification.get("selected_primary_path", "")
         diagnostics_updated["has_parseable_context"] = verification.get("has_parseable_context", False)
-        diagnostics_updated["failure_kind"] = "requirements" if combined_missing else diagnostics.get("failure_kind", "")
+        diagnostics_updated["failure_kind"] = "requirements" if not passed else diagnostics.get("failure_kind", "")
 
         logger.info(
             f"[{_AGENT_VERIFY_REQUIREMENTS}] completed",
             passed=passed,
             score=verification.get("score", 0),
-            failure_stage="" if (passed or (verification.get("error") and not combined_missing)) else "requirements",
+            failure_stage="" if passed else "requirements",
         )
         return {
             "verification": verification,
             "verification_passed": passed,
             "compiled_request": compiled_request,
-            "failure_stage": "" if (passed or (verification.get("error") and not combined_missing)) else "requirements",
+            "failure_stage": "" if passed else "requirements",
             "diagnostics": diagnostics_updated,
         }
 
@@ -1789,7 +1909,6 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         suggested_changes = state.get("suggested_changes", [])
         clarifying_questions = state.get("clarifying_questions", [])
         failure_stage = state.get("failure_stage", "")
-
         logger.info(
             f"[{_AGENT_PREPARE_RESPONSE}] started",
             code_len=len(code),

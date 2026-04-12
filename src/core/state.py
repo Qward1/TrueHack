@@ -53,3 +53,11 @@ class PipelineState(TypedDict):
     # User-visible output
     response: str
     response_type: str
+
+    # Planner state
+    planner_result: dict[str, Any]
+    planner_skipped: bool
+    awaiting_planner_clarification: bool
+    planner_pending_questions: list[str]
+    planner_original_input: str
+    planner_clarification_attempts: int

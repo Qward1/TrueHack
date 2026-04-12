@@ -83,6 +83,9 @@ JSON only:"""
 
 _AGENT_NAME = "TaskPlanner"
 
+# Maximum clarification rounds before planner forcibly continues into the pipeline.
+MAX_CLARIFICATION_ATTEMPTS = 2
+
 
 # ---------------------------------------------------------------------------
 # Output types
@@ -304,11 +307,36 @@ def create_planner_node(llm: LLMProvider) -> Callable:
     agent = PlannerAgent(llm, enabled=None)  # reads env var
 
     async def plan_request(state: dict) -> dict:
-        """LangGraph node: analyze and reformulate the user's task."""
+        """LangGraph node: analyze and reformulate the user's task.
+
+        Supports a clarification follow-up flow:
+          - If state.awaiting_planner_clarification is True, the user's current
+            input is treated as an answer to previously posed questions. The
+            planner receives a merged input combining the original task,
+            previous questions, and the user's answer.
+          - When attempts hit MAX_CLARIFICATION_ATTEMPTS, planner forcibly
+            continues into the rest of the pipeline.
+        """
         user_input = state.get("user_input", "")
         intent = state.get("intent", "")
         current_code = state.get("current_code", "")
         compiled_request = state.get("compiled_request", {})
+
+        awaiting = bool(state.get("awaiting_planner_clarification"))
+        original_input = str(state.get("planner_original_input", "") or "")
+        pending_questions = list(state.get("planner_pending_questions", []) or [])
+        attempts = int(state.get("planner_clarification_attempts", 0) or 0)
+
+        # Build the input the planner actually sees.
+        if awaiting and original_input:
+            question_block = "\n".join(f"- {q}" for q in pending_questions if q)
+            effective_input = (
+                f"Исходная задача: {original_input}\n\n"
+                f"Уточняющие вопросы:\n{question_block}\n\n"
+                f"Ответ пользователя: {user_input}"
+            ).strip()
+        else:
+            effective_input = user_input
 
         has_context = bool(
             isinstance(compiled_request, dict)
@@ -316,7 +344,7 @@ def create_planner_node(llm: LLMProvider) -> Callable:
         )
 
         plan_output = await agent.plan(
-            user_input=user_input,
+            user_input=effective_input,
             has_context=has_context,
             intent=intent,
             current_code=current_code,
@@ -325,12 +353,28 @@ def create_planner_node(llm: LLMProvider) -> Callable:
         planner_result = plan_output.get("planner_result", {})
         planner_skipped = plan_output.get("planner_skipped", False)
 
-        # If clarification is needed, prepare the response for the user
-        if not planner_skipped and planner_result.get("needs_clarification"):
+        forced_continue = attempts >= MAX_CLARIFICATION_ATTEMPTS
+        wants_clarification = (
+            not planner_skipped
+            and planner_result.get("needs_clarification")
+            and not forced_continue
+        )
+
+        if wants_clarification:
             response = _build_clarification_response(planner_result)
+            preserved_original = original_input or user_input
+            logger.info(
+                f"[{_AGENT_NAME}] clarification_requested",
+                attempts=attempts + 1,
+                question_count=len(planner_result.get("clarification_questions", [])),
+            )
             return {
                 "planner_result": planner_result,
                 "planner_skipped": False,
+                "awaiting_planner_clarification": True,
+                "planner_pending_questions": planner_result.get("clarification_questions", []),
+                "planner_original_input": preserved_original,
+                "planner_clarification_attempts": attempts + 1,
                 "response": response,
                 "response_type": "text",
                 "failure_stage": "clarification",
@@ -343,9 +387,28 @@ def create_planner_node(llm: LLMProvider) -> Callable:
                 "save_error": "",
             }
 
-        return {
+        if forced_continue and planner_result.get("needs_clarification"):
+            logger.info(
+                f"[{_AGENT_NAME}] forced_continue_after_max_attempts",
+                attempts=attempts,
+            )
+            planner_result = dict(planner_result)
+            planner_result["needs_clarification"] = False
+            planner_result["clarification_questions"] = []
+
+        # When continuing (either no clarification, or forced continue), rewrite
+        # state.user_input to the merged effective input so the rest of the
+        # pipeline (compile_lowcode_request, etc.) sees the full task context.
+        updates: dict[str, Any] = {
             "planner_result": planner_result,
             "planner_skipped": planner_skipped,
+            "awaiting_planner_clarification": False,
+            "planner_pending_questions": [],
+            "planner_original_input": "",
+            "planner_clarification_attempts": 0,
         }
+        if awaiting and original_input:
+            updates["user_input"] = effective_input
+        return updates
 
     return plan_request

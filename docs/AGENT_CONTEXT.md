@@ -50,16 +50,9 @@
   - logic_correctness;
   - helper_api_usage;
   - edge_case_handling.
-- verifier получает deterministic findings как hard constraints, а не как optional hints.
-- если LLM verifier возвращает optimistic `passed=true` при deterministic `fail`, итоговый verdict остаётся fail и помечается как verifier conflict.
-- Для задач cleanup/remove/filter по ключам в workflow object/array deterministic guard требует реальную трансформацию данных, а не простой `return` исходного пути.
-- Для shape-sensitive задач вроде array normalization deterministic guard дополнительно требует:
-  - считать массивом только table с числовыми ключами `1..n` без пропусков; пустая table считается массивом;
-  - отличать object-like tables от array-like tables;
-  - не считать `next(x)` / пустоту достаточным способом различить object-like table и array-like table;
-  - не помечать исходный workflow object/scalar как массив через `_utils.array.markAsArray(source)`;
-  - не передавать inline arguments в `_utils.array.new()`;
-  - вызывать `_utils.array.markAsArray(arr)` для новых массивов.
+- verifier работает как основной semantic gate: он получает parsed workflow context, planner analysis и фактический runtime result из validation harness.
+- при наличии runtime result verifier обязан сверять логику решения с конкретным результатом выполнения, а не только с текстом кода.
+- для задач cleanup/remove/filter и shape-sensitive задач fix-loop теперь получает именно semantic requirement failures и причины проваленных checklist-проверок, а не отдельный статический guard verdict.
 - Если в тексте задачи указан bare field name без полного `wf.vars.*` / `wf.initVariables.*`, compiler пытается однозначно разрешить его через parseable workflow context и добавить в expected workflow paths.
 - Если intent классифицирован как `change`, но текущий код отсутствует, pipeline идёт в `generate_code`, а не в `refine_code`.
 - `route_intent` теперь hybrid:
@@ -139,7 +132,7 @@
 - The canonical style is: direct `wf.vars` / `wf.initVariables` access, no recreated demo input tables, no console wrappers, and the amount of Lua structure the task actually needs.
 - Deterministic verification supplements LLM verification with:
   - expected workflow path matching;
-  - anti-pattern detection for invented sample data and app/service wrappers;
+  - runtime-result-aware semantic verification and fix-loop feedback;
   - save-gate blocking when deterministic requirements fail, even if the semantic verifier is unavailable.
 - `docs/_pdf_text.txt` remains an offline working aid only and is not read at runtime.
 
@@ -154,3 +147,13 @@
   - ranked candidate paths.
 - The compiled request is now used to steer model generation and verification, not to emit canned Lua templates directly.
 - If the workflow path cannot be selected confidently, the pipeline stops before generation, asks a clarification question, and does not save code.
+
+## 2026-04-12 update: validation and verifier hardening
+- Workflow-context parsing now tolerates loose pasted JSON fragments and fenced JSON-like blocks before the compiler builds the request.
+- `src/tools/lua_tools.py` normalizes malformed LowCode wrappers before validation, including fenced `lua{...}lua` variants and partial trailing wrapper noise.
+- `validate_code` now captures the actual returned value from the temporary workflow harness and exposes that runtime result to `verify_requirements`.
+- `verify_requirements` now evaluates logic against:
+  - parsed workflow context;
+  - planner analysis when available;
+  - actual runtime result preview from validation.
+- `prepare_response` always includes the current code payload in the user response, even on failed validation/verification turns; the response stays diagnostic and saving still remains blocked.

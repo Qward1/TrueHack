@@ -162,7 +162,7 @@ return emails[#emails]
 ```
 
 ### Pass criteria
-- deterministic verification reports missing workflow-context alignment;
+- semantic verification reports that the solution ignores the provided workflow structure;
 - pipeline enters `fix_code` instead of saving immediately;
 - the corrected result switches to direct `wf.vars` usage before save.
 
@@ -176,7 +176,7 @@ return wf.vars.RESTbody.result
 ```
 
 ### Pass criteria
-- deterministic verification does not accept the code just because the path is correct;
+- semantic verification does not accept the code just because the path is correct;
 - pipeline enters `fix_code` instead of saving immediately;
 - corrected code explicitly transforms object items before return and references the requested keys.
 
@@ -191,7 +191,7 @@ return recallTime
 ```
 
 ### Pass criteria
-- deterministic verification lists `wf.initVariables.recallTime` as a missing direct workflow path;
+- semantic verification flags that `wf.initVariables.recallTime` must be used directly;
 - save does not happen until the script uses the expected workflow path directly.
 
 ## 15. Simple extraction still works in model-driven generation
@@ -226,7 +226,7 @@ return wf.vars.contacts
 ```
 
 ### Pass criteria
-- deterministic verification does not accept code that relies only on `type(x) == "table"` for array-vs-object semantics;
+- semantic verification does not accept code that relies only on `type(x) == "table"` for array-vs-object semantics;
 - array semantics are explicit: only numeric keys `1..n` without gaps count as an array; an empty table counts as an array;
 - `next(x)` / empty-vs-non-empty checks are not accepted as a substitute for object-vs-array shape detection;
 - simply marking the original workflow object/scalar as an array via `_utils.array.markAsArray(source)` is rejected;
@@ -262,6 +262,25 @@ return wf.vars.contacts
 - pasted Lua becomes the refine context even though chat state was empty before the turn;
 - pipeline enters `refine_code`, not fresh `generate_code`.
 
+## Wrapper noise is repaired before validation
+### Prompt
+Any workflow task where the model returns a fenced malformed wrapper like ```` ```lua{...}lua ``` ```` instead of a clean `lua{...}lua` payload.
+
+### Pass criteria
+- normalizer extracts standalone Lua from the malformed fenced/wrapper response before validation;
+- validation runs on the repaired Lua body instead of raw wrapper noise;
+- if the repaired Lua is still invalid, the turn remains diagnostic and still shows the current code payload.
+
+## Runtime-result-based logic verification blocks wrong filtering
+### Prompt
+`Отфильтруй элементы из массива, чтобы включить только те, у которых есть значения в полях Discount или Markdown.` plus workflow context where one row has empty strings in both fields.
+
+### Pass criteria
+- validation harness executes the code on the provided workflow context and captures the returned result;
+- semantic verification receives the runtime-result preview and can fail `logic_correctness` / `edge_case_handling` when the wrong row remains in the output;
+- save does not happen on this false-positive filter result;
+- the user receives diagnostics together with the current code payload.
+
 ## 18b. Pure Lua question remains a question
 ### Prompt
 `Как в Lua работает цикл for?`
@@ -281,7 +300,7 @@ return wf.vars.RESTbody.result
 
 ### Pass criteria
 - compiler infers `wf.initVariables.recallTime` as the expected workflow path even though the prompt does not contain the full path;
-- deterministic verification rejects code that uses a different workflow path;
+- semantic verification rejects code that uses a different workflow path;
 - pipeline enters `fix_code` instead of saving the wrong script.
 
 ## 20. Runtime bad-argument diagnostics produce generic repair hints
@@ -329,7 +348,7 @@ Shape-sensitive workflow task where the first fix response repeats the same `nex
 
 ### Pass criteria
 - `fix_code` does not accept the first repair attempt blindly;
-- if the first repair still repeats the same deterministic requirement failures, `fix_code` performs one stricter internal retry;
+- if the first repair still repeats the same semantic requirement failures, `fix_code` performs one stricter internal retry;
 - the second attempt is the one returned to validation.
 
 ## 21d. Prompt format contract stays single and strict
@@ -341,16 +360,15 @@ Shape-sensitive workflow task where the first fix response repeats the same `nex
 - the only response-format requirement is: start with `lua{` and end with `}lua`, without surrounding quotes and without code fences;
 - generation/fix prompt payload does not include ranked candidates, confidence, verifier summary, or past broken assistant outputs.
 
-## 21c. Hallucinated verifier pass is overruled by deterministic checks
+## 21c. Hallucinated verifier pass is overruled by a contradiction-focused second pass
 ### Prompt
-Any workflow task where deterministic verification finds hard failures, but the LLM verifier incorrectly returns `passed=true` with all-pass checklist items.
+Any workflow task where the first semantic verifier pass incorrectly returns `passed=true`, but the captured runtime result contradicts the user request.
 
 ### Pass criteria
 - final verification result remains failed;
 - summary does not present the optimistic verifier text as the authoritative verdict;
-- warnings include a verifier-conflict marker;
 - save is blocked and fix-loop continues or the response fails closed;
-- verifier does not approve shape-sensitive code when `next(...)` is the only array check or when the answer is still wrapped in quotes/markdown fences.
+- verifier can overturn a false positive by citing the contradictory runtime result directly.
 
 ## 22. User-facing JsonString export is wrapped into a named JSON field
 ### Prompt

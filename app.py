@@ -56,6 +56,10 @@ def _empty_state_dict(workspace_root: str | None = None) -> dict:
         "last_suggested_changes": [],
         "last_clarifying_questions": [],
         "last_explanation": {},
+        "awaiting_planner_clarification": False,
+        "planner_pending_questions": [],
+        "planner_original_input": "",
+        "planner_clarification_attempts": 0,
     }
 
 
@@ -109,6 +113,23 @@ def _normalize_state_dict(state_dict: dict | None, workspace_root: str | None = 
     ]
     explanation = state_dict.get("last_explanation", {})
     normalized["last_explanation"] = explanation if isinstance(explanation, dict) else {}
+    normalized["awaiting_planner_clarification"] = bool(
+        state_dict.get("awaiting_planner_clarification", False)
+    )
+    normalized["planner_pending_questions"] = [
+        str(item).strip()
+        for item in state_dict.get("planner_pending_questions", []) or []
+        if str(item).strip()
+    ]
+    normalized["planner_original_input"] = str(
+        state_dict.get("planner_original_input", "") or ""
+    )
+    try:
+        normalized["planner_clarification_attempts"] = int(
+            state_dict.get("planner_clarification_attempts", 0) or 0
+        )
+    except (TypeError, ValueError):
+        normalized["planner_clarification_attempts"] = 0
     return normalized
 
 
@@ -1458,6 +1479,10 @@ class AppRuntime:
                     change_requests=sd.get("change_requests", []),
                     workspace_root=sd.get("workspace_root", self.default_workspace),
                     target_path=sd.get("target_path", ""),
+                    awaiting_planner_clarification=sd.get("awaiting_planner_clarification", False),
+                    planner_pending_questions=sd.get("planner_pending_questions", []),
+                    planner_original_input=sd.get("planner_original_input", ""),
+                    planner_clarification_attempts=sd.get("planner_clarification_attempts", 0),
                 )
             )
         except Exception as exc:
@@ -1488,6 +1513,13 @@ class AppRuntime:
         sd["last_intent"] = result.get("intent", "")
         sd["workspace_root"] = result.get("workspace_root", sd.get("workspace_root", self.default_workspace))
         sd["target_path"] = result.get("target_path", sd.get("target_path", ""))
+        sd["awaiting_planner_clarification"] = bool(result.get("awaiting_planner_clarification", False))
+        sd["planner_pending_questions"] = list(result.get("planner_pending_questions", []) or [])
+        sd["planner_original_input"] = str(result.get("planner_original_input", "") or "")
+        try:
+            sd["planner_clarification_attempts"] = int(result.get("planner_clarification_attempts", 0) or 0)
+        except (TypeError, ValueError):
+            sd["planner_clarification_attempts"] = 0
         if result.get("saved_to", "").strip():
             sd["last_saved_path"] = result["saved_to"].strip()
         if result.get("saved_jsonstring_to", "").strip():
@@ -1570,6 +1602,10 @@ class AppRuntime:
             self.state_dict["last_suggested_changes"] = []
             self.state_dict["last_clarifying_questions"] = []
             self.state_dict["last_explanation"] = {}
+            self.state_dict["awaiting_planner_clarification"] = False
+            self.state_dict["planner_pending_questions"] = []
+            self.state_dict["planner_original_input"] = ""
+            self.state_dict["planner_clarification_attempts"] = 0
             self.state_dict["workspace_root"] = self.default_workspace
             return self._process_via_pipeline(argument)
 
