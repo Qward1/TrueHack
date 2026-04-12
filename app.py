@@ -27,13 +27,12 @@ logger = structlog.get_logger(__name__)
 # ── Defaults (Ollama runtime) ─────────────────────────────────────────
 DEFAULT_URL = "http://127.0.0.1:11434/v1"
 DEFAULT_MODEL = "qwen2.5-coder:7b-instruct"
-DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_REQUEST_TIMEOUT = 600.0
 
 
 CHAT_DB_NAME = ".lua_console_chats.db"
 MAX_CHAT_TITLE_LENGTH = 72
-E2E_DISABLED_SUMMARY = "E2E-проверка временно отключена."
 
 
 def utc_now_iso() -> str:
@@ -57,7 +56,6 @@ def _empty_state_dict(workspace_root: str | None = None) -> dict:
         "last_suggested_changes": [],
         "last_clarifying_questions": [],
         "last_explanation": {},
-        "last_e2e_summary": E2E_DISABLED_SUMMARY,
     }
 
 
@@ -111,9 +109,6 @@ def _normalize_state_dict(state_dict: dict | None, workspace_root: str | None = 
     ]
     explanation = state_dict.get("last_explanation", {})
     normalized["last_explanation"] = explanation if isinstance(explanation, dict) else {}
-    normalized["last_e2e_summary"] = (
-        str(state_dict.get("last_e2e_summary", "") or "").strip() or E2E_DISABLED_SUMMARY
-    )
     return normalized
 
 
@@ -1351,7 +1346,6 @@ class AppRuntime:
             "change_requests_count": len(sd.get("change_requests", [])),
             "suggested_changes": sd.get("last_suggested_changes", []),
             "clarifying_questions": sd.get("last_clarifying_questions", []),
-            "last_e2e_summary": sd.get("last_e2e_summary", ""),
         }
 
     def build_full_payload(self) -> dict:
@@ -1511,13 +1505,6 @@ class AppRuntime:
             ]
             explanation = result.get("explanation", {})
             sd["last_explanation"] = explanation if isinstance(explanation, dict) else {}
-            e2e_results = result.get("e2e_results", {})
-            if isinstance(e2e_results, dict):
-                sd["last_e2e_summary"] = (
-                    str(e2e_results.get("summary", "")).strip() or E2E_DISABLED_SUMMARY
-                )
-            else:
-                sd["last_e2e_summary"] = E2E_DISABLED_SUMMARY
 
         return result.get("response", "")
 
@@ -1542,7 +1529,6 @@ class AppRuntime:
                 f"Workspace: {sd.get('workspace_root', self.default_workspace)}",
                 f"Последнее сохранение: {sd.get('last_saved_path', '(ещё не было)') or '(ещё не было)'}",
                 f"Последний JsonString: {sd.get('last_saved_jsonstring_path', '(ещё не было)') or '(ещё не было)'}",
-                f"E2E: {sd.get('last_e2e_summary', E2E_DISABLED_SUMMARY) or E2E_DISABLED_SUMMARY}",
                 f"Предложений от системы: {len(sd.get('last_suggested_changes', []))}",
                 f"Уточняющих вопросов: {len(sd.get('last_clarifying_questions', []))}",
                 f"Последний intent: {sd.get('last_intent', '(не определён)')}",
@@ -1584,7 +1570,6 @@ class AppRuntime:
             self.state_dict["last_suggested_changes"] = []
             self.state_dict["last_clarifying_questions"] = []
             self.state_dict["last_explanation"] = {}
-            self.state_dict["last_e2e_summary"] = E2E_DISABLED_SUMMARY
             self.state_dict["workspace_root"] = self.default_workspace
             return self._process_via_pipeline(argument)
 

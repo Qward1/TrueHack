@@ -35,12 +35,9 @@ class PipelineState(TypedDict):
     fix_iterations: int
     max_fix_iterations: int
 
-    # Verification / e2e / save state
+    # Verification / save state
     verification: dict[str, Any]
     verification_passed: bool
-    e2e_suite: dict[str, Any]
-    e2e_results: dict[str, Any]
-    e2e_passed: bool
     save_success: bool
     save_skipped: bool
     save_skip_reason: str

@@ -15,7 +15,6 @@ import structlog
 from src.core.llm import LLMProvider
 from src.tools.local_runtime import (
     run_lua_file,
-    run_lua_file_with_input,
     to_cmd_path,
 )
 
@@ -23,8 +22,6 @@ logger = structlog.get_logger(__name__)
 
 DEFAULT_LUA_BIN = os.getenv("LUA_BIN", "lua55")
 DEFAULT_STARTUP_TIMEOUT = 3.0
-DEFAULT_E2E_TIMEOUT = 8.0
-DEFAULT_MAX_E2E_CASES = 3
 DEFAULT_VERIFICATION_TEMPERATURE = 0.0
 LOWCODE_LUA_VERSION = "Lua 5.5"
 LOWCODE_JSONSTRING_OPEN = "lua{"
@@ -61,12 +58,6 @@ DEFAULT_VERIFICATION_SYSTEM_PROMPT = (
     "The `checks` object must contain: workflow_path_usage, source_shape_understood, target_shape_satisfied, logic_correctness, helper_api_usage, edge_case_handling. "
     "Each check value must be an object with keys: status (`pass` | `fail` | `unclear`) and reason. "
     "Use passed=true only if all critical checks pass."
-)
-DEFAULT_E2E_SYSTEM_PROMPT = (
-    "You design deterministic end-to-end tests for a single Lua workflow script. "
-    "Return strict JSON only with key: tests. "
-    "Each test must contain: name, stdin, expected_stdout_contains, expected_stdout_not_contains, expected_exit_code. "
-    "Use concise assertions and keep at most 3 tests."
 )
 
 ZERO_WIDTH_PATTERN = re.compile(r"[\u200b\u200c\u200d\ufeff]")
@@ -203,8 +194,12 @@ LUA_ATTEMPT_CALL_NIL_RE = re.compile(r"attempt to call a nil value", re.IGNORECA
 LUA_ATTEMPT_ARITHMETIC_RE = re.compile(r"attempt to perform arithmetic on a (?P<got>[^ ]+) value", re.IGNORECASE)
 LUA_ATTEMPT_COMPARE_RE = re.compile(r"attempt to compare (?P<left>[^ ]+) with (?P<right>[^ ]+)", re.IGNORECASE)
 LUA_ATTEMPT_CONCAT_RE = re.compile(r"attempt to concatenate a (?P<got>[^ ]+) value", re.IGNORECASE)
+LUA_UNEXPECTED_SYMBOL_RE = re.compile(r"unexpected symbol near ['`](?P<token>[^'`]+)['`]", re.IGNORECASE)
+LUA_UNFINISHED_RE = re.compile(r"unfinished (?:string|long string|comment|long comment)", re.IGNORECASE)
 LOWCODE_ARRAY_NEW_CALL_RE = re.compile(r"_utils\.array\.new\s*\((?P<args>[^)]*)\)", re.DOTALL)
 LOWCODE_MARK_AS_ARRAY_CALL_RE = re.compile(r"_utils\.array\.markAsArray\s*\((?P<arg>[^)]*)\)", re.DOTALL)
+RUNTIME_CONTEXT_START = "__TRUEHACK_CONTEXT_START__"
+RUNTIME_CONTEXT_END = "__TRUEHACK_CONTEXT_END__"
 
 
 def merge_process_output(stdout: str, stderr: str) -> str:
@@ -380,6 +375,21 @@ def infer_runtime_fix_hints(run_error: str) -> list[str]:
             "The code tries to call a nil value. Check that the function exists and was not overwritten by a variable."
         )
 
+    unexpected_symbol_match = LUA_UNEXPECTED_SYMBOL_RE.search(text)
+    if unexpected_symbol_match:
+        token = unexpected_symbol_match.group("token")
+        hints.append(
+            f"Lua found an unexpected symbol near `{token}`. Check the tokens immediately before that point for leftover wrappers, missing keywords, separators, or malformed expressions."
+        )
+        hints.append(
+            "If the file still contains `lua{...}lua`, markdown fences, JSON fragments, or other response-format wrappers, remove them so the file is plain standalone Lua."
+        )
+
+    if LUA_UNFINISHED_RE.search(text):
+        hints.append(
+            "The Lua source is syntactically incomplete. Check for unclosed strings, comments, tables, functions, or control-flow blocks."
+        )
+
     arithmetic_match = LUA_ATTEMPT_ARITHMETIC_RE.search(text)
     if arithmetic_match:
         got = arithmetic_match.group("got")
@@ -424,8 +434,14 @@ def build_mock_init_value(name: str) -> str:
         return '"20260410"'
     if lowered == "time":
         return '"123045"'
-    if any(token in lowered for token in ("time", "date", "timestamp", "datetime", "recall")):
-        return '"2026-04-10T12:00:00"'
+    if lowered == "date":
+        return '"2026-04-10"'
+    if any(token in lowered for token in ("timestamp", "datetime", "recall")):
+        return '"2026-04-10T12:00:00+00:00"'
+    if "time" in lowered:
+        return '"2026-04-10T12:00:00+00:00"'
+    if "date" in lowered:
+        return '"2026-04-10"'
     if any(token in lowered for token in ("email", "emails")):
         return '{"user@example.com"}'
     if lowered.startswith(("is", "has", "can", "should")) or any(
@@ -874,10 +890,8 @@ def compile_lowcode_request(
     task_text: str,
     raw_context: str = "",
     clarification_text: str = "",
-    allow_deterministic: bool = True,
 ) -> dict[str, Any]:
     """Compile task text plus pasted workflow context into a structured request."""
-    _ = allow_deterministic
     parsed_context = parse_lowcode_workflow_context(raw_context)
     inventory = parsed_context["workflow_path_inventory"]
     merged_text = "\n".join(part for part in (task_text.strip(), clarification_text.strip()) if part.strip())
@@ -960,6 +974,7 @@ def compile_lowcode_request(
         "task_text": task_text.strip(),
         "raw_context": raw_context.strip(),
         "clarification_text": clarification_text.strip(),
+        "parsed_context": parsed_context["parsed_context"],
         "workflow_path_inventory": inventory,
         "path_types": parsed_context["path_types"],
         "sample_values": parsed_context["sample_values"],
@@ -1256,6 +1271,47 @@ def build_mock_leaf_value(path_segments: list[str]) -> str:
     return build_mock_init_value(path_segments[-1])
 
 
+def _extract_workflow_root_tables(workflow_context: Any | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Extract wf.vars / wf.initVariables tables from parsed workflow context."""
+    if not isinstance(workflow_context, dict):
+        return {}, {}
+
+    wf_section = workflow_context.get("wf")
+    root = wf_section if isinstance(wf_section, dict) else workflow_context
+    if not isinstance(root, dict):
+        return {}, {}
+
+    vars_value = root.get("vars")
+    init_value = root.get("initVariables")
+    return (
+        vars_value if isinstance(vars_value, dict) else {},
+        init_value if isinstance(init_value, dict) else {},
+    )
+
+
+def _python_to_lua_literal(value: Any) -> str:
+    """Serialize a JSON-like Python value into a Lua literal."""
+    if value is None:
+        return "nil"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        items = ", ".join(_python_to_lua_literal(item) for item in value)
+        return f"{{{items}}}"
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for key in sorted(value.keys(), key=lambda item: str(item)):
+            rendered_key = _python_to_lua_literal(str(key))
+            rendered_value = _python_to_lua_literal(value[key])
+            parts.append(f"[{rendered_key}] = {rendered_value}")
+        return "{" + ", ".join(parts) + "}"
+    return json.dumps(str(value), ensure_ascii=False)
+
+
 def _lua_path_expression(root: str, segments: list[str]) -> str:
     expression = f"wf.{root}"
     for segment in segments:
@@ -1283,9 +1339,62 @@ def build_mock_assignment_lines(root: str, paths: list[list[str]]) -> list[str]:
     return lines
 
 
-def build_lowcode_validation_harness(lua_file: str, lua_code: str) -> tuple[str, dict[str, list[str]]]:
-    """Build a temporary harness that injects a mock LowCode runtime around the user file."""
+def _extract_runtime_context(run_output: str) -> tuple[str, dict[str, Any]]:
+    """Strip structured runtime context markers from stderr and parse them."""
+    text = str(run_output or "")
+    start_marker = f"{RUNTIME_CONTEXT_START}\n"
+    end_marker = f"\n{RUNTIME_CONTEXT_END}"
+    start_index = text.find(start_marker)
+    if start_index == -1:
+        return text, {}
+
+    content_start = start_index + len(start_marker)
+    end_index = text.find(end_marker, content_start)
+    if end_index == -1:
+        return text, {}
+
+    raw_block = text[content_start:end_index]
+    cleaned_output = (text[:start_index] + text[end_index + len(end_marker):]).strip()
+    runtime_context: dict[str, Any] = {"locals": []}
+
+    for raw_line in raw_block.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("__TRUEHACK_FRAME__\t"):
+            parts = line.split("\t", 3)
+            if len(parts) >= 4:
+                try:
+                    runtime_context["line"] = int(parts[1])
+                except (TypeError, ValueError):
+                    runtime_context["line"] = 0
+                runtime_context["function"] = parts[2]
+                runtime_context["source"] = parts[3]
+            continue
+        if line.startswith("__TRUEHACK_LOCAL__\t"):
+            parts = line.split("\t", 3)
+            if len(parts) >= 4:
+                runtime_context.setdefault("locals", []).append(
+                    {
+                        "name": parts[1],
+                        "type": parts[2],
+                        "value": parts[3],
+                    }
+                )
+
+    if not runtime_context.get("locals") and not runtime_context.get("line"):
+        return cleaned_output, {}
+    return cleaned_output, runtime_context
+
+
+def build_lowcode_validation_harness(
+    lua_file: str,
+    lua_code: str,
+    workflow_context: Any | None = None,
+) -> tuple[str, dict[str, list[str]]]:
+    """Build a temporary harness that injects workflow context plus LowCode mocks around the user file."""
     access_paths = collect_lowcode_access_paths(lua_code)
+    provided_vars, provided_init_variables = _extract_workflow_root_tables(workflow_context)
     assignment_lines = [
         *build_mock_assignment_lines("vars", access_paths["vars"]),
         *build_mock_assignment_lines("initVariables", access_paths["initVariables"]),
@@ -1294,11 +1403,16 @@ def build_lowcode_validation_harness(lua_file: str, lua_code: str) -> tuple[str,
     if assignments_block:
         assignments_block = f"{assignments_block}\n"
 
-    user_path_literal = json.dumps(to_cmd_path(lua_file))
+    user_path = to_cmd_path(lua_file)
+    user_path_literal = json.dumps(user_path)
+    provided_vars_literal = _python_to_lua_literal(provided_vars)
+    provided_init_literal = _python_to_lua_literal(provided_init_variables)
     harness = (
         "wf = wf or {}\n"
         "wf.vars = wf.vars or {}\n"
         "wf.initVariables = wf.initVariables or {}\n"
+        f"wf.vars = {provided_vars_literal}\n"
+        f"wf.initVariables = {provided_init_literal}\n"
         "_utils = _utils or {}\n"
         "_utils.array = _utils.array or {}\n"
         "if _utils.array.new == nil then\n"
@@ -1312,7 +1426,83 @@ def build_lowcode_validation_harness(lua_file: str, lua_code: str) -> tuple[str,
         "    end\n"
         "end\n"
         f"{assignments_block}"
+        "local function _safe_runtime_value(value)\n"
+        "    local value_type = type(value)\n"
+        "    if value_type == 'nil' then\n"
+        "        return 'nil'\n"
+        "    end\n"
+        "    if value_type == 'table' then\n"
+        "        local parts = {}\n"
+        "        local count = 0\n"
+        "        for key, item in pairs(value) do\n"
+        "            count = count + 1\n"
+        "            if count > 3 then\n"
+        "                break\n"
+        "            end\n"
+        "            parts[#parts + 1] = tostring(key) .. '=' .. tostring(item)\n"
+        "        end\n"
+        "        if count == 0 then\n"
+        "            return '{}'\n"
+        "        end\n"
+        "        if count > 3 then\n"
+        "            parts[#parts + 1] = '...'\n"
+        "        end\n"
+        "        return '{' .. table.concat(parts, ', ') .. '}'\n"
+        "    end\n"
+        "    local ok, rendered = pcall(function()\n"
+        "        return tostring(value)\n"
+        "    end)\n"
+        "    if ok then\n"
+        "        return rendered\n"
+        "    end\n"
+        "    return '<' .. value_type .. '>'\n"
+        "end\n"
+        "local function _sanitize_runtime_value(value)\n"
+        "    local text = _safe_runtime_value(value)\n"
+        "    text = string.gsub(text, '\\r', ' ')\n"
+        "    text = string.gsub(text, '\\n', ' ')\n"
+        "    text = string.gsub(text, '\\t', ' ')\n"
+        "    return text\n"
+        "end\n"
+        "local function _emit_runtime_context()\n"
+        "    if not debug then\n"
+        "        return\n"
+        "    end\n"
+        "    local target_level = nil\n"
+        "    local target_info = nil\n"
+        "    local level = 2\n"
+        "    while true do\n"
+        "        local info = debug.getinfo(level, 'Sln')\n"
+        "        if info == nil then\n"
+        "            break\n"
+        "        end\n"
+        f"        if info.source == '@' .. {user_path_literal} then\n"
+        "            target_level = level\n"
+        "            target_info = info\n"
+        "            break\n"
+        "        end\n"
+        "        level = level + 1\n"
+        "    end\n"
+        "    if target_level == nil or target_info == nil then\n"
+        "        return\n"
+        "    end\n"
+        f"    io.stderr:write('{RUNTIME_CONTEXT_START}\\n')\n"
+        "    io.stderr:write('__TRUEHACK_FRAME__\\t' .. tostring(target_info.currentline or 0) .. '\\t' .. tostring(target_info.name or '') .. '\\t' .. tostring(target_info.source or '') .. '\\n')\n"
+        "    local index = 1\n"
+        "    while true do\n"
+        "        local name, value = debug.getlocal(target_level, index)\n"
+        "        if name == nil then\n"
+        "            break\n"
+        "        end\n"
+        "        if name ~= '(*temporary)' then\n"
+        "            io.stderr:write('__TRUEHACK_LOCAL__\\t' .. tostring(name) .. '\\t' .. type(value) .. '\\t' .. _sanitize_runtime_value(value) .. '\\n')\n"
+        "        end\n"
+        "        index = index + 1\n"
+        "    end\n"
+        f"    io.stderr:write('{RUNTIME_CONTEXT_END}\\n')\n"
+        "end\n"
         "local function _traceback(err)\n"
+        "    _emit_runtime_context()\n"
         "    if debug and debug.traceback then\n"
         "        return debug.traceback(err, 2)\n"
         "    end\n"
@@ -1338,6 +1528,7 @@ def _sync_run_diagnostics(
     lua_file: str,
     lua_bin: str = DEFAULT_LUA_BIN,
     startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
+    workflow_context: Any | None = None,
 ) -> dict[str, Any]:
     """Run Lua runtime validation and return a diagnostics dict for the graph."""
     run_error = ""
@@ -1352,6 +1543,7 @@ def _sync_run_diagnostics(
     contract_blockers: list[str] = []
     contract_warnings: list[str] = []
     runtime_fix_hints: list[str] = []
+    runtime_context: dict[str, Any] = {}
 
     try:
         with open(lua_file, "r", encoding="utf-8", errors="replace") as file:
@@ -1391,7 +1583,11 @@ def _sync_run_diagnostics(
         return diagnostics
 
     try:
-        harness_code, mocked_paths = build_lowcode_validation_harness(lua_file, lua_code)
+        harness_code, mocked_paths = build_lowcode_validation_harness(
+            lua_file,
+            lua_code,
+            workflow_context=workflow_context,
+        )
         mocked_init_variables = mocked_paths["initVariables"]
         mocked_var_paths = mocked_paths["vars"]
         with tempfile.NamedTemporaryFile(
@@ -1411,6 +1607,7 @@ def _sync_run_diagnostics(
         )
         raw_run_output = merge_process_output(run_result["stdout"], run_result["stderr"])
         run_output = repair_mojibake(raw_run_output)
+        run_output, runtime_context = _extract_runtime_context(run_output)
         timed_out = run_result["timed_out"]
         no_runtime_stderr = not run_result["stderr"].strip()
         if program_mode == "interactive":
@@ -1456,6 +1653,7 @@ def _sync_run_diagnostics(
         "run_error": run_error,
         "run_warning": run_warning,
         "runtime_fix_hints": runtime_fix_hints,
+        "runtime_context": runtime_context,
         "luacheck_output": "",
         "luacheck_error": "",
         "luacheck_warning": "",
@@ -1473,6 +1671,7 @@ async def async_run_diagnostics(
     lua_code: str,
     lua_bin: str = DEFAULT_LUA_BIN,
     startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
+    workflow_context: Any | None = None,
 ) -> dict[str, Any]:
     """Validate by running the Lua code and return the full diagnostics dict."""
     with tempfile.NamedTemporaryFile(
@@ -1493,6 +1692,7 @@ async def async_run_diagnostics(
                 temp_path,
                 lua_bin,
                 startup_timeout,
+                workflow_context,
             ),
         )
     finally:
@@ -1528,10 +1728,15 @@ def strip_explanatory_preamble(cleaned: str) -> str:
 
 def unwrap_lowcode_jsonstring(text: str) -> str:
     """Extract Lua body from the LowCode JsonString wrapper when present."""
-    match = LOWCODE_JSONSTRING_PATTERN.search(text.strip())
-    if not match:
-        return text
-    return match.group(1).strip()
+    cleaned = str(text or "").strip()
+    previous = None
+    while cleaned and cleaned != previous:
+        previous = cleaned
+        match = LOWCODE_JSONSTRING_PATTERN.fullmatch(cleaned)
+        if not match:
+            break
+        cleaned = match.group(1).strip()
+    return cleaned or str(text or "")
 
 
 def format_lowcode_jsonstring(lua_code: str) -> str:
@@ -1622,6 +1827,8 @@ def _extract_lua_payload_from_json_like(value: Any, depth: int = 0) -> str:
     if isinstance(value, str):
         normalized_value = (
             str(value)
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
             .replace("\\r\\n", "\n")
             .replace("\\n", "\n")
             .replace("\\r", "\n")
@@ -1936,232 +2143,6 @@ async def async_verify_requirements(
     if not normalized["summary"]:
         normalized["summary"] = "Verification completed."
     return normalized
-
-
-def _normalize_e2e_case(index: int, raw_case: object) -> dict[str, Any]:
-    if not isinstance(raw_case, dict):
-        return {}
-
-    name = str(raw_case.get("name") or f"case_{index + 1}").strip() or f"case_{index + 1}"
-    stdin_text = str(raw_case.get("stdin", "") or "")
-    expected_contains = _ensure_string_list(raw_case.get("expected_stdout_contains"))
-    expected_not_contains = _ensure_string_list(raw_case.get("expected_stdout_not_contains"))
-
-    expected_exit_code = raw_case.get("expected_exit_code", 0)
-    try:
-        expected_exit_code = int(expected_exit_code)
-    except (TypeError, ValueError):
-        expected_exit_code = 0
-
-    return {
-        "name": name[:120],
-        "stdin": stdin_text[:4000],
-        "expected_stdout_contains": expected_contains[:6],
-        "expected_stdout_not_contains": expected_not_contains[:6],
-        "expected_exit_code": expected_exit_code,
-    }
-
-
-def _normalize_e2e_suite(data: dict[str, Any]) -> dict[str, Any]:
-    raw_tests = data.get("tests")
-    if not isinstance(raw_tests, list):
-        raw_tests = []
-
-    tests: list[dict[str, Any]] = []
-    for index, raw_case in enumerate(raw_tests[:DEFAULT_MAX_E2E_CASES]):
-        normalized = _normalize_e2e_case(index, raw_case)
-        if normalized:
-            tests.append(normalized)
-
-    return {"tests": tests}
-
-
-async def async_generate_e2e_suite(
-    llm: LLMProvider,
-    prompt: str,
-    code: str,
-    target_path: str = "",
-) -> dict[str, Any]:
-    """Generate a compact JSON e2e test suite for the Lua file."""
-    location = target_path or "(not set)"
-    messages = [
-        {"role": "system", "content": DEFAULT_E2E_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"User request:\n{prompt}\n\n"
-                f"Target path:\n{location}\n\n"
-                "Produce tests for user-visible behavior only. "
-                "Avoid brittle exact full-output matches."
-            ),
-        },
-        {"role": "assistant", "content": code},
-        {
-            "role": "user",
-            "content": (
-                "Return strict JSON only in this shape:\n"
-                '{'
-                '"tests": ['
-                '{'
-                '"name": "test name", '
-                '"stdin": "", '
-                '"expected_stdout_contains": [], '
-                '"expected_stdout_not_contains": [], '
-                '"expected_exit_code": 0'
-                '}'
-                "]"
-                "}"
-            ),
-        },
-    ]
-
-    raw = await llm.chat(messages, temperature=0.0)
-    parsed = _extract_json_block(raw)
-    normalized = _normalize_e2e_suite(parsed)
-    if not normalized["tests"]:
-        raise RuntimeError("LLM returned an empty e2e suite.")
-    return normalized
-
-
-def _sync_run_e2e_suite(
-    lua_code: str,
-    suite: dict[str, Any],
-    lua_bin: str = DEFAULT_LUA_BIN,
-    timeout_seconds: float = DEFAULT_E2E_TIMEOUT,
-) -> dict[str, Any]:
-    tests = suite.get("tests", []) if isinstance(suite, dict) else []
-    if not tests:
-        return {
-            "passed": False,
-            "summary": "E2E suite is empty.",
-            "cases": [],
-            "failed_cases": [],
-            "retryable": False,
-        }
-
-    with tempfile.NamedTemporaryFile(
-        suffix=".lua",
-        delete=False,
-        mode="w",
-        encoding="utf-8",
-    ) as file:
-        file.write(lua_code)
-        temp_path = file.name
-
-    case_results: list[dict[str, Any]] = []
-    retryable = True
-    try:
-        for index, case in enumerate(tests):
-            case_name = str(case.get("name", f"case_{index + 1}"))
-            stdin_text = str(case.get("stdin", "") or "")
-            expect_contains = _ensure_string_list(case.get("expected_stdout_contains"))
-            expect_not_contains = _ensure_string_list(case.get("expected_stdout_not_contains"))
-
-            expected_exit_code = case.get("expected_exit_code", 0)
-            try:
-                expected_exit_code = int(expected_exit_code)
-            except (TypeError, ValueError):
-                expected_exit_code = 0
-
-            try:
-                run_result = run_lua_file_with_input(
-                    temp_path,
-                    stdin_text=stdin_text,
-                    lua_bin=lua_bin,
-                    timeout_seconds=timeout_seconds,
-                )
-            except (FileNotFoundError, RuntimeError) as exc:
-                retryable = False
-                case_results.append(
-                    {
-                        "name": case_name,
-                        "passed": False,
-                        "reason": str(exc),
-                        "timed_out": False,
-                        "returncode": -1,
-                        "output": "",
-                    }
-                )
-                break
-
-            output = repair_mojibake(
-                merge_process_output(run_result.get("stdout", ""), run_result.get("stderr", ""))
-            )
-            timed_out = bool(run_result.get("timed_out", False))
-            returncode = int(run_result.get("returncode", 0))
-
-            reason_parts: list[str] = []
-            passed = True
-
-            if timed_out:
-                passed = False
-                reason_parts.append("timed_out")
-            if returncode != expected_exit_code:
-                passed = False
-                reason_parts.append(
-                    f"unexpected_exit_code(expected={expected_exit_code}, actual={returncode})"
-                )
-
-            for expected in expect_contains:
-                if expected not in output:
-                    passed = False
-                    reason_parts.append(f"missing_output_fragment: {expected}")
-
-            for forbidden in expect_not_contains:
-                if forbidden and forbidden in output:
-                    passed = False
-                    reason_parts.append(f"forbidden_output_fragment: {forbidden}")
-
-            case_results.append(
-                {
-                    "name": case_name,
-                    "passed": passed,
-                    "reason": "; ".join(reason_parts),
-                    "timed_out": timed_out,
-                    "returncode": returncode,
-                    "output": output[:3000],
-                }
-            )
-    finally:
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-
-    failed_cases = [case for case in case_results if not case.get("passed")]
-    passed = bool(case_results) and not failed_cases
-    if passed:
-        summary = f"E2E passed ({len(case_results)}/{len(case_results)})."
-    else:
-        summary = f"E2E failed ({len(case_results) - len(failed_cases)}/{len(case_results)})."
-
-    return {
-        "passed": passed,
-        "summary": summary,
-        "cases": case_results,
-        "failed_cases": failed_cases,
-        "retryable": retryable,
-    }
-
-
-async def async_run_e2e_suite(
-    lua_code: str,
-    suite: dict[str, Any],
-    lua_bin: str = DEFAULT_LUA_BIN,
-    timeout_seconds: float = DEFAULT_E2E_TIMEOUT,
-) -> dict[str, Any]:
-    """Run generated e2e test cases against the current Lua code."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None,
-        partial(
-            _sync_run_e2e_suite,
-            lua_code,
-            suite,
-            lua_bin,
-            timeout_seconds,
-        ),
-    )
 
 
 def extract_function_names(code: str) -> list[str]:

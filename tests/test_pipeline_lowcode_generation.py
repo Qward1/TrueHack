@@ -440,8 +440,9 @@ return arr
         self.assertIn("for key in pairs(contacts) do", result["generated_code"])
         self.assertIn("Differentiate object-like tables from array-like tables", llm.last_fix_prompt)
         self.assertIn("Call `_utils.array.new()` without inline arguments", llm.last_fix_prompt)
-        self.assertIn("Rewrite the script from scratch", llm.last_fix_prompt)
-        self.assertNotIn("Current code:", llm.last_fix_prompt)
+        self.assertIn("Current broken code with line numbers:", llm.last_fix_prompt)
+        self.assertIn("return wf.vars.contacts", llm.last_fix_prompt)
+        self.assertNotIn("Rewrite the script from scratch", llm.last_fix_prompt)
 
     def test_array_normalization_rejects_next_check_and_source_marking_shortcut(self) -> None:
         async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
@@ -1226,6 +1227,135 @@ return epoch
         self.assertIn("argument #1 of type `table`", llm.last_fix_prompt)
         self.assertIn("validate or convert the workflow value", llm.last_fix_prompt)
         self.assertIn("wf.initVariables.recallTime", result["generated_code"])
+
+    def test_runtime_arithmetic_nil_error_retries_with_numbered_code_prompt(self) -> None:
+        seen_workflow_contexts: list[dict | None] = []
+
+        async def fake_run_diagnostics(
+            code: str,
+            lua_bin: str = "lua55",
+            startup_timeout: float = 3.0,
+            workflow_context: dict | None = None,
+        ) -> dict:
+            seen_workflow_contexts.append(workflow_context)
+            if "timezone_text" in code:
+                return _success_diagnostics()
+            return {
+                "success": False,
+                "started_ok": True,
+                "timed_out": False,
+                "program_mode": "workflow",
+                "validation_context": "test",
+                "mocked_init_variables": ["recallTime"],
+                "mocked_var_paths": [],
+                "contract_blockers": [],
+                "contract_warnings": [],
+                "run_output": "",
+                "run_error": "C:\\Users\\Admin\\AppData\\Local\\Temp\\tmp.lua:15: attempt to perform arithmetic on a nil value",
+                "run_warning": "",
+                "runtime_fix_hints": [
+                    "Arithmetic is applied to `nil`. Convert inputs with `tonumber(...)` or guard nil/non-numeric values before the operation.",
+                ],
+                "runtime_context": {
+                    "line": 15,
+                    "locals": [
+                        {"name": "offsetSign", "type": "string", "value": "-"},
+                        {"name": "offsetHours", "type": "nil", "value": "nil"},
+                    ],
+                },
+                "luacheck_output": "",
+                "luacheck_error": "",
+                "luacheck_warning": "",
+                "failure_kind": "runtime",
+            }
+
+        def fake_save_output(target_path: str, code: str, jsonstring_code: str = "") -> dict:
+            return {
+                "lua_path": target_path,
+                "jsonstring_path": f"{target_path}.jsonstring.txt",
+            }
+
+        repeated_broken = """lua{
+local isoDate = wf.initVariables.recallTime
+local year, month, day, hour, minute, second, offsetHours, offsetMinutes
+year, month, day, hour, minute, second, offsetSign, offsetHours, offsetMinutes = string.match(isoDate, "(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)([+-])(%d+):(%d+)")
+local epoch = os.time({year=tonumber(year), month=tonumber(month), day=tonumber(day), hour=tonumber(hour), min=tonumber(minute), sec=tonumber(second)})
+epoch = epoch + (offsetHours * 3600) + (offsetMinutes * 60)
+return epoch
+}lua"""
+        fixed_code = """lua{
+local isoDate = wf.initVariables.recallTime
+local baseText, timezone_text = isoDate:match("^(%d+%-%d+%-%d+T%d+:%d+:%d+)(Z|[+-]%d+:%d+)$")
+if not baseText or not timezone_text then
+    return nil
+end
+local year, month, day, hour, minute, second = baseText:match("^(%d+)%-(%d+)%-(%d+)T(%d+):(%d+):(%d+)$")
+local epoch = os.time({year=tonumber(year), month=tonumber(month), day=tonumber(day), hour=tonumber(hour), min=tonumber(minute), sec=tonumber(second)})
+if not epoch then
+    return nil
+end
+if timezone_text ~= "Z" then
+    local sign, offsetHour, offsetMinute = timezone_text:match("^([+-])(%d+):(%d+)$")
+    local offsetSeconds = (tonumber(offsetHour) * 3600) + (tonumber(offsetMinute) * 60)
+    if sign == "+" then
+        epoch = epoch - offsetSeconds
+    else
+        epoch = epoch + offsetSeconds
+    end
+end
+wf.vars.recallTimeEpoch = epoch
+return epoch
+}lua"""
+
+        llm = StubLLM(
+            generate_responses=[repeated_broken],
+            fix_response=[repeated_broken, fixed_code],
+        )
+        target_path = self.tmp_path / "sample.lua"
+        prompt = """Конвертируй время в переменной recallTime в unix-формат.
+
+{
+  "wf": {
+    "initVariables": {
+      "recallTime": "2023-10-15T15:30:00+00:00"
+    }
+  }
+}"""
+
+        with patch("src.graph.nodes.async_run_diagnostics", new=fake_run_diagnostics), patch(
+            "src.graph.nodes.save_final_output",
+            new=fake_save_output,
+        ):
+            engine = PipelineEngine(llm=llm)
+            result = asyncio.run(
+                engine.process_message(
+                    chat_id=1,
+                    user_input=prompt,
+                    workspace_root=str(self.tmp_path),
+                    target_path=str(target_path),
+                )
+            )
+
+        self.assertEqual(llm.fix_calls, 2)
+        self.assertTrue(result["save_success"])
+        self.assertTrue(seen_workflow_contexts)
+        self.assertEqual(
+            seen_workflow_contexts[0]["wf"]["initVariables"]["recallTime"],
+            "2023-10-15T15:30:00+00:00",
+        )
+        self.assertIn("Current broken code with line numbers:", llm.last_fix_prompt)
+        self.assertIn("  1 | local isoDate = wf.initVariables.recallTime", llm.last_fix_prompt)
+        self.assertIn("Likely failing Lua line: 15", llm.last_fix_prompt)
+        self.assertIn("Failing code context:", llm.last_fix_prompt)
+        self.assertIn("Runtime context snapshot:", llm.last_fix_prompt)
+        self.assertIn("offsetSign [string] = -", llm.last_fix_prompt)
+        self.assertIn("offsetHours [nil] = nil", llm.last_fix_prompt)
+        self.assertIn("When the runtime error points to a specific line", llm.last_fix_prompt)
+        self.assertIn("For any value derived from pattern matching, table lookups, helper calls, or workflow input", llm.last_fix_prompt)
+        self.assertIn("The proposed fix still fails during Lua validation", llm.last_fix_prompt)
+        self.assertIn("Remaining runtime repair hint:", llm.last_fix_prompt)
+        self.assertIn("The fix attempt did not materially change the code.", llm.last_fix_prompt)
+        self.assertIn("timezone_text", result["generated_code"])
 
     def test_ambiguity_returns_clarification_without_generation(self) -> None:
         async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:

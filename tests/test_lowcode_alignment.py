@@ -1,6 +1,8 @@
 import unittest
 
 from src.tools.lua_tools import (
+    _extract_runtime_context,
+    build_lowcode_validation_harness,
     compile_lowcode_request,
     format_lowcode_json_payload,
     inspect_lowcode_request_alignment,
@@ -47,7 +49,6 @@ class LowcodeAlignmentTests(unittest.TestCase):
     }
   }
 }""",
-            allow_deterministic=True,
         )
 
         self.assertEqual(compiled["selected_operation"], "count")
@@ -75,7 +76,6 @@ class LowcodeAlignmentTests(unittest.TestCase):
     }
   }
 }""",
-            allow_deterministic=True,
         )
 
         self.assertTrue(compiled["needs_clarification"])
@@ -98,6 +98,23 @@ class LowcodeAlignmentTests(unittest.TestCase):
 
         self.assertEqual(compiled["selected_primary_path"], "wf.vars.contacts")
         self.assertIn("array_normalization", compiled["semantic_expectations"])
+
+    def test_compile_request_preserves_parsed_context_for_runtime_validation(self) -> None:
+        compiled = compile_lowcode_request(
+            task_text="Convert wf.initVariables.recallTime to unix timestamp.",
+            raw_context="""{
+  "wf": {
+    "initVariables": {
+      "recallTime": "2023-10-15T15:30:00+00:00"
+    }
+  }
+}""",
+        )
+
+        self.assertEqual(
+            compiled["parsed_context"]["wf"]["initVariables"]["recallTime"],
+            "2023-10-15T15:30:00+00:00",
+        )
 
     def test_array_normalization_flags_next_check_and_source_marking_shortcuts(self) -> None:
         prompt = """Если поле contacts не массив, оберни его в массив.
@@ -258,6 +275,18 @@ json
         self.assertNotIn("\\n", normalized)
         self.assertNotIn('{"contacts":', normalized)
 
+    def test_normalize_lua_code_unwraps_nested_lowcode_wrappers(self) -> None:
+        raw = """```json
+{"recallTimeEpoch": "lua{\\r\\nlua{\\r\\nlocal value = wf.initVariables.recallTime\\r\\nreturn value\\r\\n}lua\\r\\n}lua"}
+```"""
+
+        normalized = normalize_lua_code(raw)
+
+        self.assertEqual(
+            normalized,
+            "local value = wf.initVariables.recallTime\nreturn value",
+        )
+
     def test_validate_lowcode_llm_output_rejects_fenced_wrapper(self) -> None:
         analysis = validate_lowcode_llm_output("```lua\nlua{return wf.vars.contacts}lua\n```")
 
@@ -320,6 +349,41 @@ return #cart.items
 
         self.assertFalse(result["passed"])
         self.assertTrue(any("invented top-level table" in item for item in result["anti_patterns"]))
+
+    def test_validation_harness_uses_provided_workflow_context_before_mocks(self) -> None:
+        harness, mocked = build_lowcode_validation_harness(
+            "sample.lua",
+            "return wf.initVariables.recallTime",
+            workflow_context={
+                "wf": {
+                    "initVariables": {
+                        "recallTime": "2023-10-15T15:30:00+00:00",
+                    }
+                }
+            },
+        )
+
+        self.assertIn('wf.initVariables = {["recallTime"] = "2023-10-15T15:30:00+00:00"}', harness)
+        self.assertIn("if wf.initVariables[\"recallTime\"] == nil then", harness)
+        self.assertEqual(mocked["initVariables"], ["recallTime"])
+
+    def test_extract_runtime_context_parses_locals_and_strips_markers(self) -> None:
+        run_output = """__TRUEHACK_CONTEXT_START__
+__TRUEHACK_FRAME__\t15\t\t@C:\\temp\\script.lua
+__TRUEHACK_LOCAL__\toffsetSign\tstring\t-
+__TRUEHACK_LOCAL__\toffsetHours\tnil\tnil
+__TRUEHACK_CONTEXT_END__
+C:\\temp\\script.lua:15: attempt to perform arithmetic on a nil value"""
+
+        cleaned, runtime_context = _extract_runtime_context(run_output)
+
+        self.assertEqual(
+            cleaned,
+            "C:\\temp\\script.lua:15: attempt to perform arithmetic on a nil value",
+        )
+        self.assertEqual(runtime_context["line"], 15)
+        self.assertEqual(runtime_context["locals"][0]["name"], "offsetSign")
+        self.assertEqual(runtime_context["locals"][1]["type"], "nil")
 
 
 if __name__ == "__main__":
