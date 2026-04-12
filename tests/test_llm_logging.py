@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from src.core import llm as llm_module
 
@@ -26,6 +27,41 @@ class LLMLoggingHelpersTests(unittest.TestCase):
             self.assertTrue(truncated.startswith("12345"))
         finally:
             llm_module.PROMPT_MAX_CHARS = previous
+
+    def test_agent_model_env_key_uses_upper_snake_case(self) -> None:
+        self.assertEqual(
+            llm_module._agent_model_env_key("CodeGenerator"),
+            "OLLAMA_MODEL_CODE_GENERATOR",
+        )
+        self.assertEqual(
+            llm_module._agent_model_env_key("RequirementsVerifier"),
+            "OLLAMA_MODEL_REQUIREMENTS_VERIFIER",
+        )
+
+    def test_resolve_agent_model_prefers_agent_override(self) -> None:
+        with patch.dict(
+            llm_module.os.environ,
+            {"OLLAMA_MODEL_VALIDATION_FIXER": "qwen2.5-coder:3b-instruct"},
+            clear=False,
+        ):
+            provider = llm_module.LLMProvider(model="qwen2.5-coder:7b-instruct")
+            self.assertEqual(
+                provider.resolve_model("ValidationFixer"),
+                "qwen2.5-coder:3b-instruct",
+            )
+            self.assertEqual(
+                provider.resolve_model("CodeGenerator"),
+                "qwen2.5-coder:7b-instruct",
+            )
+
+    def test_provider_reads_shared_model_from_env_at_init_time(self) -> None:
+        with patch.dict(
+            llm_module.os.environ,
+            {"OLLAMA_MODEL": "qwen2.5-coder:14b-instruct"},
+            clear=False,
+        ):
+            provider = llm_module.LLMProvider()
+            self.assertEqual(provider.resolve_model(""), "qwen2.5-coder:14b-instruct")
 
 
 if __name__ == "__main__":

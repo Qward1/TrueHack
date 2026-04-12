@@ -18,7 +18,8 @@ PLANNER_SYSTEM_PREFIX = "You are a task analyst for a Lua workflow script genera
 ROUTE_SYSTEM_PREFIX = "You are an intent classifier"
 EXPLAIN_SYSTEM_PREFIX = "You explain generated Lua code"
 VERIFY_SYSTEM_PREFIX = "You review whether a Lua solution fully satisfies the user's request."
-FIX_SYSTEM_PREFIX = "You fix broken Lua workflow scripts."
+FIX_VALIDATION_SYSTEM_PREFIX = "You fix Lua 5.5 workflow scripts that fail during execution."
+FIX_VERIFICATION_SYSTEM_PREFIX = "You fix Lua 5.5 workflow scripts that fail requirement verification."
 
 
 def _success_diagnostics() -> dict:
@@ -78,12 +79,21 @@ class IntegrationStubLLM:
         system: str = "",
         temperature: float = 0.2,
         max_tokens: int | None = None,
+        *,
+        agent_name: str = "",
     ) -> str:
         self.generate_calls += 1
         self.last_generate_prompt = prompt
         return self.generate_response
 
-    async def generate_json(self, prompt: str, system: str = "", temperature: float = 0.0) -> dict:
+    async def generate_json(
+        self,
+        prompt: str,
+        system: str = "",
+        temperature: float = 0.0,
+        *,
+        agent_name: str = "",
+    ) -> dict:
         if system.startswith(PLANNER_SYSTEM_PREFIX):
             self.planner_calls += 1
             self.last_planner_prompt = prompt
@@ -105,9 +115,11 @@ class IntegrationStubLLM:
         messages: list[dict],
         temperature: float = 0.2,
         max_tokens: int | None = None,
+        *,
+        agent_name: str = "",
     ) -> str:
         system = str(messages[0].get("content", "")) if messages else ""
-        if system.startswith(FIX_SYSTEM_PREFIX):
+        if system.startswith(FIX_VALIDATION_SYSTEM_PREFIX) or system.startswith(FIX_VERIFICATION_SYSTEM_PREFIX):
             return self.generate_response
         if system.startswith(VERIFY_SYSTEM_PREFIX):
             return json.dumps({

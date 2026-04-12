@@ -2,6 +2,25 @@
 
 # Decisions log
 
+## 2026-04-12
+### Decision
+Per-agent Ollama model selection is resolved centrally inside `src/core/llm.py`, not by branching the pipeline into separate client implementations.
+
+### Why
+Different LLM steps have different quality/latency requirements, but adding dedicated clients per node would duplicate configuration, logging, and request handling.
+
+### Consequences
+- The canonical runtime still constructs one `LLMProvider`.
+- Each LLM call now passes its logical `agent_name`, and `LLMProvider` resolves the effective model from env key `OLLAMA_MODEL_<AGENT_NAME>` when present.
+- Shared fallback order is:
+  - per-agent env override;
+  - CLI `--model`;
+  - shared `OLLAMA_MODEL`;
+  - built-in default.
+- Request/response audit logs now include both `agent_name` and the effective `model`.
+
+---
+
 ## 2026-04-10
 ### Decision
 Используем `app.py + src/graph` как единственный поддерживаемый runtime.
@@ -184,18 +203,15 @@ Follow-up вида `примени предложение N` поддержив�
 
 ## 2026-04-11
 ### Decision
-Workflow-path alignment is now enforced by a deterministic guard before save.
+Workflow-path alignment is a hard save-gate requirement.
 
 ### Why
 LLM-only verification was insufficient for public-sample tasks: the model could still return an app-style script with invented input tables and pass semantic scoring. The product requirement is stricter: generated Lua must operate on the provided workflow structure directly.
 
 ### Consequences
-- `verify_requirements` now merges semantic LLM verification with deterministic checks.
-- Deterministic checks validate:
-  - direct usage of expected `wf.vars.*` / `wf.initVariables.*` paths when they are explicitly mentioned;
-  - absence of invented demo tables and app/service wrappers when workflow context is present;
-  - direct `return` for simple extraction/computation tasks unless the request explicitly asks to save into `wf.vars`.
-- `check_verification` no longer allows save when deterministic `missing_requirements` are present, even if the semantic verifier returns a high score or is temporarily unavailable.
+- The product rule stays the same: code that ignores the provided workflow structure must not be saved.
+- The initial implementation used a deterministic guard.
+- The active implementation now enforces the same rule through semantic verification with parsed workflow context and concrete runtime evidence.
 
 ---
 
@@ -317,7 +333,7 @@ LLM intent classifier склонен переоценивать `change` для 
 Bare field names from the task can be resolved to workflow paths using the pasted context.
 
 ### Why
-Пользователь часто пишет `recallTime`, `emails`, `DATUM`, `TIME` без полного `wf.vars.*` / `wf.initVariables.*`. Если parseable workflow context уже есть в сообщении, отсутствие такого разрешения делает deterministic verification слишком слабой и позволяет сохранить код с неправильным workflow path.
+Пользователь часто пишет `recallTime`, `emails`, `DATUM`, `TIME` без полного `wf.vars.*` / `wf.initVariables.*`. Если parseable workflow context уже есть в сообщении, отсутствие такого разрешения ослабляет verification/save gate и позволяет сохранить код с неправильным workflow path.
 
 ### Consequences
 - compiler добавляет inferred explicit paths, если bare field name однозначно соответствует одному workflow path в pasted context;
@@ -394,26 +410,26 @@ Raw stderr alone is often too noisy. For recurring Lua failures such as `bad arg
 Fix-loop must not trust the first model repair attempt blindly.
 
 ### Why
-Логи показали, что модель может игнорировать diagnostics и вернуть почти тот же код или повторить те же deterministic requirement failures. Без дополнительной проверки pipeline тратит итерации fix-loop на косметические или пустые правки.
+Логи показали, что модель может игнорировать diagnostics и вернуть почти тот же код или повторить те же semantic requirement failures. Без дополнительной проверки pipeline тратит итерации fix-loop на косметические или пустые правки.
 
 ### Consequences
 - after the first `fix_code` model call, the pipeline assesses the candidate before returning to validation;
-- if the candidate is empty, not a plausible standalone Lua file, materially unchanged, or still repeats the same deterministic requirement failures, `fix_code` performs one stricter internal retry immediately;
+- if the candidate is empty, not a plausible standalone Lua file, materially unchanged, or still repeats the same semantic requirement failures, `fix_code` performs one stricter internal retry immediately;
 - the stricter retry explicitly lists why the previous fix attempt is rejected and demands a materially different full Lua script.
 
 ---
 
 ## 2026-04-12
 ### Decision
-Deterministic verification remains the source of truth when it conflicts with the semantic LLM verifier.
+Concrete runtime evidence overrides an optimistic verifier pass.
 
 ### Why
-LLM verifier can hallucinate and approve code that still violates hard workflow-contract rules already found by deterministic checks. Merging both summaries naively creates misleading “passed” explanations and noisy repair prompts.
+LLM verifier can hallucinate and approve code that still violates the request. Concrete runtime result and updated workflow state are stronger evidence than a purely textual approval.
 
 ### Consequences
-- deterministic findings are injected into the verifier prompt as hard constraints;
-- optimistic LLM `passed=true` no longer overrides deterministic `fail`;
-- when such a conflict happens, the final verification result records an explicit verifier-conflict warning and summary instead of surfacing the positive LLM verdict as if it were authoritative.
+- verifier prompts include the concrete runtime result, and for mutation scripts also the updated workflow snapshot after execution;
+- a contradiction-focused verifier retry can overturn an optimistic first pass;
+- fix prompts receive the concrete request-vs-result mismatch instead of a static guard verdict.
 
 ---
 
@@ -488,9 +504,36 @@ Generation and verification must reason explicitly about shape-sensitive workflo
   - edge cases;
   - helper API usage;
 - verification prompt now returns a checklist, not only a free-form summary;
-- deterministic guard now blocks:
+- semantic verification and fix prompts now explicitly reject:
   - array-normalization code that relies only on `type(x) == "table"`;
   - array-normalization code that treats `next(x)` / empty-vs-non-empty checks as a substitute for object-vs-array shape detection;
   - relabeling the original workflow object/scalar as an array in place via `_utils.array.markAsArray(source)`;
   - `_utils.array.new(...)` with inline arguments;
   - new arrays returned without `_utils.array.markAsArray(arr)`.
+
+---
+
+## 2026-04-12
+### Decision
+Semantic verification must evaluate both direct return values and post-execution workflow mutations.
+
+### Why
+Many workflow scripts satisfy the task by updating `wf.vars` and returning `nil`. Checking only the direct runtime result causes false positives and false negatives: verifier misses wrong mutations, while correct mutation scripts look like `null`.
+
+### Consequences
+- validation harness serializes both the direct Lua result and the updated workflow snapshot;
+- verifier and verification-fix prompts can judge mutation tasks against the updated workflow state when direct result is `null`;
+- runtime marker extraction is CRLF-safe, so service markers are stripped reliably on Windows.
+
+---
+
+## 2026-04-12
+### Decision
+Solution explanation sections should accept both array and string JSON fields from the explainer model.
+
+### Why
+`SolutionExplainer` sometimes returns `what_is_in_code` / `how_it_works` as single strings instead of JSON arrays. Treating those fields as invalid caused needless fallback to generic text even when the model produced useful content.
+
+### Consequences
+- explainer response normalization now converts single strings and multiline text into short string lists;
+- generic fallback text is used only when the explainer returned no usable content for that section.

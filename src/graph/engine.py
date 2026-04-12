@@ -14,7 +14,7 @@ from src.graph.builder import build_graph
 
 logger = structlog.get_logger(__name__)
 
-DEFAULT_MAX_FIX = 5
+DEFAULT_MAX_FIX = 3
 
 
 class PipelineEngine:
@@ -67,6 +67,7 @@ class PipelineEngine:
             "diagnostics": {},
             "validation_passed": False,
             "fix_iterations": 0,
+            "fix_verification_iterations": 0,
             "max_fix_iterations": self._max_fix,
             "verification": {},
             "verification_passed": False,

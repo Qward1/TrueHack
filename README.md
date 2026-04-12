@@ -78,6 +78,33 @@ python app.py --host 127.0.0.1 --port 8765 --workspace C:\Work\LuaProjects --mod
 - `OLLAMA_MODEL` — имя модели (по умолчанию `qwen2.5-coder:7b-instruct`)
 - `OLLAMA_BASE_URL` — URL Ollama API (по умолчанию `http://127.0.0.1:11434/v1`)
 
+Опционально можно задать отдельные модели для конкретных LLM-агентов через `.env`.
+Приоритет выбора модели такой:
+1. `OLLAMA_MODEL_<AGENT_NAME>` для конкретного агента
+2. CLI `--model`
+3. общий `OLLAMA_MODEL`
+4. встроенный default `qwen2.5-coder:7b-instruct`
+
+Поддерживаемые per-agent переменные:
+- `OLLAMA_MODEL_INTENT_ROUTER`
+- `OLLAMA_MODEL_TASK_PLANNER`
+- `OLLAMA_MODEL_CODE_GENERATOR`
+- `OLLAMA_MODEL_CODE_REFINER`
+- `OLLAMA_MODEL_VALIDATION_FIXER`
+- `OLLAMA_MODEL_VERIFICATION_FIXER`
+- `OLLAMA_MODEL_REQUIREMENTS_VERIFIER`
+- `OLLAMA_MODEL_SOLUTION_EXPLAINER`
+- `OLLAMA_MODEL_QUESTION_ANSWERER`
+
+Пример:
+
+```env
+OLLAMA_MODEL=qwen2.5-coder:7b-instruct
+OLLAMA_MODEL_INTENT_ROUTER=qwen2.5-coder:3b-instruct
+OLLAMA_MODEL_REQUIREMENTS_VERIFIER=qwen2.5-coder:14b-instruct
+OLLAMA_MODEL_SOLUTION_EXPLAINER=qwen2.5-coder:3b-instruct
+```
+
 ## Как задавать путь для Lua
 
 ### 1. Явный `.lua` файл
@@ -215,11 +242,12 @@ Canonical runtime — Ollama с OpenAI-compatible API на `http://127.0.0.1:114
   - logic correctness;
   - helper API usage;
   - edge cases;
-- verifier теперь получает deterministic findings как hard constraints:
-  - если deterministic layer уже нашёл обязательные нарушения, optimistic LLM verdict не может переопределить итоговый fail;
-  - при конфликте итоговый summary явно помечает, что LLM verifier был overridden deterministic checks;
+- verifier теперь получает concrete runtime evidence:
+  - direct runtime result from validation;
+  - updated workflow snapshot after execution for mutation scripts;
+  - contradiction-focused second pass can overturn an optimistic false positive;
   - verifier дополнительно не должен одобрять ответы с markdown/quoted wrappers и shape-sensitive код, где `next(...)` выступает единственной проверкой массива;
-- shape-sensitive задачи теперь проходят дополнительный deterministic semantic gate:
+- shape-sensitive задачи теперь проверяются semantic verifier'ом и fix-loop по явным правилам:
   - нельзя опираться только на `type(x) == "table"` там, где нужно отличать object-like table от array-like table;
   - проверки `next(x)` / empty-vs-non-empty не считаются достаточным shape detection;
   - нельзя просто пометить исходный workflow object/scalar как массив через `_utils.array.markAsArray(source)` вместо создания нового array value;
@@ -227,7 +255,7 @@ Canonical runtime — Ollama с OpenAI-compatible API на `http://127.0.0.1:114
   - для новых массивов требуется `_utils.array.markAsArray(arr)`;
 - naming для auto-created folder/file и title чата строится из очищенного prompt и санитизируется под Windows;
 - без явного пути в новом чате runtime больше не создаёт fallback file target и показывает код только в ответе;
-- задачи очистки/удаления ключей внутри workflow-объектов больше не считаются простым `return`-сценарием и проходят дополнительную deterministic-проверку на реальную трансформацию данных;
+- задачи очистки/удаления ключей внутри workflow-объектов больше не считаются простым `return`-сценарием и проходят semantic verification на реальную трансформацию данных;
 - если пользователь в задаче упоминает bare field name из parseable workflow context, runtime пытается однозначно привязать его к `wf.vars.*` или `wf.initVariables.*` и использует это в verification/save gate;
 - fix-loop теперь получает не только raw Lua runtime error, но и нормализованные repair hints для типовых ошибок аргументов, nil access/call, arithmetic/type mismatch и concatenation;
 - `fix_code` теперь делает один внутренний stricter retry, если первый fix-ответ:

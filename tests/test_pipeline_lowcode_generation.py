@@ -8,8 +8,9 @@ from src.graph.engine import PipelineEngine
 
 ROUTE_SYSTEM_PREFIX = "You are an intent classifier"
 EXPLAIN_SYSTEM_PREFIX = "You explain generated Lua code"
-VERIFY_SYSTEM_PREFIX = "You review whether a Lua solution fully satisfies the user's request."
-FIX_SYSTEM_PREFIX = "You fix broken Lua workflow scripts."
+VERIFY_SYSTEM_PREFIX = "You are a STRICT verifier that decides whether a Lua solution fully satisfies the user's request."
+FIX_VALIDATION_SYSTEM_PREFIX = "You fix Lua 5.5 workflow scripts that fail during execution."
+FIX_VERIFICATION_SYSTEM_PREFIX = "You fix Lua 5.5 workflow scripts that fail requirement verification."
 
 
 class StubLLM:
@@ -42,7 +43,15 @@ class StubLLM:
         self.last_chat_temperature = None
         self.last_verify_messages: list[dict] = []
 
-    async def generate(self, prompt: str, system: str = "", temperature: float = 0.2, max_tokens: int | None = None) -> str:
+    async def generate(
+        self,
+        prompt: str,
+        system: str = "",
+        temperature: float = 0.2,
+        max_tokens: int | None = None,
+        *,
+        agent_name: str = "",
+    ) -> str:
         if system.startswith(ROUTE_SYSTEM_PREFIX):
             raise AssertionError("route_intent should use generate_json")
         if system.startswith(EXPLAIN_SYSTEM_PREFIX):
@@ -55,7 +64,14 @@ class StubLLM:
             return self._generate_responses.pop(0)
         raise AssertionError(f"unexpected generate call: {system[:80]}")
 
-    async def generate_json(self, prompt: str, system: str = "", temperature: float = 0.0) -> dict:
+    async def generate_json(
+        self,
+        prompt: str,
+        system: str = "",
+        temperature: float = 0.0,
+        *,
+        agent_name: str = "",
+    ) -> dict:
         if system.startswith(ROUTE_SYSTEM_PREFIX):
             return {"intent": self._route_intent, "confidence": 1.0}
         if system.startswith(EXPLAIN_SYSTEM_PREFIX):
@@ -68,7 +84,14 @@ class StubLLM:
             }
         raise AssertionError(f"unexpected generate_json call: {system[:80]}")
 
-    async def chat(self, messages: list[dict], temperature: float = 0.2, max_tokens: int | None = None) -> str:
+    async def chat(
+        self,
+        messages: list[dict],
+        temperature: float = 0.2,
+        max_tokens: int | None = None,
+        *,
+        agent_name: str = "",
+    ) -> str:
         system = str(messages[0].get("content", "")) if messages else ""
         self.last_chat_temperature = temperature
         if system.startswith(VERIFY_SYSTEM_PREFIX):
@@ -87,13 +110,35 @@ class StubLLM:
                 '"edge_case_handling": {"status": "pass", "reason": ""}'
                 '}}'
             )
-        if system.startswith(FIX_SYSTEM_PREFIX):
+        if system.startswith(FIX_VALIDATION_SYSTEM_PREFIX) or system.startswith(FIX_VERIFICATION_SYSTEM_PREFIX):
             self.fix_calls += 1
             self.last_fix_prompt = str(messages[-1].get("content", "")) if messages else ""
             if self._fix_responses:
                 return self._fix_responses.pop(0)
             raise AssertionError("unexpected extra fix call")
         raise AssertionError(f"unexpected chat call: {system[:80]}")
+
+
+class ExplainStringFieldsStubLLM(StubLLM):
+    async def generate_json(
+        self,
+        prompt: str,
+        system: str = "",
+        temperature: float = 0.0,
+        *,
+        agent_name: str = "",
+    ) -> dict:
+        if system.startswith(ROUTE_SYSTEM_PREFIX):
+            return {"intent": self._route_intent, "confidence": 1.0}
+        if system.startswith(EXPLAIN_SYSTEM_PREFIX):
+            return {
+                "summary": "Скрипт подготовлен.",
+                "what_is_in_code": "Читает массив из wf.vars.cart.items и возвращает количество элементов.",
+                "how_it_works": "1. Берет массив cart.items.\n2. Считает количество элементов.\n3. Возвращает число.",
+                "suggested_changes": [],
+                "clarifying_questions": [],
+            }
+        raise AssertionError(f"unexpected generate_json call: {system[:80]}")
 
 
 def _success_diagnostics() -> dict:
@@ -114,6 +159,8 @@ def _success_diagnostics() -> dict:
         "runtime_context": {},
         "result_value": None,
         "result_preview": "",
+        "workflow_state": None,
+        "workflow_state_preview": "",
         "luacheck_output": "",
         "luacheck_error": "",
         "luacheck_warning": "",
@@ -183,6 +230,46 @@ class PipelineLowcodeGenerationTests(unittest.TestCase):
         self.assertEqual(llm.fix_calls, 0)
         self.assertEqual(llm.generate_calls, 1)
         self.assertNotIn("shortest correct script", llm.last_generate_system)
+
+    def test_explainer_string_fields_do_not_fall_back_to_generic_sections(self) -> None:
+        async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
+            return _success_diagnostics()
+
+        llm = ExplainStringFieldsStubLLM(
+            generate_responses=["lua{return #wf.vars.cart.items}lua"],
+            fix_response="",
+        )
+        prompt = """Посчитай количество товаров в корзине.
+
+{
+  "wf": {
+    "vars": {
+      "cart": {
+        "items": [
+          { "sku": "A001" },
+          { "sku": "A002" }
+        ]
+      }
+    }
+  }
+}"""
+
+        with patch("src.graph.nodes.async_run_diagnostics", new=fake_run_diagnostics):
+            engine = PipelineEngine(llm=llm)
+            result = asyncio.run(
+                engine.process_message(
+                    chat_id=1,
+                    user_input=prompt,
+                    workspace_root=str(self.tmp_path),
+                    target_path="",
+                )
+            )
+
+        self.assertIn("Что есть в коде", result["response"])
+        self.assertIn("Читает массив из wf.vars.cart.items", result["response"])
+        self.assertIn("Как это работает", result["response"])
+        self.assertIn("Берет массив cart.items", result["response"])
+        self.assertNotIn("Основная логика задачи реализована", result["response"])
 
     def test_last_email_prompt_uses_model_generation_and_saves(self) -> None:
         async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
@@ -313,7 +400,10 @@ return arr
         self.assertIn("Use workflow path: wf.vars.contacts", llm.last_generate_prompt)
         self.assertIn("Treat an empty table as an array.", llm.last_generate_prompt)
         self.assertIn("create it with `_utils.array.new()`, assign items explicitly", llm.last_generate_prompt)
-        self.assertIn("The response must start with `lua{` and end with `}lua`", llm.last_generate_system)
+        self.assertIn(
+            "The response MUST start with the literal three characters `lua{` and end with the literal four characters `}lua`.",
+            llm.last_generate_system,
+        )
         self.assertNotIn("JsonString", llm.last_generate_system)
         self.assertNotIn("return wf.vars.emails[#wf.vars.emails]", llm.last_generate_prompt)
         self.assertEqual(llm.last_generate_temperature, 0.0)
@@ -465,7 +555,7 @@ return arr
             "Wrap wf.vars.contacts into a new array and return that array instead of rewriting the source value in place.",
             llm.last_fix_prompt,
         )
-        self.assertIn("Current broken code with line numbers:", llm.last_fix_prompt)
+        self.assertIn("Current code with line numbers:", llm.last_fix_prompt)
         self.assertIn("return wf.vars.contacts", llm.last_fix_prompt)
         self.assertNotIn("Rewrite the script from scratch", llm.last_fix_prompt)
 
@@ -560,7 +650,7 @@ return arr
             "Wrap object-like wf.vars.contacts into a new array instead of relabeling the source value in place.",
             llm.last_fix_prompt,
         )
-        self.assertIn("Current broken code with line numbers:", llm.last_fix_prompt)
+        self.assertIn("Current code with line numbers:", llm.last_fix_prompt)
 
     def test_fix_code_accepts_single_repair_when_requirement_failure_is_addressed(self) -> None:
         async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
@@ -908,6 +998,156 @@ return filterParsedCsv(wf.vars.parsedCsv)
         self.assertIn("A004", verify_messages_text)
         self.assertFalse(result["verification"]["passed"])
         self.assertFalse(result["save_success"])
+
+    def test_verifier_receives_updated_workflow_snapshot_for_mutation_tasks(self) -> None:
+        async def fake_run_diagnostics(
+            code: str,
+            lua_bin: str = "lua55",
+            startup_timeout: float = 3.0,
+            workflow_context: dict | None = None,
+        ) -> dict:
+            diagnostics = _success_diagnostics()
+            diagnostics["workflow_state"] = {
+                "wf": {
+                    "vars": {
+                        "json": {
+                            "IDOC": {
+                                "ZCDF_HEAD": {
+                                    "ZCDF_PACKAGES": [
+                                        {"items": [{"sku": "A"}, {"sku": "B"}]},
+                                        {"items": [{"sku": "C"}]},
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            diagnostics["workflow_state_preview"] = (
+                '{"wf":{"vars":{"json":{"IDOC":{"ZCDF_HEAD":{"ZCDF_PACKAGES":'
+                '[{"items":[{"sku":"A"},{"sku":"B"}]},{"items":[{"sku":"C"}]}]}}}}}}'
+            )
+            return diagnostics
+
+        llm = StubLLM(
+            generate_responses=[
+                """lua{
+local function is_array(x)
+  if type(x) ~= "table" then return false end
+  local first_key = next(x)
+  return first_key and tonumber(first_key) == first_key
+end
+
+local packages = wf.vars.json.IDOC.ZCDF_HEAD.ZCDF_PACKAGES
+for i, package in ipairs(packages) do
+  if not is_array(package.items) then
+    package.items = {package.items}
+  end
+end
+wf.vars.json.IDOC.ZCDF_HEAD.ZCDF_PACKAGES = packages
+}lua"""
+            ],
+            fix_response="",
+        )
+        prompt = """Как преобразовать структуру данных так, чтобы все элементы items в ZCDF_PACKAGES
+всегда были представлены в виде массивов, даже если они изначально не являются
+массивами
+{
+  "wf": {
+    "vars": {
+      "json": {
+        "IDOC": {
+          "ZCDF_HEAD": {
+            "ZCDF_PACKAGES": [
+              { "items": [{"sku": "A"}, {"sku": "B"}] },
+              { "items": {"sku": "C"} }
+            ]
+          }
+        }
+      }
+    }
+  }
+}"""
+
+        with patch("src.graph.nodes.async_run_diagnostics", new=fake_run_diagnostics):
+            engine = PipelineEngine(llm=llm, max_fix_iterations=0)
+            asyncio.run(
+                engine.process_message(
+                    chat_id=1,
+                    user_input=prompt,
+                    workspace_root=str(self.tmp_path),
+                    target_path="",
+                )
+            )
+
+        verify_messages_text = "\n".join(str(message.get("content", "")) for message in llm.last_verify_messages)
+        self.assertIn("Updated workflow state after execution", verify_messages_text)
+        self.assertIn("Updated workflow value at wf.vars.json.IDOC.ZCDF_HEAD.ZCDF_PACKAGES after execution", verify_messages_text)
+        self.assertIn('"sku": "C"', verify_messages_text)
+
+    def test_failed_verification_skips_save_but_still_returns_code(self) -> None:
+        async def fake_run_diagnostics(
+            code: str,
+            lua_bin: str = "lua55",
+            startup_timeout: float = 3.0,
+            workflow_context: dict | None = None,
+        ) -> dict:
+            return _success_diagnostics()
+
+        def fail_if_save_called(target_path: str, code: str, jsonstring_code: str = "") -> dict:
+            raise AssertionError("save_final_output must not be called when verification fails")
+
+        llm = StubLLM(
+            generate_responses=["lua{return wf.vars.contacts}lua"],
+            fix_response="",
+            verify_response=(
+                '{"passed": false, "score": 15, "summary": "Verification failed.", '
+                '"missing_requirements": ["Return the normalized contacts array instead of the original object."], '
+                '"warnings": [], '
+                '"checks": {'
+                '"workflow_path_usage": {"status": "pass", "reason": ""}, '
+                '"source_shape_understood": {"status": "pass", "reason": ""}, '
+                '"target_shape_satisfied": {"status": "fail", "reason": "The returned value is still an object."}, '
+                '"logic_correctness": {"status": "fail", "reason": "The requested normalization is missing."}, '
+                '"helper_api_usage": {"status": "pass", "reason": ""}, '
+                '"edge_case_handling": {"status": "pass", "reason": ""}'
+                '}}'
+            ),
+        )
+        target_path = self.tmp_path / "contacts.lua"
+        prompt = """Если поле contacts не массив, оберни его в массив.
+
+{
+  "wf": {
+    "vars": {
+      "contacts": {
+        "name": "Ivan",
+        "phone": "+79990001122"
+      }
+    }
+  }
+}"""
+
+        with patch("src.graph.nodes.async_run_diagnostics", new=fake_run_diagnostics), patch(
+            "src.graph.nodes.save_final_output",
+            new=fail_if_save_called,
+        ):
+            engine = PipelineEngine(llm=llm, max_fix_iterations=0)
+            result = asyncio.run(
+                engine.process_message(
+                    chat_id=1,
+                    user_input=prompt,
+                    workspace_root=str(self.tmp_path),
+                    target_path=str(target_path),
+                )
+            )
+
+        self.assertFalse(result["verification"].get("passed", True))
+        self.assertFalse(result["save_success"])
+        self.assertTrue(result["save_skipped"])
+        self.assertEqual(result["saved_to"], "")
+        self.assertEqual(result["response_type"], "code")
+        self.assertIn("проверку требований", result["response"])
 
     def test_failed_validation_still_returns_code_payload(self) -> None:
         async def failing_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
@@ -1478,8 +1718,8 @@ return epoch
 
         self.assertEqual(llm.fix_calls, 1)
         self.assertTrue(result["save_success"])
-        self.assertIn("argument #1 of type `table`", llm.last_fix_prompt)
-        self.assertIn("validate or convert the workflow value", llm.last_fix_prompt)
+        self.assertIn("Runtime error:", llm.last_fix_prompt)
+        self.assertIn("Current code with line numbers:", llm.last_fix_prompt)
         self.assertIn("wf.initVariables.recallTime", result["generated_code"])
 
     def test_runtime_arithmetic_nil_error_retries_with_numbered_code_prompt(self) -> None:
@@ -1597,18 +1837,12 @@ return epoch
             seen_workflow_contexts[0]["wf"]["initVariables"]["recallTime"],
             "2023-10-15T15:30:00+00:00",
         )
-        self.assertIn("Current broken code with line numbers:", llm.last_fix_prompt)
+        self.assertIn("Current code with line numbers:", llm.last_fix_prompt)
         self.assertIn("  1 | local isoDate = wf.initVariables.recallTime", llm.last_fix_prompt)
         self.assertIn("Likely failing Lua line: 15", llm.last_fix_prompt)
         self.assertIn("Failing code context:", llm.last_fix_prompt)
-        self.assertIn("Runtime context snapshot:", llm.last_fix_prompt)
-        self.assertIn("offsetSign [string] = -", llm.last_fix_prompt)
-        self.assertIn("offsetHours [nil] = nil", llm.last_fix_prompt)
-        self.assertIn("When the runtime error points to a specific line", llm.last_fix_prompt)
-        self.assertIn("For any value derived from pattern matching, table lookups, helper calls, or workflow input", llm.last_fix_prompt)
-        self.assertIn("The proposed fix still fails during Lua validation", llm.last_fix_prompt)
-        self.assertIn("Remaining runtime repair hint:", llm.last_fix_prompt)
-        self.assertIn("The fix attempt did not materially change the code.", llm.last_fix_prompt)
+        self.assertIn("Error analysis:", llm.last_fix_prompt)
+        self.assertIn("the previous fix attempt returned unchanged code", llm.last_fix_prompt.lower())
         self.assertIn("timezone_text", result["generated_code"])
 
     def test_ambiguity_returns_clarification_without_generation(self) -> None:

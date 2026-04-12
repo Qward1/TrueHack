@@ -268,7 +268,11 @@ class PlannerAgent:
             system_len=len(_PLANNER_SYSTEM),
         )
 
-        raw = await self._llm.generate_json(prompt, system=_PLANNER_SYSTEM)
+        raw = await self._llm.generate_json(
+            prompt,
+            system=_PLANNER_SYSTEM,
+            agent_name=_AGENT_NAME,
+        )
 
         logger.info(
             f"[{_AGENT_NAME}/llm.generate_json] done",

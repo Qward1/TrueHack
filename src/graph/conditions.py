@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import structlog
+
 from src.core.state import PipelineState
+
+logger = structlog.get_logger(__name__)
 
 
 def route_from_start(state: PipelineState) -> str:
@@ -47,36 +51,54 @@ def route_after_preparation(state: PipelineState) -> str:
 
 
 def check_validation(state: PipelineState) -> str:
-    """After local validation -> verify, fix, or respond with failure."""
+    """After local validation:
+    - pass  → verify
+    - fail, iterations left → fix_validation
+    - fail, max iterations reached → log and continue to verify anyway (pipeline never stops)
+    """
     if state.get("validation_passed"):
         return "verify"
 
     fix_iter = state.get("fix_iterations", 0)
-    max_fix = state.get("max_fix_iterations", 5)
+    max_fix = state.get("max_fix_iterations", 3)
     if fix_iter < max_fix:
-        return "fix"
-    return "force_respond"
+        return "fix_validation"
+
+    logger.warning(
+        "[ValidationFixLoop] max_iterations_reached_continuing_to_verify",
+        fix_iterations=fix_iter,
+        failure_kind=state.get("diagnostics", {}).get("failure_kind", "unknown"),
+    )
+    return "verify"
 
 
 def check_verification(state: PipelineState) -> str:
-    """After requirement verification -> save, fix, or fail."""
+    """After requirement verification:
+    - pass → save
+    - fail, iterations left → fix_verification
+    - fail, max iterations reached → log and continue to save anyway (pipeline never stops)
+    """
     verification = state.get("verification", {})
-    missing_requirements = verification.get("missing_requirements", [])
-    fix_iter = state.get("fix_iterations", 0)
+    missing_requirements = verification.get("missing_requirements", []) if isinstance(verification, dict) else []
+    fix_iter = state.get("fix_verification_iterations", 0)
     max_fix = state.get("max_fix_iterations", 5)
 
-    if verification.get("error"):
-        return "force_respond"
-
-    if missing_requirements:
-        if fix_iter < max_fix:
-            return "fix"
-        return "force_respond"
-
-    passed = verification.get("passed", False)
-    if passed:
+    if isinstance(verification, dict) and verification.get("error"):
+        logger.warning(
+            "[VerificationFixLoop] verification_error_continuing_to_save",
+            error=str(verification.get("error", ""))[:120],
+        )
         return "save"
 
-    if fix_iter < max_fix:
-        return "fix"
-    return "force_respond"
+    needs_fix = bool(missing_requirements) or not (isinstance(verification, dict) and verification.get("passed", False))
+    if needs_fix:
+        if fix_iter < max_fix:
+            return "fix_verification"
+        logger.warning(
+            "[VerificationFixLoop] max_iterations_reached_continuing_to_save",
+            fix_iterations=fix_iter,
+            missing_count=len(missing_requirements),
+        )
+        return "save"
+
+    return "save"

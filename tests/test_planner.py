@@ -25,20 +25,42 @@ class StubLLM:
         self.last_prompt = ""
         self.last_system = ""
 
-    async def generate(self, prompt: str, system: str = "", temperature: float = 0.2, max_tokens: int | None = None) -> str:
+    async def generate(
+        self,
+        prompt: str,
+        system: str = "",
+        temperature: float = 0.2,
+        max_tokens: int | None = None,
+        *,
+        agent_name: str = "",
+    ) -> str:
         self.call_count += 1
         self.last_prompt = prompt
         self.last_system = system
         import json
         return json.dumps(self._response)
 
-    async def generate_json(self, prompt: str, system: str = "", temperature: float = 0.0) -> dict:
+    async def generate_json(
+        self,
+        prompt: str,
+        system: str = "",
+        temperature: float = 0.0,
+        *,
+        agent_name: str = "",
+    ) -> dict:
         self.call_count += 1
         self.last_prompt = prompt
         self.last_system = system
         return self._response
 
-    async def chat(self, messages: list[dict], temperature: float = 0.2, max_tokens: int | None = None) -> str:
+    async def chat(
+        self,
+        messages: list[dict],
+        temperature: float = 0.2,
+        max_tokens: int | None = None,
+        *,
+        agent_name: str = "",
+    ) -> str:
         self.call_count += 1
         return ""
 

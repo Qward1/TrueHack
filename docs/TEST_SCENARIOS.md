@@ -370,6 +370,23 @@ Any workflow task where the first semantic verifier pass incorrectly returns `pa
 - save is blocked and fix-loop continues or the response fails closed;
 - verifier can overturn a false positive by citing the contradictory runtime result directly.
 
+## 21e. Mutation task verification uses updated workflow snapshot when return is null
+### Prompt
+Workflow task that updates `wf.vars.*` in place and does not `return` a value, for example normalizing nested `items` inside `wf.vars.json.IDOC.ZCDF_HEAD.ZCDF_PACKAGES`.
+
+### Pass criteria
+- validation harness serializes the updated workflow snapshot after execution;
+- verifier prompt includes the updated workflow state and the concrete selected workflow path value after execution;
+- requirement verification can fail or pass the mutation task based on the updated workflow data, not only on `null` direct result.
+
+## 21f. Explainer string fields do not trigger generic fallback sections
+### Prompt
+Any successful workflow generation where `SolutionExplainer` returns `what_is_in_code` or `how_it_works` as plain strings instead of JSON arrays.
+
+### Pass criteria
+- response normalizer converts those strings into list items;
+- user-facing blocks `Что есть в коде` / `Как это работает` show the model content instead of generic fallback text.
+
 ## 22. User-facing JsonString export is wrapped into a named JSON field
 ### Prompt
 Любой успешный workflow generation/save сценарий.

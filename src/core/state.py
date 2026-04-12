@@ -32,7 +32,8 @@ class PipelineState(TypedDict):
     failure_stage: str
     diagnostics: dict[str, Any]
     validation_passed: bool
-    fix_iterations: int
+    fix_iterations: int          # validation-fix counter
+    fix_verification_iterations: int  # verification-fix counter
     max_fix_iterations: int
 
     # Verification / save state

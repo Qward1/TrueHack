@@ -88,8 +88,7 @@ def build_graph(llm: LLMProvider):
         check_validation,
         {
             "verify": "verify_requirements",
-            "fix": "fix_code",
-            "force_respond": "prepare_response",
+            "fix_validation": "fix_validation_code",
         },
     )
 
@@ -98,12 +97,12 @@ def build_graph(llm: LLMProvider):
         check_verification,
         {
             "save": "save_code",
-            "fix": "fix_code",
-            "force_respond": "prepare_response",
+            "fix_verification": "fix_verification_code",
         },
     )
 
-    graph.add_edge("fix_code", "validate_code")
+    graph.add_edge("fix_validation_code", "validate_code")
+    graph.add_edge("fix_verification_code", "verify_requirements")
     graph.add_edge("save_code", "explain_solution")
     graph.add_edge("explain_solution", "prepare_response")
 

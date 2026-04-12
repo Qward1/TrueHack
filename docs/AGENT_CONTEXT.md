@@ -130,10 +130,10 @@
 - Prompt assembly splits the user message into `task` and pasted workflow context.
 - Generation, refine, and fix prompts now use abstract synthesis guidance instead of embedded code templates/few-shot snippets.
 - The canonical style is: direct `wf.vars` / `wf.initVariables` access, no recreated demo input tables, no console wrappers, and the amount of Lua structure the task actually needs.
-- Deterministic verification supplements LLM verification with:
-  - expected workflow path matching;
-  - runtime-result-aware semantic verification and fix-loop feedback;
-  - save-gate blocking when deterministic requirements fail, even if the semantic verifier is unavailable.
+- Semantic verification is the primary save gate:
+  - verifier/fix prompts receive parsed workflow context, expected workflow paths, planner analysis, runtime-result evidence, and semantic requirement failures;
+  - save remains blocked on failed validation or failed semantic verification;
+  - no separate deterministic verification guard remains in the active pipeline.
 - `docs/_pdf_text.txt` remains an offline working aid only and is not read at runtime.
 
 ## 2026-04-11 update: compiled workflow context
@@ -151,9 +151,30 @@
 ## 2026-04-12 update: validation and verifier hardening
 - Workflow-context parsing now tolerates loose pasted JSON fragments and fenced JSON-like blocks before the compiler builds the request.
 - `src/tools/lua_tools.py` normalizes malformed LowCode wrappers before validation, including fenced `lua{...}lua` variants and partial trailing wrapper noise.
-- `validate_code` now captures the actual returned value from the temporary workflow harness and exposes that runtime result to `verify_requirements`.
+- Runtime marker extraction now tolerates both LF and CRLF output from the temporary Lua harness.
+- `validate_code` now captures both the actual returned value and the updated workflow snapshot from the temporary workflow harness and exposes them to `verify_requirements`.
 - `verify_requirements` now evaluates logic against:
   - parsed workflow context;
   - planner analysis when available;
-  - actual runtime result preview from validation.
+  - actual runtime result preview from validation;
+  - updated workflow state after execution when the script mutates `wf.*` and returns `nil`.
+- `explain_solution` now normalizes explainer sections from either JSON arrays or single strings before falling back to generic text.
 - `prepare_response` always includes the current code payload in the user response, even on failed validation/verification turns; the response stays diagnostic and saving still remains blocked.
+
+## 2026-04-12 update: per-agent model overrides
+- `src/core/llm.py` remains the single LLM abstraction layer, but each LLM-backed agent can now use its own Ollama model via env without adding a second client path.
+- Override priority is:
+  - `OLLAMA_MODEL_<AGENT_NAME>` for a specific agent;
+  - CLI `--model`;
+  - shared fallback `OLLAMA_MODEL`;
+  - built-in default model.
+- Supported agent-specific env keys in the canonical pipeline:
+  - `OLLAMA_MODEL_INTENT_ROUTER`
+  - `OLLAMA_MODEL_TASK_PLANNER`
+  - `OLLAMA_MODEL_CODE_GENERATOR`
+  - `OLLAMA_MODEL_CODE_REFINER`
+  - `OLLAMA_MODEL_VALIDATION_FIXER`
+  - `OLLAMA_MODEL_VERIFICATION_FIXER`
+  - `OLLAMA_MODEL_REQUIREMENTS_VERIFIER`
+  - `OLLAMA_MODEL_SOLUTION_EXPLAINER`
+  - `OLLAMA_MODEL_QUESTION_ANSWERER`

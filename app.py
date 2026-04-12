@@ -27,7 +27,7 @@ logger = structlog.get_logger(__name__)
 # ── Defaults (Ollama runtime) ─────────────────────────────────────────
 DEFAULT_URL = "http://127.0.0.1:11434/v1"
 DEFAULT_MODEL = "qwen2.5-coder:7b-instruct"
-DEFAULT_MAX_ATTEMPTS = 5
+DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_REQUEST_TIMEOUT = 600.0
 
 

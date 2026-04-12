@@ -3,6 +3,7 @@ import unittest
 from src.tools.lua_tools import (
     _extract_runtime_context,
     _extract_runtime_result,
+    _extract_runtime_workflow_state,
     build_lowcode_validation_harness,
     compile_lowcode_request,
     format_lowcode_json_payload,
@@ -208,6 +209,32 @@ return value
         self.assertEqual(cleaned, "")
         self.assertEqual(result_value, {"items": [{"sku": "A001"}, {"sku": "A004"}]})
         self.assertIn('"sku":"A004"', result_preview)
+
+    def test_extract_runtime_result_accepts_windows_crlf_markers(self) -> None:
+        run_output = (
+            "__TRUEHACK_RESULT_START__\r\n"
+            '{"count":3}\r\n'
+            "__TRUEHACK_RESULT_END__\r\n"
+        )
+
+        cleaned, result_value, result_preview = _extract_runtime_result(run_output)
+
+        self.assertEqual(cleaned, "")
+        self.assertEqual(result_value, {"count": 3})
+        self.assertEqual(result_preview, '{"count":3}')
+
+    def test_extract_runtime_workflow_state_parses_serialized_snapshot(self) -> None:
+        run_output = (
+            "__TRUEHACK_WORKFLOW_START__\r\n"
+            '{"wf":{"vars":{"items":[{"sku":"A"},{"sku":"B"}]}}}\r\n'
+            "__TRUEHACK_WORKFLOW_END__\r\n"
+        )
+
+        cleaned, workflow_state, workflow_preview = _extract_runtime_workflow_state(run_output)
+
+        self.assertEqual(cleaned, "")
+        self.assertEqual(workflow_state, {"wf": {"vars": {"items": [{"sku": "A"}, {"sku": "B"}]}}})
+        self.assertIn('"items"', workflow_preview)
 
     def test_validate_lowcode_llm_output_rejects_fenced_wrapper(self) -> None:
         analysis = validate_lowcode_llm_output("```lua\nlua{return wf.vars.contacts}lua\n```")

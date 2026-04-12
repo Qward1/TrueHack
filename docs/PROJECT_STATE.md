@@ -139,9 +139,9 @@ README описывает канонический запуск через `app.
 - Save is blocked when semantic verification returns failed checklist items or `missing_requirements`.
 - Automated regression coverage exists in `tests/` via stdlib `unittest`:
   - prompt/context splitting;
-  - deterministic LowCode alignment guard;
+  - runtime-result-aware logic verification;
   - pipeline scenario: app-style generation goes into fix-loop;
-  - pipeline scenario: public-sample-style generation passes validate -> verify -> save.
+  - pipeline scenario: workflow-style generation passes validate -> verify -> save.
 
 ## 2026-04-12 update: TaskPlanner integrated into canonical pipeline
 - New LangGraph node `plan_request` powered by `src/agents/planner.py` runs between intent routing and `prepare_generation_context`.
@@ -167,6 +167,24 @@ README описывает канонический запуск через `app.
 ## 2026-04-12 update: format and logic verification hardening
 - Workflow-context parsing now also repairs loose pasted fragments like `{ } "wf": {...}` into a valid JSON object before compilation and validation.
 - Lua normalization now recovers common malformed wrapper variants such as fenced ```` ```lua{...}lua ``` ```` and trailing `}lua` remnants, so wrapper noise does not turn into a false syntax failure by itself.
-- The local validation harness now captures the actual returned Lua value on the provided workflow context and passes a serialized preview into semantic verification.
-- Semantic verification now sees parsed workflow context, planner analysis, and the concrete runtime result, so logic checks can fail on wrong outputs instead of only reviewing source text.
+- Runtime marker extraction now works for both LF and CRLF output produced by the temporary Lua harness.
+- The local validation harness now captures both the actual returned Lua value and the updated workflow snapshot on the provided workflow context.
+- Semantic verification now sees parsed workflow context, planner analysis, the concrete runtime result, and the updated workflow state, so logic checks can fail on wrong outputs or wrong mutations instead of only reviewing source text.
+- `explain_solution` now accepts explainer section fields as either JSON arrays or plain strings before generic fallback text is used.
 - If validation or requirement verification still fails after the fix loop, the user-facing response remains diagnostic, still shows the current code payload, and does not save artifacts to disk.
+
+## 2026-04-12 update: per-agent Ollama models
+- The canonical runtime still uses one `LLMProvider`, but model selection is now resolved per LLM agent at call time.
+- Shared fallback behavior stays the same:
+  - CLI `--model` or env `OLLAMA_MODEL` set the base model for the whole app.
+- Optional per-agent env overrides now exist for the LLM-backed nodes/helpers:
+  - `OLLAMA_MODEL_INTENT_ROUTER`
+  - `OLLAMA_MODEL_TASK_PLANNER`
+  - `OLLAMA_MODEL_CODE_GENERATOR`
+  - `OLLAMA_MODEL_CODE_REFINER`
+  - `OLLAMA_MODEL_VALIDATION_FIXER`
+  - `OLLAMA_MODEL_VERIFICATION_FIXER`
+  - `OLLAMA_MODEL_REQUIREMENTS_VERIFIER`
+  - `OLLAMA_MODEL_SOLUTION_EXPLAINER`
+  - `OLLAMA_MODEL_QUESTION_ANSWERER`
+- Prompt audit logs now record both `agent_name` and the effective `model` used for that request, which makes per-agent routing visible in saved logs.

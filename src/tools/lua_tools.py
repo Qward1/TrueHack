@@ -43,19 +43,48 @@ LOWCODE_CONTRACT_TEXT = (
     "- Allowed constructs: if/then/else, while/do/end, for/do/end, repeat/until.\n"
 )
 LOWCODE_RESPONSE_FORMAT_REQUIREMENT = (
-    "The response must start with `lua{` and end with `}lua`, with no surrounding quotes and no code fences."
+    "MANDATORY RESPONSE FORMAT:\n"
+    "- The response MUST start with the literal three characters `lua{` and end with the literal four characters `}lua`.\n"
+    "- Do NOT begin the response with three backticks (```), do NOT end it with three backticks, do NOT place the word 'lua' immediately after backticks.\n"
+    "- Do NOT wrap the response in quotes, XML tags, or any other delimiters.\n"
+    "- Emit nothing before `lua{` and nothing after `}lua` — no prose, no explanation, no blank lines before the opening tag.\n"
+    "Exact shape of a correct response (replace the body with your script):\n"
+    "lua{\n"
+    "...\n"
+    "return ...\n"
+    "}lua"
 )
 DEFAULT_VERIFICATION_SYSTEM_PROMPT = (
-    "You review whether a Lua solution fully satisfies the user's request. "
+    "You are a STRICT verifier that decides whether a Lua solution fully satisfies the user's request. "
+    "Default to passed=false unless every critical check has solid evidence of passing. "
     "The code must be a workflow Lua script, not a console app. "
     "Judge against the user request and workflow context, not against whether the code merely sounds plausible. "
     "If concrete example input or actual runtime result is provided, start from that concrete evidence and validate the logic against it instead of only reading the code. "
+    "\n\n"
+    "RESULT SHAPE / TYPE MISMATCH — MANDATORY FAILURE CONDITIONS:\n"
+    "- If the request asks for an array (list of items) but the runtime result is an object (JSON `{...}` with string keys, not `[...]`), set passed=false, include 'target_shape_satisfied' = fail, and describe the mismatch in summary (e.g., 'expected array of emails, got object {sku: ...}').\n"
+    "- If the request asks for a single value (string/number/boolean) but the runtime result is a table/array/object, set passed=false and describe the mismatch.\n"
+    "- If the request asks for an object with specific fields but the runtime result is missing those fields, is a primitive, or is a bare array, set passed=false and list the missing/extra fields.\n"
+    "- If the request implies numeric output but the runtime result contains non-numeric strings, set passed=false and name the offending value.\n"
+    "- Distinguish Lua arrays (integer keys 1..n) from Lua objects (string keys). A JSON result rendered as `{\"1\":...}` with string-numeric keys is NOT an array.\n"
+    "- If the direct runtime result is `null` / `nil` but an updated workflow snapshot is provided, do NOT fail only because the return value is null. Inspect the updated workflow path/value requested by the task and judge against that concrete updated state.\n"
+    "\n"
+    "CODE-VS-REQUEST ALIGNMENT — MANDATORY FAILURE CONDITIONS:\n"
+    "- If the code ignores the user's core goal (e.g., request asks to filter emails but code returns SKUs), set passed=false and describe what the code does vs what was asked.\n"
+    "- If the code reads the wrong workflow path (e.g., request says 'wf.vars.users' but code reads 'wf.vars.orders'), set passed=false and name both paths.\n"
+    "- If the code applies a different operation (e.g., request asks to count, code returns the full list), set passed=false and name the intended vs actual operation.\n"
+    "- If the code hardcodes demo data instead of reading workflow paths, set passed=false.\n"
+    "- For workflow-mutation tasks, the relevant output may be the updated wf.vars / wf.initVariables snapshot rather than the direct return value. Use the concrete updated path/value when it is provided.\n"
+    "\n"
     "For filter/select/leave-only tasks, inspect the returned items one by one and fail if any item violates the requested rule. "
     "If parsed input and runtime result are both provided, compare them item-by-item and mention concrete violating identifiers such as id, SKU, email, or name when available. "
     "Do not return passed=true if the answer is wrapped in quotes or markdown fences. "
     "Do not return passed=true if `next(...)` is the only array check in a shape-sensitive task. "
     "If the request says a field must have a value / be non-empty / be filled, empty strings and whitespace-only strings do not satisfy that requirement unless the user explicitly says otherwise. "
     "Explicitly verify workflow path usage, source shape understanding, target/output shape, logic correctness, helper API usage, and edge-case handling. "
+    "\n\n"
+    "EVERY failure must include in `summary` and in the failing check's `reason`: (1) what the request asked for, (2) what the code/runtime actually produced, (3) the specific mismatch. "
+    "Always list concrete discrepancies in `missing_requirements` — never leave it empty when passed=false. "
     "Return strict JSON only with the keys: passed, score, summary, missing_requirements, warnings, checks. "
     "The `checks` object must contain: workflow_path_usage, source_shape_understood, target_shape_satisfied, logic_correctness, helper_api_usage, edge_case_handling. "
     "Each check value must be an object with keys: status (`pass` | `fail` | `unclear`) and reason. "
@@ -183,6 +212,8 @@ RUNTIME_CONTEXT_START = "__TRUEHACK_CONTEXT_START__"
 RUNTIME_CONTEXT_END = "__TRUEHACK_CONTEXT_END__"
 RUNTIME_RESULT_START = "__TRUEHACK_RESULT_START__"
 RUNTIME_RESULT_END = "__TRUEHACK_RESULT_END__"
+RUNTIME_WORKFLOW_START = "__TRUEHACK_WORKFLOW_START__"
+RUNTIME_WORKFLOW_END = "__TRUEHACK_WORKFLOW_END__"
 
 
 def merge_process_output(stdout: str, stderr: str) -> str:
@@ -1154,22 +1185,28 @@ def build_mock_assignment_lines(root: str, paths: list[list[str]]) -> list[str]:
     return lines
 
 
+def _extract_marked_block(text: str, start_marker: str, end_marker: str) -> tuple[str, str]:
+    pattern = re.compile(
+        re.escape(start_marker) + r"\r?\n(?P<body>.*?)\r?\n" + re.escape(end_marker),
+        re.DOTALL,
+    )
+    source = str(text or "")
+    match = pattern.search(source)
+    if not match:
+        return source, ""
+    cleaned_output = (source[: match.start()] + source[match.end() :]).strip()
+    return cleaned_output, str(match.group("body") or "")
+
+
 def _extract_runtime_context(run_output: str) -> tuple[str, dict[str, Any]]:
     """Strip structured runtime context markers from stderr and parse them."""
-    text = str(run_output or "")
-    start_marker = f"{RUNTIME_CONTEXT_START}\n"
-    end_marker = f"\n{RUNTIME_CONTEXT_END}"
-    start_index = text.find(start_marker)
-    if start_index == -1:
-        return text, {}
-
-    content_start = start_index + len(start_marker)
-    end_index = text.find(end_marker, content_start)
-    if end_index == -1:
-        return text, {}
-
-    raw_block = text[content_start:end_index]
-    cleaned_output = (text[:start_index] + text[end_index + len(end_marker):]).strip()
+    cleaned_output, raw_block = _extract_marked_block(
+        run_output,
+        RUNTIME_CONTEXT_START,
+        RUNTIME_CONTEXT_END,
+    )
+    if not raw_block:
+        return str(run_output or ""), {}
     runtime_context: dict[str, Any] = {"locals": []}
 
     for raw_line in raw_block.splitlines():
@@ -1204,20 +1241,33 @@ def _extract_runtime_context(run_output: str) -> tuple[str, dict[str, Any]]:
 
 def _extract_runtime_result(run_output: str) -> tuple[str, Any | None, str]:
     """Strip structured runtime-result markers and parse the serialized return value."""
-    text = str(run_output or "")
-    start_marker = f"{RUNTIME_RESULT_START}\n"
-    end_marker = f"\n{RUNTIME_RESULT_END}"
-    start_index = text.find(start_marker)
-    if start_index == -1:
-        return text, None, ""
+    cleaned_output, raw_block = _extract_marked_block(
+        run_output,
+        RUNTIME_RESULT_START,
+        RUNTIME_RESULT_END,
+    )
+    if not raw_block:
+        return str(run_output or ""), None, ""
+    raw_block = raw_block.strip()
+    parsed_value = _extract_json_like_value(raw_block)
+    if parsed_value is None and raw_block:
+        try:
+            parsed_value = json.loads(raw_block)
+        except Exception:
+            parsed_value = raw_block
+    return cleaned_output, parsed_value, raw_block
 
-    content_start = start_index + len(start_marker)
-    end_index = text.find(end_marker, content_start)
-    if end_index == -1:
-        return text, None, ""
 
-    raw_block = text[content_start:end_index].strip()
-    cleaned_output = (text[:start_index] + text[end_index + len(end_marker):]).strip()
+def _extract_runtime_workflow_state(run_output: str) -> tuple[str, Any | None, str]:
+    """Strip serialized workflow-state markers and parse the wf snapshot."""
+    cleaned_output, raw_block = _extract_marked_block(
+        run_output,
+        RUNTIME_WORKFLOW_START,
+        RUNTIME_WORKFLOW_END,
+    )
+    if not raw_block:
+        return str(run_output or ""), None, ""
+    raw_block = raw_block.strip()
     parsed_value = _extract_json_like_value(raw_block)
     if parsed_value is None and raw_block:
         try:
@@ -1433,6 +1483,10 @@ def build_lowcode_validation_harness(
         "io.stderr:write(_serialize_runtime_result(result, 0, {}))\n"
         "io.stderr:write('\\n')\n"
         f"io.stderr:write('{RUNTIME_RESULT_END}\\n')\n"
+        f"io.stderr:write('{RUNTIME_WORKFLOW_START}\\n')\n"
+        "io.stderr:write(_serialize_runtime_result(wf, 0, {}))\n"
+        "io.stderr:write('\\n')\n"
+        f"io.stderr:write('{RUNTIME_WORKFLOW_END}\\n')\n"
     )
     mocked_paths = {
         "vars": [".".join(path) for path in access_paths["vars"]],
@@ -1463,6 +1517,8 @@ def _sync_run_diagnostics(
     runtime_context: dict[str, Any] = {}
     result_value: Any | None = None
     result_preview = ""
+    workflow_state: Any | None = None
+    workflow_state_preview = ""
 
     try:
         with open(lua_file, "r", encoding="utf-8", errors="replace") as file:
@@ -1497,6 +1553,8 @@ def _sync_run_diagnostics(
             "runtime_context": {},
             "result_value": None,
             "result_preview": "",
+            "workflow_state": None,
+            "workflow_state_preview": "",
             "luacheck_output": "",
             "luacheck_error": "",
             "luacheck_warning": "",
@@ -1530,6 +1588,7 @@ def _sync_run_diagnostics(
         raw_run_output = merge_process_output(run_result["stdout"], run_result["stderr"])
         run_output = repair_mojibake(raw_run_output)
         run_output, result_value, result_preview = _extract_runtime_result(run_output)
+        run_output, workflow_state, workflow_state_preview = _extract_runtime_workflow_state(run_output)
         run_output, runtime_context = _extract_runtime_context(run_output)
         timed_out = run_result["timed_out"]
         no_runtime_stderr = not run_result["stderr"].strip()
@@ -1579,6 +1638,8 @@ def _sync_run_diagnostics(
         "runtime_context": runtime_context,
         "result_value": result_value,
         "result_preview": result_preview,
+        "workflow_state": workflow_state,
+        "workflow_state_preview": workflow_state_preview,
         "luacheck_output": "",
         "luacheck_error": "",
         "luacheck_warning": "",
@@ -1884,6 +1945,16 @@ def normalize_lua_code(text: str) -> str:
     return cleaned.strip()
 
 
+def is_truncated_lowcode_response(raw: str) -> bool:
+    """Return True when the model started the lua{...}lua wrapper but was cut off before }lua.
+
+    Distinguishes truncation from other format failures (fenced, prose, etc.).
+    """
+    cleaned = ZERO_WIDTH_PATTERN.sub("", str(raw or "")).replace("\r\n", "\n").replace("\r", "\n").strip()
+    lower = cleaned.lower()
+    return lower.startswith(LOWCODE_JSONSTRING_OPEN.lower()) and not lower.endswith(LOWCODE_JSONSTRING_CLOSE.lower())
+
+
 def validate_lowcode_llm_output(raw_response: str) -> dict[str, Any]:
     """Validate raw model output against the strict LowCode wrapper contract."""
     analysis = analyze_lua_response(raw_response)
@@ -2099,9 +2170,21 @@ async def async_verify_requirements(
         ]
     )
 
-    raw = await llm.chat(messages, temperature=DEFAULT_VERIFICATION_TEMPERATURE)
+    raw = await llm.chat(
+        messages,
+        temperature=DEFAULT_VERIFICATION_TEMPERATURE,
+        agent_name="RequirementsVerifier",
+    )
     normalized = _normalize_verification_result(_extract_json_block(raw))
-    if normalized["passed"] and extra_context_text and "Actual runtime result on the provided workflow context" in extra_context_text:
+    has_concrete_runtime_evidence = any(
+        marker in extra_context_text
+        for marker in (
+            "Actual runtime result on the provided workflow context",
+            "Updated workflow state after execution",
+            "Updated workflow value at ",
+        )
+    )
+    if normalized["passed"] and extra_context_text and has_concrete_runtime_evidence:
         challenge_messages = [
             {
                 "role": "system",
@@ -2130,7 +2213,11 @@ async def async_verify_requirements(
                     "content": f"Runtime output:\n{run_output or 'none'}",
                 }
             )
-        challenge_raw = await llm.chat(challenge_messages, temperature=DEFAULT_VERIFICATION_TEMPERATURE)
+        challenge_raw = await llm.chat(
+            challenge_messages,
+            temperature=DEFAULT_VERIFICATION_TEMPERATURE,
+            agent_name="RequirementsVerifier",
+        )
         challenge = _normalize_verification_result(_extract_json_block(challenge_raw))
         challenge_checks = challenge.get("checks", {}) if isinstance(challenge, dict) else {}
         has_failed_or_unclear = any(
