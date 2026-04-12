@@ -26,7 +26,7 @@
 ### Pass criteria
 - директория создана
 - файл создан и сохранен только после validate + verify
-- sidecar JsonString сохранен рядом с `.lua`
+- sidecar JSON-объект сохранен рядом с `.lua`, и его value содержит `lua{...}lua`
 
 ## 3. Create/update explicit Lua file by path
 ### Prompt
@@ -34,7 +34,7 @@
 
 ### Pass criteria
 - используется именно указанный `.lua` path
-- JsonString sidecar создается рядом с этим файлом
+- JsonString sidecar создается рядом с этим файлом как JSON-объект
 - follow-up turn сохраняет изменения в тот же файл
 
 ## 3a. Invalid Windows path segments are sanitized
@@ -149,7 +149,7 @@
 `Return the last email from the provided workflow context.` plus pasted JSON-like workflow data with `wf.vars.emails`.
 
 ### Pass criteria
-- generation returns a short workflow chunk, not a demo application;
+- generation returns a focused workflow script, not a demo application;
 - code reads directly from `wf.vars.emails`;
 - code returns the computed value directly;
 - save succeeds without requiring a manual follow-up correction.
@@ -194,22 +194,45 @@ return recallTime
 - deterministic verification lists `wf.initVariables.recallTime` as a missing direct workflow path;
 - save does not happen until the script uses the expected workflow path directly.
 
-## 15. Deterministic fast-path for array count
+## 15. Simple extraction still works in model-driven generation
 ### Prompt
 `Посчитай количество товаров в корзине.` plus pasted workflow context with `wf.vars.cart.items`.
 
 ### Pass criteria
-- pipeline does not call main LLM generation;
-- generated code is exactly `return #wf.vars.cart.items`;
-- validate -> verify -> save still run normally after deterministic compilation.
+- compiler resolves `wf.vars.cart.items` as the primary workflow path;
+- model generation returns a valid workflow script for array count;
+- validate -> verify -> save still run normally after generation.
 
-## 16. Deterministic fast-path for last element
+## 16. Multi-step workflow task is allowed to stay multi-line
 ### Prompt
-`Return the last email from the provided workflow context.` plus pasted workflow context with `wf.vars.emails`.
+`Приведи wf.vars.contacts к массиву. Если там уже массив — верни как есть, иначе оберни значение в массив.` plus pasted workflow context with `wf.vars.contacts`.
 
 ### Pass criteria
-- pipeline does not call main LLM generation;
-- generated code is exactly `return wf.vars.emails[#wf.vars.emails]`.
+- generation is allowed to produce a multi-line workflow script with conditions/loops/helpers;
+- prompt steering does not collapse the task into a one-line `return`;
+- validate -> verify -> save accepts the longer script when it follows the workflow contract.
+
+## 16a. Array normalization rejects table-only shortcut logic
+### Prompt
+`Если поле contacts не массив, оберни его в массив.` plus pasted workflow context where `wf.vars.contacts` is an object table.
+
+### Bad output example
+```lua
+if type(wf.vars.contacts) ~= 'table' then
+    wf.vars.contacts = _utils.array.new({wf.vars.contacts})
+end
+_utils.array.markAsArray(wf.vars.contacts)
+return wf.vars.contacts
+```
+
+### Pass criteria
+- deterministic verification does not accept code that relies only on `type(x) == "table"` for array-vs-object semantics;
+- array semantics are explicit: only numeric keys `1..n` without gaps count as an array; an empty table counts as an array;
+- `next(x)` / empty-vs-non-empty checks are not accepted as a substitute for object-vs-array shape detection;
+- simply marking the original workflow object/scalar as an array via `_utils.array.markAsArray(source)` is rejected;
+- `_utils.array.new(...)` with inline arguments is rejected;
+- pipeline enters `fix_code` instead of saving immediately;
+- corrected code distinguishes object-like vs array-like tables and creates new arrays with `_utils.array.new()` + `_utils.array.markAsArray(arr)`.
 
 ## 17. Ambiguous path selection asks before generation
 ### Prompt
@@ -226,9 +249,26 @@ return recallTime
 `Улучши обработку email и верни последний email из workflow context.` plus pasted workflow context with `wf.vars.emails`, but no current code in chat/file.
 
 ### Pass criteria
-- intent may still be `change`;
-- pipeline does not enter `refine_code` just because of that intent;
-- request goes directly through generate -> validate -> verify -> save without fallback warning.
+- first-step intent is normalized to `create`, even if the raw LLM classifier suggests `change`;
+- pipeline goes directly through generate -> validate -> verify -> save;
+- no refine fallback warning is emitted for the normal no-code path.
+
+## 18a. Pasted Lua enables `change` without prior chat code
+### Prompt
+`Исправь этот код ...` plus a pasted `lua{...}lua` block in the same user message, with empty `current_code` in chat state.
+
+### Pass criteria
+- first-step intent resolves to `change`;
+- pasted Lua becomes the refine context even though chat state was empty before the turn;
+- pipeline enters `refine_code`, not fresh `generate_code`.
+
+## 18b. Pure Lua question remains a question
+### Prompt
+`Как в Lua работает цикл for?`
+
+### Pass criteria
+- intent resolves to `question`, not `create`;
+- pipeline returns answer text and does not enter code generation.
 
 ## 19. Bare field name resolves to a unique workflow path
 ### Prompt
@@ -253,3 +293,71 @@ Any workflow task where generated code triggers a Lua runtime error like `bad ar
 - diagnostics contain normalized fix hints about expected argument type and required conversion/validation;
 - `fix_code` prompt includes these hints together with raw runtime error;
 - corrected code passes validation and save gate without hardcoding to one specific stdlib function.
+
+## 21. Structured JSON envelope with embedded Lua is normalized before validation
+### Simulated model output
+```text
+lua{
+json
+{
+  "lua": "return wf.vars.orders[1].id"
+}
+}lua
+```
+
+### Pass criteria
+- normalizer extracts the embedded Lua body before validation;
+- runtime does not try to execute the surrounding JSON metadata as Lua;
+- validate -> verify -> save continue on the extracted script body.
+
+## 21a. Fenced JSON envelope with embedded Lua is normalized before validation
+### Simulated model output
+```text
+```json
+{"contacts": "lua{\r\n\n  local contacts = wf.vars.contacts\n  return contacts\n\r\n}lua"}
+```
+```
+
+### Pass criteria
+- normalizer extracts the embedded Lua body from the fenced JSON payload;
+- runtime does not execute literal `\n` / `\r\n` escape text as Lua;
+- validation receives plain Lua source, not the JSON wrapper.
+
+## 21b. Fix loop retries when the first repair repeats the same failure pattern
+### Prompt
+Shape-sensitive workflow task where the first fix response repeats the same `next(...)` / source-marking / table-only shortcut logic or otherwise stays materially unchanged.
+
+### Pass criteria
+- `fix_code` does not accept the first repair attempt blindly;
+- if the first repair still repeats the same deterministic requirement failures, `fix_code` performs one stricter internal retry;
+- the second attempt is the one returned to validation.
+
+## 21d. Prompt format contract stays single and strict
+### Prompt
+Любой workflow generation/fix сценарий с parseable context.
+
+### Pass criteria
+- generation/fix prompts do not mix `JsonString`, JSON-ban, markdown-ban and other overlapping format rules;
+- the only response-format requirement is: start with `lua{` and end with `}lua`, without surrounding quotes and without code fences;
+- generation/fix prompt payload does not include ranked candidates, confidence, verifier summary, or past broken assistant outputs.
+
+## 21c. Hallucinated verifier pass is overruled by deterministic checks
+### Prompt
+Any workflow task where deterministic verification finds hard failures, but the LLM verifier incorrectly returns `passed=true` with all-pass checklist items.
+
+### Pass criteria
+- final verification result remains failed;
+- summary does not present the optimistic verifier text as the authoritative verdict;
+- warnings include a verifier-conflict marker;
+- save is blocked and fix-loop continues or the response fails closed;
+- verifier does not approve shape-sensitive code when `next(...)` is the only array check or when the answer is still wrapped in quotes/markdown fences.
+
+## 22. User-facing JsonString export is wrapped into a named JSON field
+### Prompt
+Любой успешный workflow generation/save сценарий.
+
+### Pass criteria
+- response code block shows a JSON object, not only bare `lua{...}lua`;
+- sidecar `*.jsonstring.txt` stores the same JSON object shape;
+- the JSON field name is derived from the selected workflow/save path or target name;
+- plain Lua validation still runs against the extracted code body.

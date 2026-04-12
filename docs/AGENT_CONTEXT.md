@@ -25,6 +25,15 @@
   - active target текущего чата;
   - невалидные Windows-сегменты пути санитизируются до сохранения.
 - `generate_code` / `refine_code` возвращают полный Lua-файл.
+- Генерация и fix/refine теперь model-driven:
+  - compiler даёт path inventory, ranked candidates и clarification gate;
+  - финальный скрипт всегда синтезирует LLM по текущей задаче и контексту;
+  - prompt contract больше не заставляет все задачи схлопываться в короткий `return` и допускает multi-step workflow scripts, loops, guards, table traversal и helper functions, когда это требуется логикой;
+  - prompts теперь используют один format contract: ответ обязан начинаться с `lua{` и заканчиваться `}lua`, без кавычек и без code fences;
+  - service noise в generation/fix prompt сокращён: без ranked candidates / confidence / длинных diagnostic dumps;
+  - `fix_code` не подсовывает модели прошлый assistant output с ошибочным кодом, а даёт короткий список mandatory fixes и заставляет переписать скрипт заново;
+  - generate/refine/fix use a lower temperature for parseable workflow context to reduce wrapper noise and shallow shortcut generations.
+- `src/tools/lua_tools.py` normalizer дополнительно умеет доставать Lua из structured LLM responses, если модель вернула JSON envelope с полем `lua` / `code` / `script`, а не чистый code body, включая fenced/meta-wrapped JSON payloads.
 - `validate_code` запускает локальную диагностику через `lua` в temporary LowCode harness:
   - создаёт mock `wf.vars` / `wf.initVariables`;
   - добавляет `_utils.array.*` stubs;
@@ -33,22 +42,43 @@
 - `fix_code` выполняет итеративные правки по стадии ошибки:
   - validation;
   - requirements;
-- `verify_requirements` — семантическая LLM-проверка соответствия исходному запросу.
+  - если первый fix-ответ остаётся пустым, почти не меняет код или детерминированно повторяет те же requirement failures, node делает один stricter internal retry before returning to validate.
+- `verify_requirements` — семантическая LLM-проверка соответствия исходному запросу с checklist по:
+  - workflow_path_usage;
+  - source_shape_understood;
+  - target_shape_satisfied;
+  - logic_correctness;
+  - helper_api_usage;
+  - edge_case_handling.
+- verifier получает deterministic findings как hard constraints, а не как optional hints.
+- если LLM verifier возвращает optimistic `passed=true` при deterministic `fail`, итоговый verdict остаётся fail и помечается как verifier conflict.
 - Для задач cleanup/remove/filter по ключам в workflow object/array deterministic guard требует реальную трансформацию данных, а не простой `return` исходного пути.
+- Для shape-sensitive задач вроде array normalization deterministic guard дополнительно требует:
+  - считать массивом только table с числовыми ключами `1..n` без пропусков; пустая table считается массивом;
+  - отличать object-like tables от array-like tables;
+  - не считать `next(x)` / пустоту достаточным способом различить object-like table и array-like table;
+  - не помечать исходный workflow object/scalar как массив через `_utils.array.markAsArray(source)`;
+  - не передавать inline arguments в `_utils.array.new()`;
+  - вызывать `_utils.array.markAsArray(arr)` для новых массивов.
 - Если в тексте задачи указан bare field name без полного `wf.vars.*` / `wf.initVariables.*`, compiler пытается однозначно разрешить его через parseable workflow context и добавить в expected workflow paths.
 - Если intent классифицирован как `change`, но текущий код отсутствует, pipeline идёт в `generate_code`, а не в `refine_code`.
+- `route_intent` теперь hybrid:
+  - сначала использует deterministic signals из chat state и текста запроса;
+  - только затем обращается к LLM как к tie-breaker для неоднозначных случаев;
+  - без existing code в чате и без pasted Lua в текущем сообщении change-like wording (`исправь`, `улучши`, `очисти`, `оберни`) трактуется как `create`, а не `change`;
+  - если пользователь прислал Lua прямо в сообщении, этот код считается доступным контекстом для `change` / `inspect`.
 - `save_code` выполняется только после успешной локальной валидации и проверки требований.
 - если новый чат не содержит явного path и active target ещё не выбран, `save_code` не пишет файл и помечает save как intentionally skipped.
 - `save_code` сохраняет два артефакта:
   - чистый `.lua` файл в canonical target path;
-  - sidecar `*.jsonstring.txt` с представлением `lua{...}lua` рядом с ним.
+  - sidecar `*.jsonstring.txt` как JSON-объект, где value содержит `lua{...}lua`.
 - `explain_solution` формирует:
   - краткое объяснение;
   - что есть в коде;
   - как работает;
   - 1-3 предложения улучшений;
   - 1-3 уточняющих вопроса.
-- `prepare_response` собирает финальный ответ для чата с кодом, статусами проверок и объяснением.
+- `prepare_response` собирает финальный ответ для чата с JSON payload, статусами проверок и объяснением.
 
 ## Chat-level поведение
 - `app.py` сохраняет:
@@ -103,11 +133,11 @@
 
 ---
 
-## 2026-04-11 update: public-sample alignment
-- Prompt assembly now splits the user message into `task` and pasted workflow context.
-- Generation, refine, and fix prompts now include embedded few-shot examples derived from the public sample and enforce short workflow-script style.
-- The canonical style is: direct `wf.vars` / `wf.initVariables` access, no recreated demo input tables, no console wrappers, and direct `return` for simple extraction/computation tasks.
-- Deterministic verification now supplements LLM verification with:
+## 2026-04-11 update: model-driven workflow synthesis
+- Prompt assembly splits the user message into `task` and pasted workflow context.
+- Generation, refine, and fix prompts now use abstract synthesis guidance instead of embedded code templates/few-shot snippets.
+- The canonical style is: direct `wf.vars` / `wf.initVariables` access, no recreated demo input tables, no console wrappers, and the amount of Lua structure the task actually needs.
+- Deterministic verification supplements LLM verification with:
   - expected workflow path matching;
   - anti-pattern detection for invented sample data and app/service wrappers;
   - save-gate blocking when deterministic requirements fail, even if the semantic verifier is unavailable.
@@ -121,10 +151,6 @@
   - sample values;
   - selected operation;
   - selected primary path;
-  - ranked candidate paths;
-  - deterministic simple-task code when available.
-- Simple single-target data tasks now bypass main LLM generation and are compiled directly into minimal workflow Lua, for example:
-  - count array -> `return #wf.vars.path`
-  - first/last element -> `return wf.vars.path[1]` / `return wf.vars.path[#wf.vars.path]`
-  - direct scalar extraction -> `return wf.vars.path`
+  - ranked candidate paths.
+- The compiled request is now used to steer model generation and verification, not to emit canned Lua templates directly.
 - If the workflow path cannot be selected confidently, the pipeline stops before generation, asks a clarification question, and does not save code.

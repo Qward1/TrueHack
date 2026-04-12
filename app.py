@@ -18,6 +18,7 @@ import structlog
 
 from console_utils import configure_console_utf8
 from src.core.llm import LLMProvider
+from src.core.logging_runtime import configure_logging, new_turn_id, write_runtime_audit
 from src.graph.engine import PipelineEngine
 from src.tools.target_tools import build_chat_title
 
@@ -26,13 +27,12 @@ logger = structlog.get_logger(__name__)
 # ── Defaults (Ollama runtime) ─────────────────────────────────────────
 DEFAULT_URL = "http://127.0.0.1:11434/v1"
 DEFAULT_MODEL = "qwen2.5-coder:7b-instruct"
-DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_REQUEST_TIMEOUT = 600.0
 
 
 CHAT_DB_NAME = ".lua_console_chats.db"
 MAX_CHAT_TITLE_LENGTH = 72
-E2E_DISABLED_SUMMARY = "E2E-проверка временно отключена."
 
 
 def utc_now_iso() -> str:
@@ -56,7 +56,6 @@ def _empty_state_dict(workspace_root: str | None = None) -> dict:
         "last_suggested_changes": [],
         "last_clarifying_questions": [],
         "last_explanation": {},
-        "last_e2e_summary": E2E_DISABLED_SUMMARY,
     }
 
 
@@ -110,9 +109,6 @@ def _normalize_state_dict(state_dict: dict | None, workspace_root: str | None = 
     ]
     explanation = state_dict.get("last_explanation", {})
     normalized["last_explanation"] = explanation if isinstance(explanation, dict) else {}
-    normalized["last_e2e_summary"] = (
-        str(state_dict.get("last_e2e_summary", "") or "").strip() or E2E_DISABLED_SUMMARY
-    )
     return normalized
 
 
@@ -1265,6 +1261,16 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_REQUEST_TIMEOUT,
         help="Seconds to wait for the local runtime.",
     )
+    parser.add_argument(
+        "--log-dir",
+        default=os.getenv("APP_LOG_DIR", "logs"),
+        help="Directory for runtime logs (default: logs).",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=os.getenv("APP_LOG_LEVEL", "INFO"),
+        help="Logging level (DEBUG, INFO, WARNING, ERROR).",
+    )
     return parser.parse_args()
 
 
@@ -1340,7 +1346,6 @@ class AppRuntime:
             "change_requests_count": len(sd.get("change_requests", [])),
             "suggested_changes": sd.get("last_suggested_changes", []),
             "clarifying_questions": sd.get("last_clarifying_questions", []),
-            "last_e2e_summary": sd.get("last_e2e_summary", ""),
         }
 
     def build_full_payload(self) -> dict:
@@ -1387,6 +1392,13 @@ class AppRuntime:
             return self.build_full_payload()
 
         with self.lock:
+            write_runtime_audit(
+                "chat_user_message_received",
+                chat_id=self.current_chat_id,
+                chars=len(text),
+                is_command=text.startswith("/"),
+                message=text,
+            )
             # Save user message
             self.store.add_message(self.current_chat_id, "user", "Пользователь", text)
 
@@ -1400,6 +1412,12 @@ class AppRuntime:
                 self.store.add_message(
                     self.current_chat_id, "assistant", "Ответ", response_text.strip()
                 )
+            if response_text.strip():
+                write_runtime_audit(
+                    "chat_assistant_message_saved",
+                    chat_id=self.current_chat_id,
+                    chars=len(response_text.strip()),
+                )
             self._save_current_chat()
             return self.build_full_payload()
 
@@ -1410,11 +1428,30 @@ class AppRuntime:
             text,
             sd.get("last_suggested_changes", []),
         )
+        if effective_text != text:
+            write_runtime_audit(
+                "chat_prompt_expanded_from_suggestion",
+                chat_id=self.current_chat_id,
+                original_chars=len(text),
+                effective_chars=len(effective_text),
+                original_message=text,
+                effective_message=effective_text,
+            )
+        turn_id = new_turn_id()
+        write_runtime_audit(
+            "chat_pipeline_dispatch",
+            chat_id=self.current_chat_id,
+            turn_id=turn_id,
+            has_current_code=bool(sd.get("current_code", "").strip()),
+            has_base_prompt=bool(sd.get("base_prompt", "").strip()),
+            target_path=sd.get("target_path", ""),
+        )
 
         try:
             result = self._run_async(
                 self.engine.process_message(
                     chat_id=self.current_chat_id,
+                    turn_id=turn_id,
                     user_input=effective_text,
                     current_code=sd.get("current_code", ""),
                     base_prompt=sd.get("base_prompt", ""),
@@ -1424,8 +1461,25 @@ class AppRuntime:
                 )
             )
         except Exception as exc:
+            write_runtime_audit(
+                "chat_pipeline_failed",
+                chat_id=self.current_chat_id,
+                turn_id=turn_id,
+                error=str(exc),
+            )
             logger.error("pipeline_error", error=str(exc))
             return f"Ошибка: {exc}"
+
+        write_runtime_audit(
+            "chat_pipeline_result",
+            chat_id=self.current_chat_id,
+            turn_id=turn_id,
+            intent=result.get("intent", ""),
+            response_type=result.get("response_type", ""),
+            save_success=result.get("save_success", False),
+            validation_passed=result.get("validation_passed", False),
+            verification_passed=bool(result.get("verification", {}).get("passed", False)),
+        )
 
         # Update state from pipeline result
         sd["current_code"] = result.get("current_code", sd.get("current_code", ""))
@@ -1451,13 +1505,6 @@ class AppRuntime:
             ]
             explanation = result.get("explanation", {})
             sd["last_explanation"] = explanation if isinstance(explanation, dict) else {}
-            e2e_results = result.get("e2e_results", {})
-            if isinstance(e2e_results, dict):
-                sd["last_e2e_summary"] = (
-                    str(e2e_results.get("summary", "")).strip() or E2E_DISABLED_SUMMARY
-                )
-            else:
-                sd["last_e2e_summary"] = E2E_DISABLED_SUMMARY
 
         return result.get("response", "")
 
@@ -1482,7 +1529,6 @@ class AppRuntime:
                 f"Workspace: {sd.get('workspace_root', self.default_workspace)}",
                 f"Последнее сохранение: {sd.get('last_saved_path', '(ещё не было)') or '(ещё не было)'}",
                 f"Последний JsonString: {sd.get('last_saved_jsonstring_path', '(ещё не было)') or '(ещё не было)'}",
-                f"E2E: {sd.get('last_e2e_summary', E2E_DISABLED_SUMMARY) or E2E_DISABLED_SUMMARY}",
                 f"Предложений от системы: {len(sd.get('last_suggested_changes', []))}",
                 f"Уточняющих вопросов: {len(sd.get('last_clarifying_questions', []))}",
                 f"Последний intent: {sd.get('last_intent', '(не определён)')}",
@@ -1524,7 +1570,6 @@ class AppRuntime:
             self.state_dict["last_suggested_changes"] = []
             self.state_dict["last_clarifying_questions"] = []
             self.state_dict["last_explanation"] = {}
-            self.state_dict["last_e2e_summary"] = E2E_DISABLED_SUMMARY
             self.state_dict["workspace_root"] = self.default_workspace
             return self._process_via_pipeline(argument)
 
@@ -1644,6 +1689,15 @@ def main() -> int:
     args = parse_args()
     if args.max_attempts < 1:
         raise SystemExit("--max-attempts must be at least 1")
+
+    logging_meta = configure_logging(log_dir=args.log_dir, level=args.log_level)
+    write_runtime_audit(
+        "runtime_logging_configured",
+        log_level=logging_meta["log_level"],
+        log_dir=logging_meta["log_dir"],
+        runtime_log=logging_meta["runtime_log_path"],
+        llm_prompt_log=logging_meta["llm_prompt_log_path"],
+    )
 
     runtime = AppRuntime(args)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(runtime))
