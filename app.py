@@ -10,6 +10,7 @@ import re
 import sqlite3
 import threading
 import webbrowser
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import closing
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1335,7 +1336,11 @@ class AppRuntime:
     def _run_async(self, coro) -> any:
         """Run an async coroutine from sync context via the background event loop."""
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=660)  # generous timeout
+        try:
+            return future.result(timeout=660)  # generous timeout
+        except FutureTimeoutError as exc:
+            future.cancel()
+            raise TimeoutError("Pipeline timed out after 660 seconds") from exc
 
     def _save_current_chat(self, title: str | None = None) -> None:
         effective_title = title or _derive_title(
@@ -1483,17 +1488,25 @@ class AppRuntime:
                     planner_pending_questions=sd.get("planner_pending_questions", []),
                     planner_original_input=sd.get("planner_original_input", ""),
                     planner_clarification_attempts=sd.get("planner_clarification_attempts", 0),
+                    active_clarifying_questions=sd.get("last_clarifying_questions", []),
                 )
             )
         except Exception as exc:
+            error_text = str(exc) or repr(exc) or type(exc).__name__
             write_runtime_audit(
                 "chat_pipeline_failed",
                 chat_id=self.current_chat_id,
                 turn_id=turn_id,
-                error=str(exc),
+                error=error_text,
+                error_type=type(exc).__name__,
             )
-            logger.error("pipeline_error", error=str(exc))
-            return f"Ошибка: {exc}"
+            logger.error(
+                "pipeline_error",
+                error=error_text,
+                error_type=type(exc).__name__,
+                error_repr=repr(exc),
+            )
+            return f"Ошибка: {error_text}"
 
         write_runtime_audit(
             "chat_pipeline_result",
@@ -1537,6 +1550,10 @@ class AppRuntime:
             ]
             explanation = result.get("explanation", {})
             sd["last_explanation"] = explanation if isinstance(explanation, dict) else {}
+        else:
+            sd["last_suggested_changes"] = []
+            sd["last_clarifying_questions"] = []
+            sd["last_explanation"] = {}
 
         return result.get("response", "")
 

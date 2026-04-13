@@ -63,6 +63,14 @@ class LLMLoggingHelpersTests(unittest.TestCase):
             provider = llm_module.LLMProvider()
             self.assertEqual(provider.resolve_model(""), "qwen2.5-coder:14b-instruct")
 
+    def test_should_disable_thinking_for_qwen_3_5_9b(self) -> None:
+        self.assertTrue(llm_module._should_disable_thinking("qwen3.5:9b"))
+        self.assertTrue(llm_module._should_disable_thinking(" QWEN3.5:9B "))
+
+    def test_should_not_disable_thinking_for_other_models(self) -> None:
+        self.assertFalse(llm_module._should_disable_thinking("qwen3.5:14b"))
+        self.assertFalse(llm_module._should_disable_thinking("qwen2.5-coder:7b-instruct"))
+
 
 if __name__ == "__main__":
     unittest.main()

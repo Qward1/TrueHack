@@ -46,35 +46,65 @@ def _is_planner_enabled() -> bool:
 # ---------------------------------------------------------------------------
 
 _PLANNER_SYSTEM = (
-    "You are a task analyst for a Lua workflow script generator. "
-    "Your job is to analyze the user's request and reformulate it into a clear, "
-    "unambiguous task description that a code generator can follow precisely. "
-    "The target platform is LowCode with Lua 5.5 workflow scripts using wf.vars "
-    "and wf.initVariables. "
-    "If the request is unclear or ambiguous, identify what needs clarification. "
-    "Always respond in the same language as the user's request. "
-    "Return JSON only."
+    "You are a task analyst for a LowCode Lua 5.5 workflow script generator. "
+    "Convert the user's request into a precise JSON task description for code generation. "
+
+    "Platform rules: "
+    "workflow input variables are in wf.initVariables; "
+    "workflow variables are in wf.vars; "
+    "access data only through direct paths like wf.vars.x.y or wf.initVariables.x; "
+    "never use JsonPath. "
+
+    "Strict rules: "
+    "Never invent new workflow paths, variable names, or output fields. "
+    "Use only paths explicitly present in the request or provided JSON context. "
+    "If no destination path is explicitly provided, do not create one. "
+    "For extract/transform/convert requests without a destination path, prefer returning the result. "
+    "Use save_to_wf_vars only when saving/updating is explicitly requested or an explicit target wf.vars path is given. "
+    "Set needs_clarification to true only when required information is missing and code cannot be generated correctly. "
+    "identified_workflow_paths must include only explicitly found workflow paths. "
+    "If assumptions are needed, reduce confidence. "
+
+    "Always answer in the same language as the user's request. "
+    "Return valid JSON only."
 )
 
 _PLANNER_USER = """Analyze this task request for Lua workflow code generation.
 
-User request: {user_input}
-Workflow context provided: {has_context}
-Workflow paths found in request: {workflow_paths}
-Has existing code to modify: {has_code}
+User request:
+{user_input}
 
-Analyze and return JSON with these fields:
-- "reformulated_task": rewrite the task as a clear, specific instruction for the code generator. Include exact workflow paths (wf.vars.X / wf.initVariables.X), the operation to perform, and how to return/store the result. If the task is already clear, keep it close to the original but add any implicit details.
-- "identified_workflow_paths": list of wf.vars.* / wf.initVariables.* paths relevant to this task
+Metadata:
+- Workflow context provided: {has_context}
+- Workflow paths found in request: {workflow_paths}
+- Has existing code to modify: {has_code}
+- Active clarification questions for current code: {active_clarifying_questions}
+
+Return JSON with exactly these fields:
+- "reformulated_task": rewrite the task as a clear instruction for the code generator; include only explicit workflow paths; do not invent destination fields
+- "identified_workflow_paths": only explicitly present wf.vars.* / wf.initVariables.* paths relevant to the task
 - "target_operation": one of "extract", "transform", "filter", "increment", "convert", "validate", "filter_keys", "remove_keys", "custom"
 - "key_entities": important field names, operations, or concepts from the request
-- "data_types": map of workflow path to detected type ("string", "number", "array_string", "array_object", "object", "unknown")
-- "expected_result_action": "return" or "save_to_wf_vars"
-- "needs_clarification": true if the request is too ambiguous to generate correct code
-- "clarification_questions": list of 1-3 questions if clarification is needed (empty list otherwise)
-- "confidence": 0.0-1.0 confidence in the analysis
+- "data_types": map of workflow path to detected type; values only "string", "number", "array_string", "array_object", "object", "unknown"
+- "expected_result_action": "return" if no explicit destination path is given; "save_to_wf_vars" only if saving/updating is explicitly requested or a target wf.vars path is explicitly given
+- "followup_action": one of "none", "refine_existing_code", "start_new_generation"
+- "needs_clarification": true only if required information is missing and correct code generation is impossible
+- "clarification_questions": 1-3 short questions if clarification is needed, otherwise []
+- "confidence": number from 0.0 to 1.0; reduce it if any assumption is needed
 
-JSON only:"""
+Rules:
+1. Do not invent new paths.
+2. Do not invent new output field names.
+3. If destination is missing, prefer "return".
+4. Use only information from the request and provided context.
+5. If there is existing code and active clarification questions, decide whether the user message is:
+   - an answer that should refine the existing code, or
+   - a logically new request that should start a fresh generation.
+6. Use "refine_existing_code" only when the user is clearly answering or narrowing the previous clarification questions for the current code.
+7. Use "start_new_generation" only when the user is clearly asking for a new logical task rather than refining the current code.
+5. JSON only.
+
+JSON only."""
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +141,7 @@ _VALID_OPERATIONS = frozenset({
 
 # Valid result actions
 _VALID_RESULT_ACTIONS = frozenset({"return", "save_to_wf_vars"})
+_VALID_FOLLOWUP_ACTIONS = frozenset({"none", "refine_existing_code", "start_new_generation"})
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +194,10 @@ def _normalize_planner_result(raw: dict, user_input: str) -> dict[str, Any]:
     if result_action not in _VALID_RESULT_ACTIONS:
         result_action = "return"
 
+    followup_action = str(raw.get("followup_action", "none") or "none").strip().lower()
+    if followup_action not in _VALID_FOLLOWUP_ACTIONS:
+        followup_action = "none"
+
     needs_clarification = bool(raw.get("needs_clarification", False))
 
     questions = raw.get("clarification_questions", [])
@@ -185,6 +220,7 @@ def _normalize_planner_result(raw: dict, user_input: str) -> dict[str, Any]:
         "key_entities": entities,
         "data_types": data_types,
         "expected_result_action": result_action,
+        "followup_action": followup_action,
         "needs_clarification": needs_clarification,
         "clarification_questions": questions,
         "confidence": confidence,
@@ -231,6 +267,7 @@ class PlannerAgent:
         workflow_paths: list[str] | None = None,
         intent: str = "",
         current_code: str = "",
+        active_clarifying_questions: list[str] | None = None,
     ) -> dict[str, Any]:
         """Analyze user request and produce a structured planning result.
 
@@ -254,12 +291,18 @@ class PlannerAgent:
 
         # Extract workflow paths from user text if not provided
         detected_paths = workflow_paths or _extract_workflow_paths_from_text(user_input)
+        active_questions = [
+            str(question).strip()
+            for question in (active_clarifying_questions or [])
+            if str(question).strip()
+        ]
 
         prompt = _PLANNER_USER.format(
             user_input=user_input,
             has_context=str(has_context).lower(),
             workflow_paths=", ".join(detected_paths) if detected_paths else "none",
             has_code=str(bool(current_code.strip() if current_code else False)).lower(),
+            active_clarifying_questions=" | ".join(active_questions) if active_questions else "none",
         )
 
         logger.info(
@@ -286,6 +329,7 @@ class PlannerAgent:
             f"[{_AGENT_NAME}] completed",
             needs_clarification=result["needs_clarification"],
             target_operation=result["target_operation"],
+            followup_action=result["followup_action"],
             confidence=result["confidence"],
             num_paths=len(result["identified_workflow_paths"]),
             num_questions=len(result["clarification_questions"]),
@@ -325,6 +369,11 @@ def create_planner_node(llm: LLMProvider) -> Callable:
         intent = state.get("intent", "")
         current_code = state.get("current_code", "")
         compiled_request = state.get("compiled_request", {})
+        active_clarifying_questions = [
+            str(question).strip()
+            for question in state.get("active_clarifying_questions", []) or []
+            if str(question).strip()
+        ]
 
         awaiting = bool(state.get("awaiting_planner_clarification"))
         original_input = str(state.get("planner_original_input", "") or "")
@@ -352,6 +401,7 @@ def create_planner_node(llm: LLMProvider) -> Callable:
             has_context=has_context,
             intent=intent,
             current_code=current_code,
+            active_clarifying_questions=active_clarifying_questions,
         )
 
         planner_result = plan_output.get("planner_result", {})
@@ -411,6 +461,13 @@ def create_planner_node(llm: LLMProvider) -> Callable:
             "planner_original_input": "",
             "planner_clarification_attempts": 0,
         }
+        followup_action = str(planner_result.get("followup_action", "none") or "none").strip().lower()
+        if followup_action == "refine_existing_code" and current_code.strip():
+            updates["intent"] = "change"
+        elif followup_action == "start_new_generation":
+            updates["intent"] = "create"
+            updates["base_prompt"] = ""
+            updates["change_requests"] = []
         if awaiting and original_input:
             updates["user_input"] = effective_input
         return updates

@@ -95,6 +95,7 @@ class TestNormalizePlannerResult(unittest.TestCase):
             "key_entities": ["emails", "last"],
             "data_types": {"wf.vars.emails": "array_string"},
             "expected_result_action": "return",
+            "followup_action": "none",
             "needs_clarification": False,
             "clarification_questions": [],
             "confidence": 0.9,
@@ -102,6 +103,7 @@ class TestNormalizePlannerResult(unittest.TestCase):
         result = _normalize_planner_result(raw, "original input")
         self.assertEqual(result["reformulated_task"], "Get last email from wf.vars.emails")
         self.assertEqual(result["target_operation"], "extract")
+        self.assertEqual(result["followup_action"], "none")
         self.assertAlmostEqual(result["confidence"], 0.9)
         self.assertFalse(result["needs_clarification"])
 
@@ -126,6 +128,11 @@ class TestNormalizePlannerResult(unittest.TestCase):
         raw = {"expected_result_action": "something_weird"}
         result = _normalize_planner_result(raw, "task")
         self.assertEqual(result["expected_result_action"], "return")
+
+    def test_invalid_followup_action_defaults_to_none(self) -> None:
+        raw = {"followup_action": "unexpected_mode"}
+        result = _normalize_planner_result(raw, "task")
+        self.assertEqual(result["followup_action"], "none")
 
     def test_confidence_clamped(self) -> None:
         raw = {"confidence": 5.0}

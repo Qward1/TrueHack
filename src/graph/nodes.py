@@ -78,13 +78,41 @@ User message: {user_input}
 
 JSON only:"""
 
+LOWCODE_LUA_RULES = (
+    "LowCode Lua platform rules: "
+    "Use Lua 5.5. "
+    "The script must be returned in JsonString form as lua{...}lua. "
+    "Do not use JsonPath. Access workflow data only by direct paths. "
+    "All declared workflow variables are stored in wf.vars. "
+    "All input variables passed at workflow start are stored in wf.initVariables. "
+
+    "Allowed data types: nil, boolean, number, string, table, function, and array. "
+    "When a new array is needed, create it with _utils.array.new(), populate items explicitly, "
+    "then call _utils.array.markAsArray(arr). "
+    "When an existing table must be treated as an array, use _utils.array.markAsArray(arr). "
+
+    "Allowed control flow constructs: if/then/else, while/do/end, for/do/end, repeat/until."
+)
+
 _GENERATE_SYSTEM = (
-    f"You write {LOWCODE_LUA_VERSION} workflow scripts for varied automation tasks.\n"
-    f"{LOWCODE_CONTRACT_TEXT}"
-    "Synthesize the script from the current task and workflow context instead of copying canned patterns. "
-    "Simple tasks may stay short, but when the task needs normalization, validation, iteration, or multi-step transformation, write the full logic explicitly. "
-    "Prefer correctness, robustness, and direct workflow-path usage over terseness.\n\n"
-    f"{LOWCODE_RESPONSE_FORMAT_REQUIREMENT}"
+    "You write Lua 5.5 workflow scripts for LowCode. "
+    
+    + LOWCODE_LUA_RULES +
+
+    " Use direct workflow access only: wf.vars.* and wf.initVariables.*. "
+    "Never recreate provided workflow data as local demo tables. "
+    "Never use print(), io.write(), io.read(), console prompts, apps, APIs, or wrappers. "
+    "Use return and/or explicit wf.vars updates only when requested. "
+
+    "Do not assume hidden parsers or unsupported APIs. "
+    "For datetime conversion from strings, parse components explicitly. "
+    "Do not pass ISO 8601 strings directly into os.time(...). "
+    "If timezone offset exists, handle it explicitly. "
+
+    "Use exact workflow paths from the task or provided context. "
+    "Do not invent new workflow paths unless the task explicitly names a target wf.vars path. "
+
+    "Output nothing except lua{...}lua."
 )
 
 _REFINE_SYSTEM = (
@@ -559,6 +587,7 @@ def _collect_intent_features(
     user_input: str,
     has_existing_code: bool,
     base_prompt: str,
+    active_clarifying_questions: list[str] | None = None,
 ) -> dict[str, Any]:
     message_code = _extract_message_code_block(user_input)
     cleaned_message = _strip_message_code_blocks(user_input) if message_code else str(user_input or "").strip()
@@ -586,6 +615,12 @@ def _collect_intent_features(
         and not effective_has_code
         and str(base_prompt or "").strip() != str(user_input or "").strip()
     )
+    active_questions = [
+        str(question).strip()
+        for question in (active_clarifying_questions or [])
+        if str(question).strip()
+    ]
+    has_active_code_clarification = bool(has_existing_code and active_questions)
 
     return {
         "message_code": message_code,
@@ -606,6 +641,8 @@ def _collect_intent_features(
         "has_message_code": bool(message_code),
         "effective_has_code": effective_has_code,
         "has_pending_base_prompt": has_pending_base_prompt,
+        "active_clarifying_questions": active_questions,
+        "has_active_code_clarification": has_active_code_clarification,
     }
 
 
@@ -633,9 +670,13 @@ def _deterministic_intent_from_features(features: dict[str, Any]) -> tuple[str, 
         or bool(features.get("has_workflow_context"))
         or (has_task_code_signal and not has_question_signal and not has_inspect_signal)
     )
+    has_active_code_clarification = bool(features.get("has_active_code_clarification"))
 
     if has_retry_signal:
         return ("retry", "retry_with_code") if effective_has_code else ("create", "retry_without_code")
+
+    if has_active_code_clarification and effective_has_code:
+        return "change", "active_code_clarification_followup"
 
     if has_inspect_signal and not (has_change_signal or has_create_signal or has_task_code_signal):
         return ("inspect", "inspect_existing_code") if effective_has_code else ("question", "inspect_without_code")
@@ -893,24 +934,55 @@ def _assess_fix_candidate(
     return deduped
 
 
+def _format_planner_section_compact(compiled_request: dict[str, Any]) -> str:
+    planner = compiled_request.get("planner_analysis") or {}
+    if not planner:
+        return ""
+
+    reformulated = planner.get("reformulated_task", "")
+    paths = planner.get("identified_workflow_paths", [])
+    operation = planner.get("target_operation", "")
+    action = planner.get("expected_result_action", "")
+    data_types = planner.get("data_types", {})
+
+    parts = []
+    if reformulated:
+        parts.append(f"- reformulated_task: {reformulated}")
+    if operation:
+        parts.append(f"- target_operation: {operation}")
+    if action:
+        parts.append(f"- expected_result_action: {action}")
+    if paths:
+        parts.append(f"- workflow_paths: {', '.join(paths)}")
+    if data_types:
+        typed = ", ".join(f"{k}={v}" for k, v in data_types.items())
+        parts.append(f"- data_types: {typed}")
+
+    return "\n".join(parts)
+
+
 def _build_generation_prompt(compiled_request: dict[str, Any]) -> str:
     task = str(compiled_request.get("task_text", "") or "").strip()
     provided_context = str(compiled_request.get("raw_context", "") or "").strip()
     clarification_text = str(compiled_request.get("clarification_text", "") or "").strip()
     prompt_context = _format_prompt_workflow_context(compiled_request)
-    planner_section = _format_planner_section(compiled_request)
+    planner_section = _format_planner_section_compact(compiled_request)
+
     sections = [
         f"Task:\n{task}",
-        f"Clarification from user:\n{clarification_text}" if clarification_text else "",
+        f"Clarification:\n{clarification_text}" if clarification_text else "",
         f"Workflow anchor:\n{prompt_context}" if prompt_context else "",
-        f"Planner analysis:\n{planner_section}" if planner_section else "",
-        (
-            "Provided workflow context:\n"
-            f"{provided_context}"
-        ) if provided_context else "",
-        _PROMPT_STYLE_RULES,
-        _PROMPT_SYNTHESIS_GUIDANCE,
-        LOWCODE_RESPONSE_FORMAT_REQUIREMENT,
+        f"Planner hint:\n{planner_section}" if planner_section else "",
+        f"Workflow context:\n{provided_context}" if provided_context else "",
+        "Decision rules:\n"
+        "1. Prefer explicit task text and workflow context over planner hints.\n"
+        "2. Use only explicit workflow paths.\n"
+        "3. Do not invent demo input tables.\n"
+        "4. For datetime conversion, parse components explicitly.\n"
+        "5. Do not pass ISO 8601 strings directly to os.time(...).\n"
+        "6. Handle timezone offsets explicitly when present.\n"
+        "7. Save to wf.vars only if explicitly requested.\n"
+        "8. Output only lua{...}lua."
     ]
     return _join_prompt_sections(*sections)
 
@@ -1133,8 +1205,6 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                     f"[{_AGENT_RESOLVE_TARGET}/load_target_code] done",
                     code_len=len(current_code),
                 )
-        elif not previous_target:
-            current_code = ""
 
         logger.info(
             f"[{_AGENT_RESOLVE_TARGET}] completed",
@@ -1152,10 +1222,16 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
 
     async def route_intent(state: PipelineState) -> dict:
         has_code = bool(state.get("current_code", "").strip())
+        active_clarifying_questions = [
+            str(question).strip()
+            for question in state.get("active_clarifying_questions", []) or []
+            if str(question).strip()
+        ]
         features = _collect_intent_features(
             user_input=state["user_input"],
             has_existing_code=has_code,
             base_prompt=state.get("base_prompt", ""),
+            active_clarifying_questions=active_clarifying_questions,
         )
         message_code = str(features.get("message_code", "") or "").strip()
         effective_has_code = bool(features.get("effective_has_code"))

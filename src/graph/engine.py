@@ -45,6 +45,7 @@ class PipelineEngine:
         planner_pending_questions: list[str] | None = None,
         planner_original_input: str = "",
         planner_clarification_attempts: int = 0,
+        active_clarifying_questions: list[str] | None = None,
     ) -> dict[str, Any]:
         """Run the full pipeline for one user turn."""
         resolved_turn_id = turn_id or new_turn_id()
@@ -80,6 +81,7 @@ class PipelineEngine:
             "explanation": {},
             "suggested_changes": [],
             "clarifying_questions": [],
+            "active_clarifying_questions": list(active_clarifying_questions or []),
             "response": "",
             "response_type": "text",
             "planner_result": {},

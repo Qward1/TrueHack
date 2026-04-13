@@ -14,10 +14,10 @@ from src.graph.nodes import _build_generation_prompt, _format_planner_section
 
 
 # System prompt prefixes used by various agents in the pipeline.
-PLANNER_SYSTEM_PREFIX = "You are a task analyst for a Lua workflow script generator."
+PLANNER_SYSTEM_PREFIX = "You are a task analyst for a LowCode Lua 5.5 workflow script generator."
 ROUTE_SYSTEM_PREFIX = "You are an intent classifier"
 EXPLAIN_SYSTEM_PREFIX = "You explain generated Lua code"
-VERIFY_SYSTEM_PREFIX = "You review whether a Lua solution fully satisfies the user's request."
+VERIFY_SYSTEM_PREFIX = "You are a strict verifier for LowCode Lua 5.5 workflow solutions."
 FIX_VALIDATION_SYSTEM_PREFIX = "You fix Lua 5.5 workflow scripts that fail during execution."
 FIX_VERIFICATION_SYSTEM_PREFIX = "You fix Lua 5.5 workflow scripts that fail requirement verification."
 
@@ -258,6 +258,52 @@ class PlannerEnabledPipelineTests(unittest.TestCase):
         self.assertFalse(result["awaiting_planner_clarification"])
         # Generation should run despite planner wanting more clarification.
         self.assertGreaterEqual(llm.generate_calls, 1)
+
+    def test_active_code_clarification_answer_refines_existing_code(self) -> None:
+        llm = IntegrationStubLLM(planner_response={
+            "reformulated_task": "Modify the current Lua script so it returns only VIP contacts from wf.vars.contacts.",
+            "identified_workflow_paths": ["wf.vars.contacts"],
+            "target_operation": "filter",
+            "expected_result_action": "return",
+            "followup_action": "refine_existing_code",
+            "needs_clarification": False,
+            "clarification_questions": [],
+            "confidence": 0.92,
+        })
+        result = self._run_engine(
+            llm,
+            user_input="только VIP-контакты",
+            current_code="return wf.vars.contacts",
+            base_prompt="Верни контакты из wf.vars.contacts",
+            active_clarifying_questions=["Нужно вернуть все контакты или только VIP?"],
+        )
+        self.assertEqual(result["intent"], "change")
+        self.assertEqual(result["change_requests"], ["только VIP-контакты"])
+        self.assertIn("Current code:", llm.last_generate_prompt)
+        self.assertIn("Change request:", llm.last_generate_prompt)
+
+    def test_active_code_clarification_new_task_starts_fresh_generation(self) -> None:
+        llm = IntegrationStubLLM(planner_response={
+            "reformulated_task": "Return the last order from wf.vars.orders.",
+            "identified_workflow_paths": ["wf.vars.orders"],
+            "target_operation": "extract",
+            "expected_result_action": "return",
+            "followup_action": "start_new_generation",
+            "needs_clarification": False,
+            "clarification_questions": [],
+            "confidence": 0.94,
+        })
+        result = self._run_engine(
+            llm,
+            user_input="сделай новый скрипт для последнего заказа из wf.vars.orders",
+            current_code="return wf.vars.contacts",
+            base_prompt="Верни контакты из wf.vars.contacts",
+            active_clarifying_questions=["Нужно вернуть все контакты или только VIP?"],
+        )
+        self.assertEqual(result["intent"], "create")
+        self.assertEqual(result["change_requests"], [])
+        self.assertNotIn("Current code:", llm.last_generate_prompt)
+        self.assertIn("Task:\nReturn the last order from wf.vars.orders.", llm.last_generate_prompt)
 
 
 class PlannerPromptIntegrationTests(unittest.TestCase):

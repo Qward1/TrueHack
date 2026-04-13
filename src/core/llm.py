@@ -29,6 +29,10 @@ def _parse_prompt_limit() -> int:
 
 PROMPT_MAX_CHARS = _parse_prompt_limit()
 
+QWEN_NO_THINK_MODELS = frozenset({
+    "qwen3.5:9b",
+})
+
 
 def _agent_model_env_key(agent_name: str) -> str:
     normalized = str(agent_name or "").strip()
@@ -48,6 +52,14 @@ def _resolve_agent_model(agent_name: str, default_model: str) -> str:
         if override:
             return override
     return default_model
+
+
+def _normalize_model_name(model_name: str) -> str:
+    return str(model_name or "").strip().lower()
+
+
+def _should_disable_thinking(model_name: str) -> bool:
+    return _normalize_model_name(model_name) in QWEN_NO_THINK_MODELS
 
 
 class LLMProvider:
@@ -150,6 +162,8 @@ class LLMProvider:
             "messages": messages,
             "temperature": temperature,
         }
+        if _should_disable_thinking(effective_model):
+            kwargs["reasoning_effort"] = "none"
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
 

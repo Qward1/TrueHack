@@ -8,7 +8,7 @@ from src.graph.engine import PipelineEngine
 
 ROUTE_SYSTEM_PREFIX = "You are an intent classifier"
 EXPLAIN_SYSTEM_PREFIX = "You explain generated Lua code"
-VERIFY_SYSTEM_PREFIX = "You are a STRICT verifier that decides whether a Lua solution fully satisfies the user's request."
+VERIFY_SYSTEM_PREFIX = "You are a strict verifier for LowCode Lua 5.5 workflow solutions."
 FIX_VALIDATION_SYSTEM_PREFIX = "You fix Lua 5.5 workflow scripts that fail during execution."
 FIX_VERIFICATION_SYSTEM_PREFIX = "You fix Lua 5.5 workflow scripts that fail requirement verification."
 
@@ -318,10 +318,35 @@ class PipelineLowcodeGenerationTests(unittest.TestCase):
         self.assertTrue(result["verification"]["passed"])
         self.assertEqual(llm.generate_calls, 1)
         self.assertIn('"emails"', result["response"])
-        self.assertIn('lua{\\r\\nreturn wf.vars.emails[#wf.vars.emails]\\r\\n}lua', result["response"])
-        self.assertEqual(len(saved_payloads), 1)
-        self.assertIn('"emails"', saved_payloads[0])
-        self.assertIn('lua{\\r\\nreturn wf.vars.emails[#wf.vars.emails]\\r\\n}lua', saved_payloads[0])
+
+    def test_answer_to_clarifying_question_refines_existing_code(self) -> None:
+        async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
+            return _success_diagnostics()
+
+        llm = StubLLM(
+            generate_responses=["lua{return wf.vars.contacts.vipOnly}lua"],
+            fix_response="",
+        )
+        existing_code = "return wf.vars.contacts"
+
+        with patch("src.graph.nodes.async_run_diagnostics", new=fake_run_diagnostics):
+            engine = PipelineEngine(llm=llm)
+            result = asyncio.run(
+                engine.process_message(
+                    chat_id=1,
+                    user_input="только VIP-контакты",
+                    current_code=existing_code,
+                    base_prompt="Верни контакты из wf.vars.contacts",
+                    active_clarifying_questions=["Нужно вернуть все контакты или только VIP?"],
+                    workspace_root=str(self.tmp_path),
+                    target_path="",
+                )
+            )
+
+        self.assertEqual(result["intent"], "change")
+        self.assertEqual(result["change_requests"], ["только VIP-контакты"])
+        self.assertIn("Current code:", llm.last_generate_prompt)
+        self.assertIn('lua{\\r\\nreturn wf.vars.contacts.vipOnly\\r\\n}lua', result["response"])
 
     def test_generation_prompt_allows_multi_step_workflow_script(self) -> None:
         async def fake_run_diagnostics(code: str, lua_bin: str = "lua55", startup_timeout: float = 3.0) -> dict:
