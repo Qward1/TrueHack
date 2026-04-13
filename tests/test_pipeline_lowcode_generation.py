@@ -8,7 +8,7 @@ from src.graph.engine import PipelineEngine
 
 ROUTE_SYSTEM_PREFIX = "You are an intent classifier"
 EXPLAIN_SYSTEM_PREFIX = "You explain generated Lua code"
-VERIFY_SYSTEM_PREFIX = "You are a STRICT verifier that decides whether a Lua solution fully satisfies the user's request."
+VERIFY_SYSTEM_PREFIX = "You are a strict verifier of Lua workflow solutions."
 FIX_VALIDATION_SYSTEM_PREFIX = "You fix Lua 5.5 workflow scripts that fail during execution."
 FIX_VERIFICATION_SYSTEM_PREFIX = "You fix Lua 5.5 workflow scripts that fail requirement verification."
 
@@ -57,6 +57,14 @@ class StubLLM:
             raise AssertionError("route_intent should use generate_json")
         if system.startswith(EXPLAIN_SYSTEM_PREFIX):
             raise AssertionError("explain_solution should use generate_json")
+        if agent_name == "CodeValidator":
+            return (
+                "Error type/message: runtime error\n"
+                "Failing line: unknown\n"
+                "Root cause: inferred from traceback\n"
+                "Why it fails on this context: validation runtime produced this failure\n"
+                "Exact repair path: update the failing expression so the runtime error is removed."
+            )
         self.generate_calls += 1
         self.last_generate_prompt = prompt
         self.last_generate_system = system
@@ -1706,6 +1714,10 @@ return epoch
         self.assertTrue(result["save_success"])
         self.assertIn("Runtime error:", llm.last_fix_prompt)
         self.assertIn("Current code with line numbers:", llm.last_fix_prompt)
+        self.assertNotIn("Task:\n", llm.last_fix_prompt)
+        self.assertNotIn("Original workflow context:\n", llm.last_fix_prompt)
+        self.assertNotIn("Workflow anchor:\n", llm.last_fix_prompt)
+        self.assertNotIn("Planner analysis:\n", llm.last_fix_prompt)
         self.assertIn("wf.initVariables.recallTime", result["generated_code"])
 
     def test_runtime_arithmetic_nil_error_retries_with_numbered_code_prompt(self) -> None:

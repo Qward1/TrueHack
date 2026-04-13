@@ -2116,7 +2116,7 @@ async def async_verify_requirements(
                 '{'
                 '"passed": true, '
                 '"summary": "short summary", '
-                '"missing_requirements": [] - unfulfilled requirements that must be filled in if there are errors, '
+                '"missing_or_unfulfilled_requirements": [] - unfulfilled requirements that must be filled in if there are errors, '
                 '"warnings": [], '
                 '}'
             ),

@@ -39,12 +39,15 @@
   - добавляет `_utils.array.*` stubs;
   - строит nested mock paths для найденных `wf.vars.*` / `wf.initVariables.*`, включая alias-derived field access;
   - извлекает общие runtime repair hints из типовых Lua ошибок для следующего fix-шага.
+- validation hint analysis (`CodeValidator`) now uses the numbered script, runtime traceback, and the exact validation workflow context together; its prompt requires `root cause`, `why it fails on this context`, and an `exact repair path` instead of a bare traceback restatement.
 - `fix_code` выполняет итеративные правки по стадии ошибки:
   - validation;
   - requirements;
   - если первый fix-ответ остаётся пустым, почти не меняет код или детерминированно повторяет те же requirement failures, node делает один stricter internal retry before returning to validate.
+- validation-fix prompt intentionally keeps only runtime-failure context: `run_error`, line/context hints, `llm_fix_hint`, and the current numbered code block, without task/planner/workflow-context payload from `compiled_request`.
 - `verify_requirements` — семантическая LLM-проверка соответствия исходному запросу, которая возвращает итоговый verdict через `summary`, `missing_requirements` и `warnings`.
-- verifier работает как основной semantic gate: он получает parsed workflow context, planner analysis, original workflow state и updated workflow state из validation harness.
+- verifier работает как основной semantic gate: он получает parsed workflow context, before/after workflow-state evidence и updated workflow state из validation harness без дублирующего planner summary блока.
+- если `Parsed workflow context` совпадает с `Original workflow state before execution`, verifier prompt оставляет только один полный snapshot и отдельные точечные значения по выбранному workflow path.
 - verifier и verification-fix prompts также трактуют явные type/shape hints из compiled workflow context (`selected_primary_type`, `requested_item_keys`, `semantic_expectations`) как обязательные ограничения, а не как факультативные подсказки.
 - для задач cleanup/remove/filter и shape-sensitive задач fix-loop теперь получает semantic requirement failures и verifier summary, а не отдельный статический guard verdict.
 - Если в тексте задачи указан bare field name без полного `wf.vars.*` / `wf.initVariables.*`, compiler пытается однозначно разрешить его через parseable workflow context и добавить в expected workflow paths.
@@ -125,7 +128,7 @@
 - Generation, refine, and fix prompts now use abstract synthesis guidance instead of embedded code templates/few-shot snippets.
 - The canonical style is: direct `wf.vars` / `wf.initVariables` access, no recreated demo input tables, no console wrappers, and the amount of Lua structure the task actually needs.
 - Semantic verification is the primary save gate:
-  - verifier/fix prompts receive parsed workflow context, expected workflow paths, planner analysis, before/after workflow-state evidence, and semantic requirement failures;
+  - verifier/fix prompts receive parsed workflow context, expected workflow paths, before/after workflow-state evidence, and semantic requirement failures;
   - verifier contract uses `passed`, `summary`, `missing_requirements`, and `warnings`, without numeric score fields or checklist objects;
   - save remains blocked on failed validation or failed semantic verification;
   - no separate deterministic verification guard remains in the active pipeline.
@@ -149,7 +152,7 @@
 - `validate_code` now captures both the actual returned value and the updated workflow snapshot from the temporary workflow harness and exposes them to `verify_requirements`.
 - `verify_requirements` now evaluates logic against:
   - parsed workflow context;
-  - planner analysis when available;
+  - workflow anchor and concrete workflow-state evidence;
   - updated workflow state after execution when the script mutates `wf.*` and returns `nil`.
 - `explain_solution` now normalizes explainer sections from either JSON arrays or single strings before falling back to generic text.
 - `prepare_response` always includes the current code payload in the user response, even on failed validation/verification turns; the response stays diagnostic and saving still remains blocked.

@@ -433,6 +433,24 @@ LLM verifier can hallucinate and approve code that still violates the request. C
 
 ---
 
+## 2026-04-13
+### Decision
+Validation-time LLM diagnostics must produce root-cause analysis and repair-path guidance, not only a reformulated traceback.
+
+### Why
+Logs showed that weak `CodeValidator` hints could simply restate `run_error` or derive a shallow wrong fix, which polluted the validation fixer prompt without improving repair quality.
+
+### Consequences
+- `CodeValidator` prompt now explicitly requires:
+  - exact error type/message;
+  - failing line;
+  - concrete root cause in the code;
+  - why the failure happens on the provided validation context;
+  - exact code-level repair path.
+- Initial and retry validator-hint calls now use the same prompt builder, so retry diagnostics do not silently fall back to a weaker prompt shape.
+
+---
+
 ## 2026-04-12
 ### Decision
 Workflow code generation must use a stricter output contract and a lower-temperature policy when parseable workflow context is available.
@@ -483,7 +501,7 @@ TaskPlanner LLM-агент интегрирован в canonical pipeline как
 - `app.py` персистит planner-state между turn'ами и сбрасывает его в `/new`.
 - При follow-up планировщик собирает merged input: `Исходная задача + Уточняющие вопросы + Ответ пользователя` и переписывает `state.user_input` на этот merged context, чтобы дальнейший pipeline видел полную задачу.
 - `MAX_CLARIFICATION_ATTEMPTS=2` — защита от зацикливания: после 2 попыток уточнения принудительно `needs_clarification=False`.
-- Deterministic compiler остаётся единственным источником истины по path-level решениям. Planner output только обогащает prompt'ы generation/refine/fix через `_format_planner_section` (`Reformulated task`, `Planner-identified workflow paths`, `Expected result action`).
+- Deterministic compiler остаётся единственным источником истины по path-level решениям. Planner output сохраняется в state, но больше не дублируется в generation/refine/fix prompt'ах там, где те же task/path сигналы уже переданы через `task_text` и `Workflow anchor`.
 - Soft enrichment: если у запроса не было parseable context, но `reformulated_task` помогает compiler'у найти больше expected paths — берём улучшенный compiled_request.
 - Toggle: `PLANNER_ENABLED=true` в `.env.example`. При `false` нода short-circuits с `planner_skipped=True` и pipeline работает как раньше — это сохраняет совместимость с существующими тестами и даёт fallback при медленной модели.
 

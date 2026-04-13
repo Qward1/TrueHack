@@ -97,11 +97,21 @@ _REFINE_SYSTEM = (
 )
 
 _VALIDATOR_HINT_SYSTEM = (
-    "You are a Lua error analyst. "
-    "State: 1) the exact error type and message, 2) the failing line number, "
-    "3) the exact fix (which variable or call to change and how). "
-    "Do not paraphrase the error. Copy key identifiers verbatim from the error message. "
-    "Plain text only."
+    "You are a Lua runtime diagnostics analyst for workflow scripts. "
+    "Use the traceback, the numbered script, and the provided workflow context together. "
+    "Do not simply restate the runtime error. Add new diagnostic value. "
+    "Infer the concrete root cause in the code, explain why it fails on this input/context, "
+    "and describe the exact repair path. "
+    "If the traceback points to a wrong argument, missing value, wrong type, nil access, or malformed call, "
+    "name the specific expression, variable, or argument position that must change. "
+    "If a proposed fix would leave the failing expression unchanged, say that it is insufficient and propose a concrete code-level change instead. "
+    "Return plain text only in this exact structure:\n"
+    "Error type/message: ...\n"
+    "Failing line: ...\n"
+    "Root cause: ...\n"
+    "Why it fails on this context: ...\n"
+    "Exact repair path: ...\n"
+    "Copy key identifiers verbatim from the code and error where possible."
 )
 
 _FIX_VALIDATION_SYSTEM = (
@@ -376,6 +386,15 @@ def _format_planner_section(compiled_request: dict[str, Any]) -> str:
     return "\n\n".join(parts)
 
 
+def _workflow_snapshots_equivalent(left: object, right: object) -> bool:
+    try:
+        return json.dumps(left, ensure_ascii=False, sort_keys=True) == json.dumps(
+            right, ensure_ascii=False, sort_keys=True
+        )
+    except Exception:
+        return left == right
+
+
 def _compact_json_for_prompt(value: object, limit: int = 4000) -> str:
     try:
         rendered = json.dumps(value, ensure_ascii=False, indent=2)
@@ -396,10 +415,6 @@ def _build_verification_extra_context(
         diagnostics = {}
 
     sections: list[str] = []
-    planner_section = _format_planner_section(compiled_request)
-    if planner_section:
-        sections.append("Planner/task analysis:\n" + planner_section)
-
     planner_result = compiled_request.get("planner_result") or {}
 
     selected_type = str(compiled_request.get("selected_primary_type", "") or "").strip()
@@ -464,18 +479,22 @@ def _build_verification_extra_context(
         if identified_paths:
             selected_path = identified_paths[0]
     if workflow_state is not None:
-        if compiled_request.get("has_parseable_context") and parsed_context is not None:
+        if (
+            compiled_request.get("has_parseable_context")
+            and parsed_context is not None
+            and not _workflow_snapshots_equivalent(parsed_context, workflow_state)
+        ):
             sections.append(
                 "Original workflow state before execution:\n"
                 + _compact_json_for_prompt(parsed_context)
             )
-            if selected_path:
-                original_found, original_value = _resolve_workflow_path_value(parsed_context, selected_path)
-                if original_found:
-                    sections.append(
-                        f"Original workflow value at {selected_path} before execution:\n"
-                        + _compact_json_for_prompt(original_value)
-                    )
+        if compiled_request.get("has_parseable_context") and parsed_context is not None and selected_path:
+            original_found, original_value = _resolve_workflow_path_value(parsed_context, selected_path)
+            if original_found:
+                sections.append(
+                    f"Original workflow value at {selected_path} before execution:\n"
+                    + _compact_json_for_prompt(original_value)
+                )
         sections.append(
             "Updated workflow state after execution:\n"
             + _compact_json_for_prompt(workflow_state)
@@ -884,12 +903,10 @@ def _build_generation_prompt(compiled_request: dict[str, Any]) -> str:
     provided_context = str(compiled_request.get("raw_context", "") or "").strip()
     clarification_text = str(compiled_request.get("clarification_text", "") or "").strip()
     prompt_context = _format_prompt_workflow_context(compiled_request)
-    planner_section = _format_planner_section(compiled_request)
     sections = [
         f"Task:\n{task}",
         f"Clarification from user:\n{clarification_text}" if clarification_text else "",
         f"Workflow anchor:\n{prompt_context}" if prompt_context else "",
-        f"Planner analysis:\n{planner_section}" if planner_section else "",
         (
             "Provided workflow context:\n"
             f"{provided_context}"
@@ -913,7 +930,6 @@ def _build_refine_prompt(
     provided_context = str(compiled_request.get("raw_context", "") or "").strip()
     clarification_text = str(compiled_request.get("clarification_text", "") or "").strip()
     prompt_context = _format_prompt_workflow_context(compiled_request)
-    planner_section = _format_planner_section(compiled_request)
     sections = [
         f"Original task:\n{original_task}" if original_task else "",
         (
@@ -922,7 +938,6 @@ def _build_refine_prompt(
         ) if provided_context else "",
         f"Change clarification:\n{clarification_text}" if clarification_text else "",
         f"Workflow anchor:\n{prompt_context}" if prompt_context else "",
-        f"Planner analysis:\n{planner_section}" if planner_section else "",
         (
             "Existing functions you must preserve unless the user explicitly removes them:\n"
             f"{function_list}"
@@ -941,23 +956,12 @@ def _build_fix_validation_prompt(
     code: str,
     run_error: str,
     llm_fix_hint: str,
-    compiled_request: dict[str, Any],
 ) -> str:
     """Prompt for fixing Lua runtime/syntax errors (validation failures)."""
-    task_text = str(compiled_request.get("task_text", "") or "").strip()
-    provided_context = str(compiled_request.get("raw_context", "") or "").strip()
-    if len(provided_context) > 600:
-        provided_context = provided_context[:600].rstrip() + "..."
-    prompt_context = _format_prompt_workflow_context(compiled_request)
-    planner_section = _format_planner_section(compiled_request)
     runtime_line_number = _extract_runtime_line_number(run_error)
     runtime_line_hint = _extract_runtime_line_hint(run_error)
     runtime_code_context = _format_code_context_window(code, runtime_line_number)
     sections = [
-        f"Task:\n{task_text}" if task_text else "",
-        f"Original workflow context:\n{provided_context}" if provided_context else "",
-        f"Workflow anchor:\n{prompt_context}" if prompt_context else "",
-        f"Planner analysis:\n{planner_section}" if planner_section else "",
         f"Runtime error:\n{run_error}" if str(run_error or "").strip() else "",
         runtime_line_hint,
         f"Failing code context:\n{runtime_code_context}" if runtime_code_context else "",
@@ -970,6 +974,34 @@ def _build_fix_validation_prompt(
         LOWCODE_RESPONSE_FORMAT_REQUIREMENT,
     ]
     return _join_prompt_sections(*sections)
+
+
+def _build_validator_hint_prompt(
+    *,
+    code: str,
+    run_error: str,
+    workflow_context: Any | None = None,
+    raw_context: str = "",
+) -> str:
+    workflow_context_section = ""
+    if workflow_context is not None:
+        workflow_context_section = (
+            "Workflow context used during validation:\n"
+            f"{_compact_json_for_prompt(workflow_context)}\n\n"
+        )
+    elif raw_context.strip():
+        workflow_context_section = (
+            "Workflow context used during validation:\n"
+            f"{raw_context.strip()}\n\n"
+        )
+    return (
+        f"Script with line numbers:\n{_format_numbered_code_block(code)}\n\n"
+        f"{workflow_context_section}"
+        f"Runtime error:\n{_clean_run_error(run_error)}\n\n"
+        "Analyze the actual failure. Do not just rephrase the traceback. "
+        "Identify the concrete root cause in the code, explain why it breaks on this validation context, "
+        "and describe the exact code-level repair path."
+    )
 
 
 def _build_fix_verification_prompt(
@@ -987,14 +1019,12 @@ def _build_fix_verification_prompt(
     if len(provided_context) > 600:
         provided_context = provided_context[:600].rstrip() + "..."
     prompt_context = _format_prompt_workflow_context(compiled_request)
-    planner_section = _format_planner_section(compiled_request)
     summary_text = str(verification_summary or "").strip()
     missing_str = "\n".join(f"- {r}" for r in (missing_requirements or []) if str(r).strip())
     sections = [
         f"Task:\n{task_text}" if task_text else "",
         f"Original workflow context:\n{provided_context}" if provided_context else "",
         f"Workflow anchor:\n{prompt_context}" if prompt_context else "",
-        f"Planner analysis:\n{planner_section}" if planner_section else "",
         f"Verification summary:\n{summary_text}" if summary_text else "",
         f"Unmet requirements:\n{missing_str}" if missing_str else "",
         f"Runtime result during validation:\n{runtime_result}" if runtime_result else "",
@@ -1002,7 +1032,7 @@ def _build_fix_verification_prompt(
         f"Current code with line numbers:\n{_format_numbered_code_block(code)}",
         "Fix the logic so all listed requirements are satisfied.",
         "Do not change parts of the script that already work correctly.",
-        "Ensure the workflow paths used match the task and the expected paths in the planner analysis.",
+        "Ensure the workflow paths used match the task and the workflow anchor.",
         _PROMPT_STYLE_RULES,
         LOWCODE_RESPONSE_FORMAT_REQUIREMENT,
     ]
@@ -1579,24 +1609,14 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 workflow_context = _workflow_context_for_validation(
                     compiled_request if isinstance(compiled_request, dict) else {},
                 )
-                workflow_context_section = ""
-                if workflow_context is not None:
-                    workflow_context_section = (
-                        "Workflow context used during validation:\n"
-                        f"{_compact_json_for_prompt(workflow_context)}\n\n"
-                    )
-                elif isinstance(compiled_request, dict):
+                raw_context = ""
+                if isinstance(compiled_request, dict):
                     raw_context = str(compiled_request.get("raw_context", "") or "").strip()
-                    if raw_context:
-                        workflow_context_section = (
-                            "Workflow context used during validation:\n"
-                            f"{raw_context}\n\n"
-                        )
-                hint_prompt = (
-                    f"Script with line numbers:\n{_format_numbered_code_block(code)}\n\n"
-                    f"The context in which the solution was tested, analyze what happened in the code with this context, and why the error occurred:\n{workflow_context_section}\n\n"
-                    f"Runtime error:\n{_clean_run_error(diagnostics['run_error'])}\n\n"
-                    "What is the error, which line causes it, and what is the exact fix needed?"
+                hint_prompt = _build_validator_hint_prompt(
+                    code=code,
+                    run_error=str(diagnostics["run_error"]),
+                    workflow_context=workflow_context,
+                    raw_context=raw_context,
                 )
                 logger.info(
                     f"[{_AGENT_VALIDATE_CODE}/llm.generate] hint calling",
@@ -1656,7 +1676,6 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             code=code,
             run_error=run_error,
             llm_fix_hint=llm_fix_hint,
-            compiled_request=compiled_request,
         )
         messages = [
             {"role": "system", "content": _FIX_VALIDATION_SYSTEM},
@@ -1697,10 +1716,17 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 new_hint = llm_fix_hint
                 if candidate_error:
                     try:
-                        hint_prompt = (
-                            f"Script with line numbers:\n{_format_numbered_code_block(normalized_fixed)}\n\n"
-                            f"Runtime error:\n{_clean_run_error(candidate_error)}\n\n"
-                            "What is the error, which line causes it, and what is the exact fix needed?"
+                        workflow_context = _workflow_context_for_validation(
+                            compiled_request if isinstance(compiled_request, dict) else {},
+                        )
+                        raw_context = ""
+                        if isinstance(compiled_request, dict):
+                            raw_context = str(compiled_request.get("raw_context", "") or "").strip()
+                        hint_prompt = _build_validator_hint_prompt(
+                            code=normalized_fixed,
+                            run_error=candidate_error,
+                            workflow_context=workflow_context,
+                            raw_context=raw_context,
                         )
                         new_hint_raw = await llm.generate(
                             prompt=hint_prompt,
@@ -1715,7 +1741,6 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                     code=normalized_fixed,
                     run_error=candidate_error,
                     llm_fix_hint=new_hint,
-                    compiled_request=compiled_request,
                 )
                 retry_messages = [
                     {"role": "system", "content": _FIX_VALIDATION_SYSTEM},
@@ -1736,7 +1761,6 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 code=code,
                 run_error=run_error,
                 llm_fix_hint=(llm_fix_hint + "\n\nNote: the previous fix attempt returned unchanged code.").strip(),
-                compiled_request=compiled_request,
             )
             logger.info(f"[{_AGENT_FIX_VALIDATION_CODE}/llm.chat] retry calling (unchanged)", temperature=0.0)
             retry_raw = await llm.chat(

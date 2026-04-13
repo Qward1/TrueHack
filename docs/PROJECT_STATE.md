@@ -19,7 +19,7 @@
   - при ambiguity задаёт 1-3 уточняющих вопроса и возвращает clarification response;
   - на следующем turn ответ пользователя идёт **напрямую** в планировщик через `route_from_start` bypass — без захода в `resolve_target`/`route_intent`;
   - после 2 попыток уточнения принудительно продолжает pipeline;
-  - результат планировщика обогащает prompt'ы generation/refine/fix секцией `Planner analysis:`;
+  - planner result сохраняется в state, но generation/refine/fix prompts больше не дублируют его отдельной секцией, если те же данные уже выражены через `Task` и `Workflow anchor`;
   - отключается через `PLANNER_ENABLED=false`
 - path-aware Lua target logic:
   - explicit `.lua` path;
@@ -40,13 +40,16 @@
   - `wf.vars` / `wf.initVariables` для данных схемы
 - локальная валидация через `lua` с temporary LowCode harness
 - nested mock paths для `wf.vars` / `wf.initVariables` в validation harness
+- `CodeValidator` больше не должен ограничиваться пересказом traceback: hint-prompt требует назвать root cause, объяснить, почему код падает именно на данном validation context, и дать exact repair path
 - fix loop по стадиям ошибок
+- validation-fix prompt is now runtime-focused and no longer includes task/planner/workflow-context sections from `compiled_request`
 - normalized runtime repair hints для common Lua errors (`bad argument`, `nil` access/call, arithmetic/type mismatch, concatenation)
 - stricter internal fix retry:
   - если первый fix-кандидат пустой, почти идентичен прошлому коду или повторяет те же semantic requirement failures, pipeline делает ещё один более жёсткий fix-call до возврата в validation
 - LLM verification требований
 - workflow-state-aware semantic verification:
-  - verifier sees parsed workflow context, planner analysis, the original workflow state, and the updated workflow snapshot captured during validation;
+- verifier sees parsed workflow context and the before/after workflow snapshot captured during validation, without отдельного planner-summary дубля;
+- если parsed workflow context и original workflow state совпадают, verifier prompt не дублирует оба полных snapshot-а;
   - explicit type/shape hints from compiled workflow context (`selected_primary_type`, `requested_item_keys`, `semantic_expectations`) are treated as mandatory verifier/fixer constraints;
   - verifier returns `passed`, `summary`, `missing_requirements`, and `warnings`, without any numeric score field or checklist object;
   - if the first verifier pass returns an optimistic false positive while the workflow-state evidence contradicts the request, a second contradiction-focused verifier pass can overrule it
@@ -150,7 +153,7 @@ README описывает канонический запуск через `app.
 - Toggle: env `PLANNER_ENABLED` (default `true` in `.env.example`); when off, the node short-circuits with `planner_skipped=True` and the rest of the pipeline runs as before.
 - Clarification follow-up bypass: when the planner asks a question, state carries `awaiting_planner_clarification`, `planner_pending_questions`, `planner_original_input`, `planner_clarification_attempts` across turns. On the next turn the new `route_from_start` conditional edge routes directly to `plan_request`, skipping `resolve_target` and `route_intent`. The planner sees a merged input combining the original task, the questions it asked, and the user's answer.
 - Safety: after `MAX_CLARIFICATION_ATTEMPTS` (=2) the planner forces continue to avoid infinite loops.
-- Prompt enrichment: `_format_planner_section` injects `Reformulated task / Planner-identified workflow paths / Expected result action` into all three prompt builders (`_build_generation_prompt`, `_build_refine_prompt`, `_build_fix_prompt`). Deterministic compiler stays the source of truth for path-level decisions; planner output only enriches model prompts.
+- Prompt enrichment from planner is no longer duplicated into generation/refine/fix builders when the same task/path signal is already present through `task_text` and `Workflow anchor`. Deterministic compiler remains the source of truth for path-level decisions.
 - Soft re-compilation: if the request had no parseable context but the planner's `reformulated_task` lets the deterministic compiler discover more `expected_workflow_paths`, the enriched compiled_request is preferred.
 - Persistence: `app.py` stores the four planner state fields per chat in `_empty_state_dict` / `_normalize_state_dict`, threads them into `process_message`, copies the result back via `_apply_pipeline_result`, and resets them on `/new`.
 - Tests: 8 new e2e tests in `tests/test_planner_integration.py`; full suite (`python -m unittest discover tests -v`) passes 92 tests.
@@ -171,7 +174,7 @@ README описывает канонический запуск через `app.
 - Lua normalization now recovers common malformed wrapper variants such as fenced ```` ```lua{...}lua ``` ```` and trailing `}lua` remnants, so wrapper noise does not turn into a false syntax failure by itself.
 - Runtime marker extraction now works for both LF and CRLF output produced by the temporary Lua harness.
 - The local validation harness now captures both the actual returned Lua value and the updated workflow snapshot on the provided workflow context.
-- Semantic verification now sees parsed workflow context, planner analysis, and the updated workflow state, so logic review can fail on wrong mutations instead of only reviewing source text.
+- Semantic verification now sees parsed workflow context and the updated workflow state, so logic review can fail on wrong mutations instead of only reviewing source text.
 - `explain_solution` now accepts explainer section fields as either JSON arrays or plain strings before generic fallback text is used.
 - If validation or requirement verification still fails after the fix loop, the user-facing response remains diagnostic, still shows the current code payload, and does not save artifacts to disk.
 

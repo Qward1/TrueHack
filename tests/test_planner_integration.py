@@ -267,20 +267,21 @@ class PlannerPromptIntegrationTests(unittest.TestCase):
         self.assertEqual(_format_planner_section({}), "")
         self.assertEqual(_format_planner_section({"planner_result": {}}), "")
 
-    def test_generation_prompt_includes_planner_section(self) -> None:
+    def test_generation_prompt_prefers_workflow_anchor_over_planner_section(self) -> None:
         compiled_request = {
-            "task_text": "Get last email",
+            "task_text": "Return wf.vars.emails[#wf.vars.emails]",
             "raw_context": "",
             "clarification_text": "",
+            "selected_primary_path": "wf.vars.emails",
             "planner_result": {
                 "reformulated_task": "Return wf.vars.emails[#wf.vars.emails]",
                 "identified_workflow_paths": ["wf.vars.emails"],
             },
         }
         prompt = _build_generation_prompt(compiled_request)
-        self.assertIn("Planner analysis:", prompt)
-        self.assertIn("Reformulated task:", prompt)
+        self.assertIn("Workflow anchor:", prompt)
         self.assertIn("wf.vars.emails", prompt)
+        self.assertNotIn("Planner analysis:", prompt)
 
 
 class PlannerDisabledPipelineTests(unittest.TestCase):
