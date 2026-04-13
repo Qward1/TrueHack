@@ -91,9 +91,7 @@ class TestNormalizePlannerResult(unittest.TestCase):
         raw = {
             "reformulated_task": "Get last email from wf.vars.emails",
             "identified_workflow_paths": ["wf.vars.emails"],
-            "target_operation": "extract",
             "key_entities": ["emails", "last"],
-            "data_types": {"wf.vars.emails": "array_string"},
             "expected_result_action": "return",
             "followup_action": "none",
             "needs_clarification": False,
@@ -102,15 +100,12 @@ class TestNormalizePlannerResult(unittest.TestCase):
         }
         result = _normalize_planner_result(raw, "original input")
         self.assertEqual(result["reformulated_task"], "Get last email from wf.vars.emails")
-        self.assertEqual(result["target_operation"], "extract")
-        self.assertEqual(result["followup_action"], "none")
         self.assertAlmostEqual(result["confidence"], 0.9)
         self.assertFalse(result["needs_clarification"])
 
     def test_empty_dict_fallback(self) -> None:
         result = _normalize_planner_result({}, "original input")
         self.assertEqual(result["reformulated_task"], "original input")
-        self.assertEqual(result["target_operation"], "custom")
         self.assertEqual(result["confidence"], 0.0)
         self.assertFalse(result["needs_clarification"])
         self.assertEqual(result["clarification_questions"], [])
@@ -118,11 +113,6 @@ class TestNormalizePlannerResult(unittest.TestCase):
     def test_non_dict_fallback(self) -> None:
         result = _normalize_planner_result("garbage", "original input")  # type: ignore
         self.assertEqual(result["reformulated_task"], "original input")
-
-    def test_invalid_operation_defaults_to_custom(self) -> None:
-        raw = {"target_operation": "invalid_op"}
-        result = _normalize_planner_result(raw, "task")
-        self.assertEqual(result["target_operation"], "custom")
 
     def test_invalid_result_action_defaults_to_return(self) -> None:
         raw = {"expected_result_action": "something_weird"}
@@ -152,13 +142,6 @@ class TestNormalizePlannerResult(unittest.TestCase):
         raw = {"clarification_questions": ["q1", "q2", "q3", "q4", "q5"]}
         result = _normalize_planner_result(raw, "task")
         self.assertEqual(len(result["clarification_questions"]), 3)
-
-    def test_data_types_filters_non_string(self) -> None:
-        raw = {"data_types": {"wf.vars.x": "number", 123: "bad", "ok": 456}}
-        result = _normalize_planner_result(raw, "task")
-        self.assertIn("wf.vars.x", result["data_types"])
-        self.assertNotIn(123, result["data_types"])
-
 
 class TestBuildClarificationResponse(unittest.TestCase):
     def test_with_questions(self) -> None:
@@ -192,9 +175,7 @@ class TestPlannerAgentPlan(unittest.TestCase):
         llm = StubLLM(response={
             "reformulated_task": "Получить последний элемент массива wf.vars.emails",
             "identified_workflow_paths": ["wf.vars.emails"],
-            "target_operation": "extract",
             "key_entities": ["emails", "последний"],
-            "data_types": {"wf.vars.emails": "array_string"},
             "expected_result_action": "return",
             "needs_clarification": False,
             "clarification_questions": [],
@@ -209,7 +190,6 @@ class TestPlannerAgentPlan(unittest.TestCase):
         self.assertFalse(result["planner_skipped"])
         pr = result["planner_result"]
         self.assertIn("wf.vars.emails", pr["reformulated_task"])
-        self.assertEqual(pr["target_operation"], "extract")
         self.assertGreater(pr["confidence"], 0.7)
 
     def test_identifies_workflow_paths(self) -> None:
@@ -219,12 +199,7 @@ class TestPlannerAgentPlan(unittest.TestCase):
                 "wf.vars.json.IDOC.ZCDF_HEAD.DATUM",
                 "wf.vars.json.IDOC.ZCDF_HEAD.TIME",
             ],
-            "target_operation": "convert",
             "key_entities": ["DATUM", "TIME", "ISO 8601"],
-            "data_types": {
-                "wf.vars.json.IDOC.ZCDF_HEAD.DATUM": "string",
-                "wf.vars.json.IDOC.ZCDF_HEAD.TIME": "string",
-            },
             "expected_result_action": "return",
             "needs_clarification": False,
             "clarification_questions": [],
@@ -243,9 +218,7 @@ class TestPlannerAgentPlan(unittest.TestCase):
         llm = StubLLM(response={
             "reformulated_task": "обработай данные",
             "identified_workflow_paths": [],
-            "target_operation": "custom",
             "key_entities": ["данные"],
-            "data_types": {},
             "expected_result_action": "return",
             "needs_clarification": True,
             "clarification_questions": [
@@ -265,9 +238,7 @@ class TestPlannerAgentPlan(unittest.TestCase):
         llm = StubLLM(response={
             "reformulated_task": "Добавь переменную с квадратом числа",
             "identified_workflow_paths": [],
-            "target_operation": "custom",
             "key_entities": ["квадрат", "переменная"],
-            "data_types": {},
             "expected_result_action": "return",
             "needs_clarification": True,
             "clarification_questions": [
@@ -287,9 +258,7 @@ class TestPlannerAgentPlan(unittest.TestCase):
         llm = StubLLM(response={
             "reformulated_task": "Увеличить значение wf.vars.try_count_n на 1 и вернуть результат",
             "identified_workflow_paths": ["wf.vars.try_count_n"],
-            "target_operation": "increment",
             "key_entities": ["try_count_n", "увеличить"],
-            "data_types": {"wf.vars.try_count_n": "number"},
             "expected_result_action": "return",
             "needs_clarification": False,
             "clarification_questions": [],
@@ -304,7 +273,6 @@ class TestPlannerAgentPlan(unittest.TestCase):
         pr = result["planner_result"]
         self.assertFalse(pr["needs_clarification"])
         self.assertGreater(pr["confidence"], 0.7)
-        self.assertEqual(pr["target_operation"], "increment")
 
     def test_detects_operation_type(self) -> None:
         cases = [
@@ -315,20 +283,18 @@ class TestPlannerAgentPlan(unittest.TestCase):
         for expected_op, user_input in cases:
             llm = StubLLM(response={
                 "reformulated_task": user_input,
-                "target_operation": expected_op,
                 "needs_clarification": False,
                 "confidence": 0.8,
             })
             agent = PlannerAgent(llm, enabled=True)
             result = asyncio.run(agent.plan(user_input=user_input))
             pr = result["planner_result"]
-            self.assertEqual(pr["target_operation"], expected_op, f"Failed for: {user_input}")
+            self.assertEqual(pr["reformulated_task"], user_input, f"Failed for: {user_input}")
 
     def test_extracts_key_entities(self) -> None:
         llm = StubLLM(response={
             "reformulated_task": "Convert DATUM and TIME to ISO",
             "key_entities": ["DATUM", "TIME", "ZCDF_HEAD", "ISO 8601"],
-            "target_operation": "convert",
             "needs_clarification": False,
             "confidence": 0.85,
         })
@@ -349,7 +315,6 @@ class TestPlannerAgentPlan(unittest.TestCase):
         pr = result["planner_result"]
         # Should fallback gracefully
         self.assertEqual(pr["reformulated_task"], original_input)
-        self.assertEqual(pr["target_operation"], "custom")
         self.assertAlmostEqual(pr["confidence"], 0.0)
         self.assertFalse(pr["needs_clarification"])
 
@@ -358,7 +323,6 @@ class TestPlannerAgentPlan(unittest.TestCase):
         for intent in ("create", "change", "retry"):
             llm = StubLLM(response={
                 "reformulated_task": "test",
-                "target_operation": "extract",
                 "needs_clarification": False,
                 "confidence": 0.8,
             })
@@ -414,7 +378,6 @@ class TestCreatePlannerNode(unittest.TestCase):
     def test_node_accepts_pipeline_state(self) -> None:
         llm = StubLLM(response={
             "reformulated_task": "test task",
-            "target_operation": "extract",
             "needs_clarification": False,
             "confidence": 0.8,
         })
@@ -435,7 +398,6 @@ class TestCreatePlannerNode(unittest.TestCase):
     def test_node_clarification_sets_response(self) -> None:
         llm = StubLLM(response={
             "reformulated_task": "unclear task",
-            "target_operation": "custom",
             "needs_clarification": True,
             "clarification_questions": ["What exactly do you need?"],
             "confidence": 0.2,
@@ -473,7 +435,6 @@ class TestCreatePlannerNode(unittest.TestCase):
         """When compiled_request has parseable context, planner should get has_context=True."""
         llm = StubLLM(response={
             "reformulated_task": "task with context",
-            "target_operation": "extract",
             "needs_clarification": False,
             "confidence": 0.9,
         })

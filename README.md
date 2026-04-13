@@ -235,15 +235,8 @@ Canonical runtime — Ollama с OpenAI-compatible API на `http://127.0.0.1:114
   - `fix_code` больше не подсовывает модели прошлый сломанный assistant output и переписывает сценарий по short mandatory-fix list;
   - generate/refine/fix теперь используют более консервативную temperature policy для parseable workflow context и shape-sensitive tasks;
   - raw LLM output считается невалидным, если модель вернула fences, quoted wrapper или не начала ответ с `lua{`;
-- verification теперь использует semantic checklist, а не только summary scoring:
-  - workflow path usage;
-  - source shape;
-  - target/output shape;
-  - logic correctness;
-  - helper API usage;
-  - edge cases;
+- verification теперь использует semantic verdict через `summary` + `missing_requirements`, а не только свободный summary;
 - verifier теперь получает concrete runtime evidence:
-  - direct runtime result from validation;
   - updated workflow snapshot after execution for mutation scripts;
   - contradiction-focused second pass can overturn an optimistic false positive;
   - verifier дополнительно не должен одобрять ответы с markdown/quoted wrappers и shape-sensitive код, где `next(...)` выступает единственной проверкой массива;

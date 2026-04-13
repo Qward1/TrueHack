@@ -133,12 +133,6 @@ class PlannerOutput(TypedDict, total=False):
     planner_skipped: bool
 
 
-# Valid operations
-_VALID_OPERATIONS = frozenset({
-    "extract", "transform", "filter", "increment", "convert",
-    "validate", "filter_keys", "remove_keys", "custom",
-})
-
 # Valid result actions
 _VALID_RESULT_ACTIONS = frozenset({"return", "save_to_wf_vars"})
 _VALID_FOLLOWUP_ACTIONS = frozenset({"none", "refine_existing_code", "start_new_generation"})
@@ -176,19 +170,10 @@ def _normalize_planner_result(raw: dict, user_input: str) -> dict[str, Any]:
         paths = []
     paths = [str(p) for p in paths if isinstance(p, str) and p.strip()]
 
-    operation = str(raw.get("target_operation", "custom") or "custom").strip().lower()
-    if operation not in _VALID_OPERATIONS:
-        operation = "custom"
-
     entities = raw.get("key_entities", [])
     if not isinstance(entities, list):
         entities = []
     entities = [str(e) for e in entities if isinstance(e, str) and e.strip()]
-
-    data_types = raw.get("data_types", {})
-    if not isinstance(data_types, dict):
-        data_types = {}
-    data_types = {str(k): str(v) for k, v in data_types.items() if isinstance(k, str) and isinstance(v, str)}
 
     result_action = str(raw.get("expected_result_action", "return") or "return").strip().lower()
     if result_action not in _VALID_RESULT_ACTIONS:
@@ -216,9 +201,7 @@ def _normalize_planner_result(raw: dict, user_input: str) -> dict[str, Any]:
     return {
         "reformulated_task": reformulated,
         "identified_workflow_paths": paths,
-        "target_operation": operation,
         "key_entities": entities,
-        "data_types": data_types,
         "expected_result_action": result_action,
         "followup_action": followup_action,
         "needs_clarification": needs_clarification,

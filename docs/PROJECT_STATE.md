@@ -45,9 +45,11 @@
 - stricter internal fix retry:
   - если первый fix-кандидат пустой, почти идентичен прошлому коду или повторяет те же semantic requirement failures, pipeline делает ещё один более жёсткий fix-call до возврата в validation
 - LLM verification требований
-- runtime-result-aware semantic verification:
-  - verifier sees parsed workflow context, planner analysis, runtime stderr/stdout, and the concrete Lua return value captured during validation;
-  - if the first verifier pass returns an optimistic false positive while the runtime result contradicts the request, a second contradiction-focused verifier pass can overrule it
+- workflow-state-aware semantic verification:
+  - verifier sees parsed workflow context, planner analysis, the original workflow state, and the updated workflow snapshot captured during validation;
+  - explicit type/shape hints from compiled workflow context (`selected_primary_type`, `requested_item_keys`, `semantic_expectations`) are treated as mandatory verifier/fixer constraints;
+  - verifier returns `passed`, `summary`, `missing_requirements`, and `warnings`, without any numeric score field or checklist object;
+  - if the first verifier pass returns an optimistic false positive while the workflow-state evidence contradicts the request, a second contradiction-focused verifier pass can overrule it
 - model-driven Lua synthesis with compiler-assisted context:
   - prompts no longer rely on embedded code templates or shortest-return bias;
   - compiler still supplies path inventory, clarification gating, and verification hints, but prompt payloads now only keep the task, selected workflow path, current context, and short mandatory-fix lists;
@@ -63,8 +65,8 @@
   - чат и sidecar now emit JSON payloads with a named field whose value is the wrapped `lua{...}lua` string;
   - field name is chosen from selected save path, selected primary workflow path, or target stem
 - verifier/fix loop for cleanup and shape-sensitive tasks:
-  - save is blocked by semantic `missing_requirements` and failed checklist items from verifier;
-  - fix prompts now carry concrete logic failures, including contradictions between the request and the actual runtime result
+  - save is blocked by semantic `missing_requirements` and failed verifier verdicts;
+  - fix prompts now carry concrete logic failures, including contradictions between the request and the observed workflow-state changes
 - route guard для `change` without code:
   - если existing code отсутствует, pipeline не уходит в `refine_code` и не пишет warning fallback;
   - вместо этого запрос обрабатывается как generate-path с сохранением intent
@@ -136,7 +138,7 @@ README описывает канонический запуск через `app.
 - The pipeline now assembles prompts around task/context splitting instead of sending raw user text as-is.
 - Prompt steering is now abstract and model-driven: it describes workflow-script constraints and synthesis strategy without embedding concrete code templates from sample tasks.
 - Requirement verification now relies on semantic LLM review plus concrete runtime evidence from validation.
-- Save is blocked when semantic verification returns failed checklist items or `missing_requirements`.
+- Save is blocked when semantic verification returns `passed=false` or non-empty `missing_requirements`.
 - Automated regression coverage exists in `tests/` via stdlib `unittest`:
   - prompt/context splitting;
   - runtime-result-aware logic verification;
@@ -148,7 +150,7 @@ README описывает канонический запуск через `app.
 - Toggle: env `PLANNER_ENABLED` (default `true` in `.env.example`); when off, the node short-circuits with `planner_skipped=True` and the rest of the pipeline runs as before.
 - Clarification follow-up bypass: when the planner asks a question, state carries `awaiting_planner_clarification`, `planner_pending_questions`, `planner_original_input`, `planner_clarification_attempts` across turns. On the next turn the new `route_from_start` conditional edge routes directly to `plan_request`, skipping `resolve_target` and `route_intent`. The planner sees a merged input combining the original task, the questions it asked, and the user's answer.
 - Safety: after `MAX_CLARIFICATION_ATTEMPTS` (=2) the planner forces continue to avoid infinite loops.
-- Prompt enrichment: `_format_planner_section` injects `Reformulated task / Target operation / Planner-identified workflow paths / Path types / Expected result action` into all three prompt builders (`_build_generation_prompt`, `_build_refine_prompt`, `_build_fix_prompt`). Deterministic compiler stays the source of truth for path-level decisions; planner output only enriches model prompts.
+- Prompt enrichment: `_format_planner_section` injects `Reformulated task / Planner-identified workflow paths / Expected result action` into all three prompt builders (`_build_generation_prompt`, `_build_refine_prompt`, `_build_fix_prompt`). Deterministic compiler stays the source of truth for path-level decisions; planner output only enriches model prompts.
 - Soft re-compilation: if the request had no parseable context but the planner's `reformulated_task` lets the deterministic compiler discover more `expected_workflow_paths`, the enriched compiled_request is preferred.
 - Persistence: `app.py` stores the four planner state fields per chat in `_empty_state_dict` / `_normalize_state_dict`, threads them into `process_message`, copies the result back via `_apply_pipeline_result`, and resets them on `/new`.
 - Tests: 8 new e2e tests in `tests/test_planner_integration.py`; full suite (`python -m unittest discover tests -v`) passes 92 tests.
@@ -169,7 +171,7 @@ README описывает канонический запуск через `app.
 - Lua normalization now recovers common malformed wrapper variants such as fenced ```` ```lua{...}lua ``` ```` and trailing `}lua` remnants, so wrapper noise does not turn into a false syntax failure by itself.
 - Runtime marker extraction now works for both LF and CRLF output produced by the temporary Lua harness.
 - The local validation harness now captures both the actual returned Lua value and the updated workflow snapshot on the provided workflow context.
-- Semantic verification now sees parsed workflow context, planner analysis, the concrete runtime result, and the updated workflow state, so logic checks can fail on wrong outputs or wrong mutations instead of only reviewing source text.
+- Semantic verification now sees parsed workflow context, planner analysis, and the updated workflow state, so logic review can fail on wrong mutations instead of only reviewing source text.
 - `explain_solution` now accepts explainer section fields as either JSON arrays or plain strings before generic fallback text is used.
 - If validation or requirement verification still fails after the fix loop, the user-facing response remains diagnostic, still shows the current code payload, and does not save artifacts to disk.
 
