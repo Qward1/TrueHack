@@ -32,6 +32,7 @@ PROMPT_MAX_CHARS = _parse_prompt_limit()
 QWEN_NO_THINK_MODELS = frozenset({
     "qwen3.5:9b",
 })
+VALID_REASONING_EFFORTS = frozenset({"none", "low", "medium", "high"})
 
 
 def _agent_model_env_key(agent_name: str) -> str:
@@ -58,6 +59,46 @@ def _normalize_model_name(model_name: str) -> str:
     return str(model_name or "").strip().lower()
 
 
+def _agent_reasoning_env_key(agent_name: str) -> str:
+    normalized = _agent_model_env_key(agent_name)
+    if not normalized:
+        return ""
+    return normalized.replace("OLLAMA_MODEL_", "OLLAMA_REASONING_EFFORT_", 1)
+
+
+def _normalize_reasoning_effort(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    aliases = {
+        "off": "none",
+        "false": "none",
+        "0": "none",
+        "on": "medium",
+        "true": "medium",
+        "1": "medium",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized in VALID_REASONING_EFFORTS:
+        return normalized
+    return ""
+
+
+def _resolve_reasoning_effort(agent_name: str, model_name: str) -> str:
+    agent_env_key = _agent_reasoning_env_key(agent_name)
+    if agent_env_key:
+        agent_value = _normalize_reasoning_effort(os.getenv(agent_env_key, ""))
+        if agent_value:
+            return agent_value
+
+    shared_value = _normalize_reasoning_effort(os.getenv("OLLAMA_REASONING_EFFORT", ""))
+    if shared_value:
+        return shared_value
+
+    if _should_disable_thinking(model_name):
+        return "none"
+
+    return ""
+
+
 def _should_disable_thinking(model_name: str) -> bool:
     return _normalize_model_name(model_name) in QWEN_NO_THINK_MODELS
 
@@ -82,6 +123,9 @@ class LLMProvider:
 
     def resolve_model(self, agent_name: str = "") -> str:
         return _resolve_agent_model(agent_name, self._model)
+
+    def resolve_reasoning_effort(self, agent_name: str = "") -> str:
+        return _resolve_reasoning_effort(agent_name, self.resolve_model(agent_name))
 
     async def generate(
         self,
@@ -157,13 +201,14 @@ class LLMProvider:
         agent_name: str = "",
     ) -> str:
         effective_model = self.resolve_model(agent_name)
+        reasoning_effort = self.resolve_reasoning_effort(agent_name)
         kwargs: dict = {
             "model": effective_model,
             "messages": messages,
             "temperature": temperature,
         }
-        if _should_disable_thinking(effective_model):
-            kwargs["reasoning_effort"] = "none"
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
 

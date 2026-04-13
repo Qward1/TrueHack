@@ -71,6 +71,48 @@ class LLMLoggingHelpersTests(unittest.TestCase):
         self.assertFalse(llm_module._should_disable_thinking("qwen3.5:14b"))
         self.assertFalse(llm_module._should_disable_thinking("qwen2.5-coder:7b-instruct"))
 
+    def test_agent_reasoning_env_key_uses_upper_snake_case(self) -> None:
+        self.assertEqual(
+            llm_module._agent_reasoning_env_key("CodeGenerator"),
+            "OLLAMA_REASONING_EFFORT_CODE_GENERATOR",
+        )
+        self.assertEqual(
+            llm_module._agent_reasoning_env_key("RequirementsVerifier"),
+            "OLLAMA_REASONING_EFFORT_REQUIREMENTS_VERIFIER",
+        )
+
+    def test_resolve_reasoning_effort_prefers_agent_override(self) -> None:
+        with patch.dict(
+            llm_module.os.environ,
+            {
+                "OLLAMA_REASONING_EFFORT": "low",
+                "OLLAMA_REASONING_EFFORT_CODE_GENERATOR": "high",
+            },
+            clear=False,
+        ):
+            provider = llm_module.LLMProvider(model="qwen2.5-coder:7b-instruct")
+            self.assertEqual(provider.resolve_reasoning_effort("CodeGenerator"), "high")
+            self.assertEqual(provider.resolve_reasoning_effort("RequirementsVerifier"), "low")
+
+    def test_resolve_reasoning_effort_uses_none_for_qwen_3_5_9b_by_default(self) -> None:
+        with patch.dict(llm_module.os.environ, {}, clear=True):
+            provider = llm_module.LLMProvider(model="qwen3.5:9b")
+            self.assertEqual(provider.resolve_reasoning_effort("TaskPlanner"), "none")
+
+    def test_resolve_reasoning_effort_allows_explicit_override_for_qwen_3_5_9b(self) -> None:
+        with patch.dict(
+            llm_module.os.environ,
+            {"OLLAMA_REASONING_EFFORT_TASK_PLANNER": "low"},
+            clear=True,
+        ):
+            provider = llm_module.LLMProvider(model="qwen3.5:9b")
+            self.assertEqual(provider.resolve_reasoning_effort("TaskPlanner"), "low")
+
+    def test_normalize_reasoning_effort_supports_boolean_aliases(self) -> None:
+        self.assertEqual(llm_module._normalize_reasoning_effort("true"), "medium")
+        self.assertEqual(llm_module._normalize_reasoning_effort("off"), "none")
+        self.assertEqual(llm_module._normalize_reasoning_effort("invalid"), "")
+
 
 if __name__ == "__main__":
     unittest.main()

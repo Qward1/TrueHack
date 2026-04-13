@@ -24,9 +24,9 @@ from src.tools.lua_tools import (
     format_lowcode_jsonstring,
     is_truncated_lowcode_response,
     restore_lost_functions,
-    normalize_lua_code,
+    smart_normalize,
     validate_lowcode_llm_output,
-    analyze_lua_response,
+    validate_lua_response,
 )
 from src.tools.target_tools import (
     load_target_code,
@@ -81,7 +81,7 @@ JSON only:"""
 LOWCODE_LUA_RULES = (
     "LowCode Lua platform rules: "
     "Use Lua 5.5. "
-    "The script must be returned in JsonString form as lua{...}lua. "
+    "The script must be returned in the exact wrapper format lua{...}lua. "
     "Do not use JsonPath. Access workflow data only by direct paths. "
     "All declared workflow variables are stored in wf.vars. "
     "All input variables passed at workflow start are stored in wf.initVariables. "
@@ -94,25 +94,39 @@ LOWCODE_LUA_RULES = (
     "Allowed control flow constructs: if/then/else, while/do/end, for/do/end, repeat/until."
 )
 
-_GENERATE_SYSTEM = (
-    "You write Lua 5.5 workflow scripts for LowCode. "
-    
-    + LOWCODE_LUA_RULES +
+_GENERATE_SYSTEM = ("""
+You write Lua 5.5 workflow scripts for LowCode.
 
-    " Use direct workflow access only: wf.vars.* and wf.initVariables.*. "
-    "Never recreate provided workflow data as local demo tables. "
-    "Never use print(), io.write(), io.read(), console prompts, apps, APIs, or wrappers. "
-    "Use return and/or explicit wf.vars updates only when requested. "
+Priority rules:
+1. Follow the explicit task text.
+2. Use only explicit workflow paths from the task or provided context.
+3. Never invent new workflow paths or destination fields.
+4. Return a value or update wf.vars only if the task explicitly requires it.
+5. Output exactly in the format lua{...}lua.
+6. Allowed control flow constructs: if/then/else, while/do/end, for/do/end, repeat/until.
+7. All input variables passed at workflow start are stored in wf.initVariables. 
+Workflow data rules:
+- Input variables are in wf.initVariables.
+- Workflow variables are in wf.vars.
+- Access data only by direct paths like wf.vars.x.y or wf.initVariables.x.
+- Never use JsonPath.
+- Never recreate provided workflow data as local demo tables.
 
-    "Do not assume hidden parsers or unsupported APIs. "
-    "For datetime conversion from strings, parse components explicitly. "
-    "Do not pass ISO 8601 strings directly into os.time(...). "
-    "If timezone offset exists, handle it explicitly. "
+Code rules:
+- Use Lua 5.5 syntax only.
+- Never use print(), io.write(), io.read(), console prompts, apps, APIs, or wrappers.
+- Use return and/or explicit wf.vars updates only when requested.
+- For simple tasks, keep the code minimal and direct.
+- If a new array is needed, use _utils.array.new(), populate items explicitly, then call _utils.array.markAsArray(arr).
+- If an existing table must be treated as an array, use _utils.array.markAsArray(arr).
 
-    "Use exact workflow paths from the task or provided context. "
-    "Do not invent new workflow paths unless the task explicitly names a target wf.vars path. "
+Conditional rule:
+- If the task involves datetime parsing from strings, parse components explicitly and do not pass ISO 8601 strings directly into os.time(...). Handle timezone offsets explicitly if present.
 
-    "Output nothing except lua{...}lua."
+Output format:
+- Start exactly with lua{
+- End exactly with }lua
+- Output nothing else"""
 )
 
 _REFINE_SYSTEM = (
@@ -398,10 +412,58 @@ def _format_planner_section(compiled_request: dict[str, Any]) -> str:
     ]
     if paths:
         parts.append(f"Planner-identified workflow paths: {', '.join(paths)}")
+    operation = str(planner.get("target_operation", "") or "").strip()
+    if operation:
+        parts.append(f"Target operation: {operation}")
     expected_action = str(planner.get("expected_result_action", "") or "").strip()
     if expected_action:
         parts.append(f"Expected result action: {expected_action}")
+    data_types = planner.get("data_types", {})
+    if isinstance(data_types, dict) and data_types:
+        typed = ", ".join(
+            f"{key}={value}"
+            for key, value in data_types.items()
+            if str(key).strip() and str(value).strip()
+        )
+        if typed:
+            parts.append(f"Path types: {typed}")
     return "\n\n".join(parts)
+
+
+def _format_planner_section_compact(compiled_request: dict[str, Any]) -> str:
+    planner = compiled_request.get("planner_result") or {}
+    if not isinstance(planner, dict) or not planner:
+        return ""
+
+    reformulated = str(planner.get("reformulated_task", "") or "").strip()
+    paths = [
+        str(path).strip()
+        for path in planner.get("identified_workflow_paths", []) or []
+        if str(path).strip()
+    ]
+    operation = str(planner.get("target_operation", "") or "").strip()
+    action = str(planner.get("expected_result_action", "") or "").strip()
+    data_types = planner.get("data_types", {})
+
+    parts: list[str] = []
+    if reformulated:
+        parts.append(f"- reformulated_task: {reformulated}")
+    if operation:
+        parts.append(f"- target_operation: {operation}")
+    if action:
+        parts.append(f"- expected_result_action: {action}")
+    if paths:
+        parts.append(f"- workflow_paths: {', '.join(paths)}")
+    if isinstance(data_types, dict) and data_types:
+        typed = ", ".join(
+            f"{key}={value}"
+            for key, value in data_types.items()
+            if str(key).strip() and str(value).strip()
+        )
+        if typed:
+            parts.append(f"- data_types: {typed}")
+
+    return "\n".join(parts)
 
 
 def _compact_json_for_prompt(value: object, limit: int = 4000) -> str:
@@ -442,7 +504,11 @@ def _build_verification_extra_context(
         if str(key).strip()
     ]
     verifier_instructions: list[str] = []
-    selected_operation = str(compiled_request.get("selected_operation", "") or "").strip().lower()
+    selected_operation = str(
+        compiled_request.get("selected_operation")
+        or planner_result.get("target_operation")
+        or ""
+    ).strip().lower()
     if selected_operation == "filter":
         verifier_instructions.append(
             "This is a filter/select task: every returned item must satisfy the requested condition."
@@ -561,7 +627,7 @@ def _extract_message_code_block(user_input: str) -> str:
             candidates.append(stripped)
 
     for candidate in candidates:
-        analysis = analyze_lua_response(candidate)
+        analysis = validate_lua_response(candidate)
         normalized = str(analysis.get("normalized", "") or "").strip()
         if not analysis.get("valid") or not normalized:
             continue
@@ -740,7 +806,7 @@ def _code_signature(code: str) -> str:
 
 
 def _normalize_runtime_candidate(code: str) -> str:
-    normalized = normalize_lua_code(str(code or ""))
+    normalized = smart_normalize(str(code or ""))
     return normalized if normalized else str(code or "")
 
 
@@ -888,7 +954,7 @@ def _assess_fix_candidate(
     if _code_signature(candidate) == _code_signature(original):
         reasons.append("The fix attempt did not materially change the code.")
 
-    analysis = analyze_lua_response(candidate)
+    analysis = validate_lua_response(candidate)
     if not analysis.get("valid"):
         reasons.append(str(analysis.get("reason", "") or "The fix attempt does not look like a valid standalone Lua file."))
 
@@ -921,8 +987,8 @@ def _assess_fix_candidate(
 
 
 def _format_planner_section_compact(compiled_request: dict[str, Any]) -> str:
-    planner = compiled_request.get("planner_analysis") or {}
-    if not planner:
+    planner = compiled_request.get("planner_result") or {}
+    if not isinstance(planner, dict) or not planner:
         return ""
 
     reformulated = planner.get("reformulated_task", "")
@@ -933,16 +999,16 @@ def _format_planner_section_compact(compiled_request: dict[str, Any]) -> str:
 
     parts = []
     if reformulated:
-        parts.append(f"- reformulated_task: {reformulated}")
+        parts.append(f"Reformulated task: {reformulated}")
     if operation:
-        parts.append(f"- target_operation: {operation}")
+        parts.append(f"Target operation: {operation}")
     if action:
-        parts.append(f"- expected_result_action: {action}")
+        parts.append(f"Expected result action: {action}")
     if paths:
-        parts.append(f"- workflow_paths: {', '.join(paths)}")
+        parts.append(f"Planner-identified workflow paths: {', '.join(paths)}")
     if data_types:
         typed = ", ".join(f"{k}={v}" for k, v in data_types.items())
-        parts.append(f"- data_types: {typed}")
+        parts.append(f"Path types: {typed}")
 
     return "\n".join(parts)
 
@@ -958,8 +1024,10 @@ def _build_generation_prompt(compiled_request: dict[str, Any]) -> str:
         f"Task:\n{task}",
         f"Clarification:\n{clarification_text}" if clarification_text else "",
         f"Workflow anchor:\n{prompt_context}" if prompt_context else "",
-        f"Planner hint:\n{planner_section}" if planner_section else "",
+        f"Planner analysis:\n{planner_section}" if planner_section else "",
         f"Workflow context:\n{provided_context}" if provided_context else "",
+        _PROMPT_STYLE_RULES,
+        _PROMPT_SYNTHESIS_GUIDANCE,
         "Decision rules:\n"
         "1. Prefer explicit task text and workflow context over planner hints.\n"
         "2. Use only explicit workflow paths.\n"
@@ -1470,7 +1538,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 )
 
         if not code:
-            code = normalize_lua_code(raw)
+            code = smart_normalize(raw)
 
         logger.info(
             f"[{_AGENT_GENERATE_CODE}] completed",
