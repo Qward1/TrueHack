@@ -43,16 +43,10 @@
   - validation;
   - requirements;
   - если первый fix-ответ остаётся пустым, почти не меняет код или детерминированно повторяет те же requirement failures, node делает один stricter internal retry before returning to validate.
-- `verify_requirements` — семантическая LLM-проверка соответствия исходному запросу с checklist по:
-  - workflow_path_usage;
-  - source_shape_understood;
-  - target_shape_satisfied;
-  - logic_correctness;
-  - helper_api_usage;
-  - edge_case_handling.
-- verifier работает как основной semantic gate: он получает parsed workflow context, planner analysis и фактический runtime result из validation harness.
-- при наличии runtime result verifier обязан сверять логику решения с конкретным результатом выполнения, а не только с текстом кода.
-- для задач cleanup/remove/filter и shape-sensitive задач fix-loop теперь получает именно semantic requirement failures и причины проваленных checklist-проверок, а не отдельный статический guard verdict.
+- `verify_requirements` — семантическая LLM-проверка соответствия исходному запросу, которая возвращает итоговый verdict через `summary`, `missing_requirements` и `warnings`.
+- verifier работает как основной semantic gate: он получает parsed workflow context, planner analysis, original workflow state и updated workflow state из validation harness.
+- verifier и verification-fix prompts также трактуют явные type/shape hints из compiled workflow context (`selected_primary_type`, `requested_item_keys`, `semantic_expectations`) как обязательные ограничения, а не как факультативные подсказки.
+- для задач cleanup/remove/filter и shape-sensitive задач fix-loop теперь получает semantic requirement failures и verifier summary, а не отдельный статический guard verdict.
 - Если в тексте задачи указан bare field name без полного `wf.vars.*` / `wf.initVariables.*`, compiler пытается однозначно разрешить его через parseable workflow context и добавить в expected workflow paths.
 - Если intent классифицирован как `change`, но текущий код отсутствует, pipeline идёт в `generate_code`, а не в `refine_code`.
 - `route_intent` теперь hybrid:
@@ -131,7 +125,8 @@
 - Generation, refine, and fix prompts now use abstract synthesis guidance instead of embedded code templates/few-shot snippets.
 - The canonical style is: direct `wf.vars` / `wf.initVariables` access, no recreated demo input tables, no console wrappers, and the amount of Lua structure the task actually needs.
 - Semantic verification is the primary save gate:
-  - verifier/fix prompts receive parsed workflow context, expected workflow paths, planner analysis, runtime-result evidence, and semantic requirement failures;
+  - verifier/fix prompts receive parsed workflow context, expected workflow paths, planner analysis, before/after workflow-state evidence, and semantic requirement failures;
+  - verifier contract uses `passed`, `summary`, `missing_requirements`, and `warnings`, without numeric score fields or checklist objects;
   - save remains blocked on failed validation or failed semantic verification;
   - no separate deterministic verification guard remains in the active pipeline.
 - `docs/_pdf_text.txt` remains an offline working aid only and is not read at runtime.
@@ -140,7 +135,6 @@
 - The pipeline now has an explicit generation-context preparation stage before `generate_code` / `refine_code`.
 - Parsed workflow JSON is compiled into an internal request object with:
   - path inventory;
-  - path types;
   - sample values;
   - selected operation;
   - selected primary path;
@@ -156,7 +150,6 @@
 - `verify_requirements` now evaluates logic against:
   - parsed workflow context;
   - planner analysis when available;
-  - actual runtime result preview from validation;
   - updated workflow state after execution when the script mutates `wf.*` and returns `nil`.
 - `explain_solution` now normalizes explainer sections from either JSON arrays or single strings before falling back to generic text.
 - `prepare_response` always includes the current code payload in the user response, even on failed validation/verification turns; the response stays diagnostic and saving still remains blocked.

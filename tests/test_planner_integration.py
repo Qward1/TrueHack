@@ -57,9 +57,7 @@ class IntegrationStubLLM:
         self.planner_response = planner_response if planner_response is not None else {
             "reformulated_task": "echo task",
             "identified_workflow_paths": [],
-            "target_operation": "extract",
             "key_entities": [],
-            "data_types": {},
             "expected_result_action": "return",
             "needs_clarification": False,
             "clarification_questions": [],
@@ -124,18 +122,9 @@ class IntegrationStubLLM:
         if system.startswith(VERIFY_SYSTEM_PREFIX):
             return json.dumps({
                 "passed": True,
-                "score": 100,
                 "summary": "ok",
                 "missing_requirements": [],
                 "warnings": [],
-                "checks": {
-                    "workflow_path_usage": {"status": "pass", "reason": ""},
-                    "source_shape_understood": {"status": "pass", "reason": ""},
-                    "target_shape_satisfied": {"status": "pass", "reason": ""},
-                    "logic_correctness": {"status": "pass", "reason": ""},
-                    "helper_api_usage": {"status": "pass", "reason": ""},
-                    "edge_case_handling": {"status": "pass", "reason": ""},
-                },
             })
         raise AssertionError(f"unexpected chat system: {system[:80]}")
 
@@ -217,7 +206,6 @@ class PlannerEnabledPipelineTests(unittest.TestCase):
         llm.planner_response = {
             "reformulated_task": "Return wf.vars.last",
             "identified_workflow_paths": ["wf.vars.last"],
-            "target_operation": "extract",
             "needs_clarification": False,
             "confidence": 0.9,
         }
@@ -265,18 +253,14 @@ class PlannerPromptIntegrationTests(unittest.TestCase):
         compiled_request = {
             "planner_result": {
                 "reformulated_task": "Get last item from wf.vars.emails",
-                "target_operation": "extract",
                 "identified_workflow_paths": ["wf.vars.emails"],
-                "data_types": {"wf.vars.emails": "array_string"},
                 "expected_result_action": "return",
             },
         }
         section = _format_planner_section(compiled_request)
         self.assertIn("Reformulated task:", section)
         self.assertIn("Get last item from wf.vars.emails", section)
-        self.assertIn("Target operation: extract", section)
         self.assertIn("Planner-identified workflow paths: wf.vars.emails", section)
-        self.assertIn("array_string", section)
         self.assertIn("Expected result action: return", section)
 
     def test_format_planner_section_skips_when_empty(self) -> None:

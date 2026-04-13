@@ -128,7 +128,7 @@
 - turn 2 идет по answer path
 - файл не перезаписывается
 
-## 10. Command checks
+## 10. Command validation
 ### Commands
 - `/path`
 - `/status`
@@ -228,7 +228,7 @@ return wf.vars.contacts
 ### Pass criteria
 - semantic verification does not accept code that relies only on `type(x) == "table"` for array-vs-object semantics;
 - array semantics are explicit: only numeric keys `1..n` without gaps count as an array; an empty table counts as an array;
-- `next(x)` / empty-vs-non-empty checks are not accepted as a substitute for object-vs-array shape detection;
+- `next(x)` / empty-vs-non-empty tests are not accepted as a substitute for object-vs-array shape detection;
 - simply marking the original workflow object/scalar as an array via `_utils.array.markAsArray(source)` is rejected;
 - `_utils.array.new(...)` with inline arguments is rejected;
 - pipeline enters `fix_code` instead of saving immediately;
@@ -277,7 +277,7 @@ Any workflow task where the model returns a fenced malformed wrapper like ```` `
 
 ### Pass criteria
 - validation harness executes the code on the provided workflow context and captures the returned result;
-- semantic verification receives the runtime-result preview and can fail `logic_correctness` / `edge_case_handling` when the wrong row remains in the output;
+- semantic verification receives the runtime-result preview and can fail when the wrong row remains in the output;
 - save does not happen on this false-positive filter result;
 - the user receives diagnostics together with the current code payload.
 
@@ -362,13 +362,13 @@ Shape-sensitive workflow task where the first fix response repeats the same `nex
 
 ## 21c. Hallucinated verifier pass is overruled by a contradiction-focused second pass
 ### Prompt
-Any workflow task where the first semantic verifier pass incorrectly returns `passed=true`, but the captured runtime result contradicts the user request.
+Any workflow task where the first semantic verifier pass incorrectly returns `passed=true`, but the captured workflow-state evidence contradicts the user request.
 
 ### Pass criteria
 - final verification result remains failed;
 - summary does not present the optimistic verifier text as the authoritative verdict;
 - save is blocked and fix-loop continues or the response fails closed;
-- verifier can overturn a false positive by citing the contradictory runtime result directly.
+- verifier can overturn a false positive by citing the contradictory workflow-state evidence directly.
 
 ## 21e. Mutation task verification uses updated workflow snapshot when return is null
 ### Prompt

@@ -22,7 +22,7 @@ logger = structlog.get_logger(__name__)
 
 DEFAULT_LUA_BIN = os.getenv("LUA_BIN", "lua55")
 DEFAULT_STARTUP_TIMEOUT = 3.0
-DEFAULT_VERIFICATION_TEMPERATURE = 0.0
+DEFAULT_VERIFICATION_TEMPERATURE = 0.05
 LOWCODE_LUA_VERSION = "Lua 5.5"
 LOWCODE_JSONSTRING_OPEN = "lua{"
 LOWCODE_JSONSTRING_CLOSE = "}lua"
@@ -37,7 +37,7 @@ LOWCODE_CONTRACT_TEXT = (
     "- Output: use `return <value>` and/or explicit wf.vars updates; never print(), io.write(), io.read().\n"
     "- For new arrays: call `_utils.array.new()` with no inline arguments, populate items explicitly, then call `_utils.array.markAsArray(arr)` before return/store.\n"
     "- For shape-sensitive array tasks, an array is a table whose keys are exactly numeric 1..n without gaps. A table with string keys like `name` or `phone` is an object, not an array. Treat an empty table as an array.\n"
-    "- When normalizing shape-sensitive data, distinguish scalar vs object-like table vs array-like table; do not rely only on `type(x) == 'table'`, `next(x)`, or emptiness checks.\n"
+    "- When normalizing shape-sensitive data, distinguish scalar vs object-like table vs array-like table; do not rely only on `type(x) == 'table'`, `next(x)`, or emptiness-only tests.\n"
     "- Keep the script focused on the task and avoid unrelated wrappers, classes, or boilerplate.\n"
     "- Start with the task logic immediately, unless helper functions are needed for correctness or reuse.\n"
     "- Allowed constructs: if/then/else, while/do/end, for/do/end, repeat/until.\n"
@@ -55,40 +55,55 @@ LOWCODE_RESPONSE_FORMAT_REQUIREMENT = (
     "}lua"
 )
 DEFAULT_VERIFICATION_SYSTEM_PROMPT = (
-    "You are a STRICT verifier that decides whether a Lua solution fully satisfies the user's request. "
-    "Default to passed=false unless every critical check has solid evidence of passing. "
-    "The code must be a workflow Lua script, not a console app. "
-    "Judge against the user request and workflow context, not against whether the code merely sounds plausible. "
-    "If concrete example input or actual runtime result is provided, start from that concrete evidence and validate the logic against it instead of only reading the code. "
+    "You are a strict verifier of Lua workflow solutions. "
+    "Return passed=true only when the user's request is satisfied by clear evidence. "
+    "Judge using, in this order: "
+    "1. observed runtime result, "
+    "2. updated workflow state, "
+    "3. code. "
+    "If runtime result or updated workflow state is provided, treat it as the main source of truth. "
+    "Do not claim any mismatch that contradicts the observed runtime result or updated workflow state. "
     "\n\n"
-    "RESULT SHAPE / TYPE MISMATCH — MANDATORY FAILURE CONDITIONS:\n"
-    "- If the request asks for an array (list of items) but the runtime result is an object (JSON `{...}` with string keys, not `[...]`), set passed=false, include 'target_shape_satisfied' = fail, and describe the mismatch in summary (e.g., 'expected array of emails, got object {sku: ...}').\n"
-    "- If the request asks for a single value (string/number/boolean) but the runtime result is a table/array/object, set passed=false and describe the mismatch.\n"
-    "- If the request asks for an object with specific fields but the runtime result is missing those fields, is a primitive, or is a bare array, set passed=false and list the missing/extra fields.\n"
-    "- If the request implies numeric output but the runtime result contains non-numeric strings, set passed=false and name the offending value.\n"
-    "- Distinguish Lua arrays (integer keys 1..n) from Lua objects (string keys). A JSON result rendered as `{\"1\":...}` with string-numeric keys is NOT an array.\n"
-    "- If the direct runtime result is `null` / `nil` but an updated workflow snapshot is provided, do NOT fail only because the return value is null. Inspect the updated workflow path/value requested by the task and judge against that concrete updated state.\n"
-    "\n"
-    "CODE-VS-REQUEST ALIGNMENT — MANDATORY FAILURE CONDITIONS:\n"
-    "- If the code ignores the user's core goal (e.g., request asks to filter emails but code returns SKUs), set passed=false and describe what the code does vs what was asked.\n"
-    "- If the code reads the wrong workflow path (e.g., request says 'wf.vars.users' but code reads 'wf.vars.orders'), set passed=false and name both paths.\n"
-    "- If the code applies a different operation (e.g., request asks to count, code returns the full list), set passed=false and name the intended vs actual operation.\n"
-    "- If the code hardcodes demo data instead of reading workflow paths, set passed=false.\n"
-    "- For workflow-mutation tasks, the relevant output may be the updated wf.vars / wf.initVariables snapshot rather than the direct return value. Use the concrete updated path/value when it is provided.\n"
-    "\n"
-    "For filter/select/leave-only tasks, inspect the returned items one by one and fail if any item violates the requested rule. "
-    "If parsed input and runtime result are both provided, compare them item-by-item and mention concrete violating identifiers such as id, SKU, email, or name when available. "
-    "Do not return passed=true if the answer is wrapped in quotes or markdown fences. "
-    "Do not return passed=true if `next(...)` is the only array check in a shape-sensitive task. "
-    "If the request says a field must have a value / be non-empty / be filled, empty strings and whitespace-only strings do not satisfy that requirement unless the user explicitly says otherwise. "
-    "Explicitly verify workflow path usage, source shape understanding, target/output shape, logic correctness, helper API usage, and edge-case handling. "
+    "Verify only what is relevant to the current task. "
+    "First infer: "
+    "- expected operation, "
+    "- expected result shape: scalar / object / array / workflow update, "
+    "- expected workflow paths to read and update. "
+    "Then check only those expectations. "
+    "Do not import unrelated failure patterns from other tasks. "
+    "Do not mention entities, fields, or shapes that are absent from the current request and evidence. "
     "\n\n"
-    "EVERY failure must include in `summary` and in the failing check's `reason`: (1) what the request asked for, (2) what the code/runtime actually produced, (3) the specific mismatch. "
-    "Always list concrete discrepancies in `missing_requirements` — never leave it empty when passed=false. "
-    "Return strict JSON only with the keys: passed, score, summary, missing_requirements, warnings, checks. "
-    "The `checks` object must contain: workflow_path_usage, source_shape_understood, target_shape_satisfied, logic_correctness, helper_api_usage, edge_case_handling. "
-    "Each check value must be an object with keys: status (`pass` | `fail` | `unclear`) and reason. "
-    "Use passed=true only if all critical checks pass and no missing_requirements remain."
+    "Fail when:\n"
+    "- the result shape is wrong,\n"
+    "- the updated workflow path/value is wrong,\n"
+    "- the wrong workflow path is read,\n"
+    "- the actual operation differs materially from the request,\n"
+    "- the observed result contradicts the requested format or logic,\n"
+    "- the code uses demo data instead of workflow data.\n"
+    "\n"
+    "Type and shape rules:\n"
+    "- Distinguish scalar, object, and array carefully.\n"
+    "- A Lua array is a table with integer keys 1..n without gaps.\n"
+    "- A Lua object is a table with string keys or mixed non-array structure.\n"
+    "- Respect explicit type/shape hints in the request or context.\n"
+    "- If a scalar is requested, object/array result is a failure.\n"
+    "- If an object is requested, scalar/array result is a failure.\n"
+    "- If an array is requested, scalar/object result is a failure.\n"
+    "- For workflow update tasks, verify the exact updated path and stored value.\n"
+    "\n"
+    "Reasoning rules:\n"
+    "- Prefer concrete observed behavior over speculation from code reading.\n"
+    "- Compare the actual result against the request, not against generic coding style.\n"
+    "- Never report vague failures. Name the exact mismatch.\n"
+    "- When passed=false, missing_requirements must not be empty.\n"
+    "\n"
+    "Every failure summary must state:\n"
+    "1. what was requested,\n"
+    "2. what was actually produced,\n"
+    "3. the exact mismatch.\n"
+    "\n"
+    "Return strict JSON only:\n"
+    "{\"passed\": true, \"summary\": \"short summary\", \"missing_requirements\": [], \"warnings\": []}"
 )
 
 ZERO_WIDTH_PATTERN = re.compile(r"[\u200b\u200c\u200d\ufeff]")
@@ -2023,17 +2038,6 @@ def analyze_lua_response(text: str) -> dict[str, Any]:
         "excerpt": normalized[:500].strip(),
     }
 
-
-def smart_normalize(raw_response: str) -> str:
-    """Normalize LLM output into a clean Lua source string."""
-    return normalize_lua_code(raw_response)
-
-
-def validate_lua_response(raw_response: str) -> dict[str, Any]:
-    """Return validation metadata for a raw LLM response."""
-    return analyze_lua_response(raw_response)
-
-
 def _extract_json_block(text: str) -> dict[str, Any]:
     cleaned = text.strip()
     fence = re.search(r"```(?:json)?\s*(.*?)```", cleaned, re.DOTALL)
@@ -2065,53 +2069,12 @@ def _ensure_string_list(value: object) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
-def _normalize_verification_checks(value: object) -> dict[str, dict[str, str]]:
-    if not isinstance(value, dict):
-        return {}
-
-    normalized: dict[str, dict[str, str]] = {}
-    for raw_key, raw_value in value.items():
-        key = str(raw_key).strip()
-        if not key:
-            continue
-
-        status = "unclear"
-        reason = ""
-        if isinstance(raw_value, dict):
-            status = str(raw_value.get("status", "unclear")).strip().lower() or "unclear"
-            reason = str(raw_value.get("reason", "")).strip()
-        else:
-            text = str(raw_value).strip()
-            lowered = text.lower()
-            if lowered.startswith("pass"):
-                status = "pass"
-            elif lowered.startswith("fail"):
-                status = "fail"
-            else:
-                status = "unclear"
-            reason = text
-
-        if status not in {"pass", "fail", "unclear"}:
-            status = "unclear"
-        normalized[key] = {"status": status, "reason": reason}
-    return normalized
-
-
 def _normalize_verification_result(data: dict[str, Any]) -> dict[str, Any]:
-    score = data.get("score", 0)
-    try:
-        score = int(score)
-    except (TypeError, ValueError):
-        score = 0
-    score = max(0, min(100, score))
-
     return {
         "passed": bool(data.get("passed", False)),
-        "score": score,
         "summary": str(data.get("summary", "")).strip(),
         "missing_requirements": _ensure_string_list(data.get("missing_requirements")),
         "warnings": _ensure_string_list(data.get("warnings")),
-        "checks": _normalize_verification_checks(data.get("checks")),
     }
 
 
@@ -2152,18 +2115,9 @@ async def async_verify_requirements(
                 "Return strict JSON only in this shape:\n"
                 '{'
                 '"passed": true, '
-                '"score": 100, '
                 '"summary": "short summary", '
-                '"missing_requirements": [], '
+                '"missing_requirements": [] - unfulfilled requirements that must be filled in if there are errors, '
                 '"warnings": [], '
-                '"checks": {'
-                '"workflow_path_usage": {"status": "pass", "reason": ""}, '
-                '"source_shape_understood": {"status": "pass", "reason": ""}, '
-                '"target_shape_satisfied": {"status": "pass", "reason": ""}, '
-                '"logic_correctness": {"status": "pass", "reason": ""}, '
-                '"helper_api_usage": {"status": "pass", "reason": ""}, '
-                '"edge_case_handling": {"status": "pass", "reason": ""}'
-                '}'
                 '}'
             ),
         },
@@ -2179,8 +2133,9 @@ async def async_verify_requirements(
     has_concrete_runtime_evidence = any(
         marker in extra_context_text
         for marker in (
-            "Actual runtime result on the provided workflow context",
+            "Original workflow state before execution",
             "Updated workflow state after execution",
+            "Original workflow value at ",
             "Updated workflow value at ",
         )
     )
@@ -2191,7 +2146,8 @@ async def async_verify_requirements(
                 "content": (
                     DEFAULT_VERIFICATION_SYSTEM_PROMPT
                     + " Perform a second-pass contradiction hunt. Assume the first verdict may be wrong. "
-                    + "Search the concrete runtime result for any counterexample. If any returned item/value violates the request, you must return passed=false and explain exactly what is wrong."
+                    + "Compare the original workflow state to the updated workflow state and search that concrete evidence for any counterexample. "
+                    + "If the observed before/after state change violates the request, you must return passed=false and explain exactly what is wrong."
                 ),
             },
             {"role": "user", "content": f"User request:\n{prompt}\n\n{LOWCODE_CONTRACT_TEXT}"},
@@ -2201,7 +2157,7 @@ async def async_verify_requirements(
                 "role": "user",
                 "content": (
                     "The previous provisional verdict said the solution passed. "
-                    "Challenge that verdict. Use the concrete runtime result to look for any wrong extra items, missing required transformations, or incorrect handling of empty values. "
+                    "Challenge that verdict. Use the concrete before/after workflow-state evidence to look for any wrong extra items, missing required transformations, incorrect mutations, or incorrect handling of empty values. "
                     "Return the same strict JSON shape."
                 ),
             },
@@ -2219,12 +2175,7 @@ async def async_verify_requirements(
             agent_name="RequirementsVerifier",
         )
         challenge = _normalize_verification_result(_extract_json_block(challenge_raw))
-        challenge_checks = challenge.get("checks", {}) if isinstance(challenge, dict) else {}
-        has_failed_or_unclear = any(
-            isinstance(payload, dict) and payload.get("status") in {"fail", "unclear"}
-            for payload in challenge_checks.values()
-        )
-        if not challenge.get("passed", False) or challenge.get("missing_requirements") or has_failed_or_unclear:
+        if not challenge.get("passed", False) or challenge.get("missing_requirements"):
             normalized = challenge
     if not normalized["summary"]:
         normalized["summary"] = "Verification completed."

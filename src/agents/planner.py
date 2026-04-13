@@ -66,9 +66,7 @@ Has existing code to modify: {has_code}
 Analyze and return JSON with these fields:
 - "reformulated_task": rewrite the task as a clear, specific instruction for the code generator. Include exact workflow paths (wf.vars.X / wf.initVariables.X), the operation to perform, and how to return/store the result. If the task is already clear, keep it close to the original but add any implicit details.
 - "identified_workflow_paths": list of wf.vars.* / wf.initVariables.* paths relevant to this task
-- "target_operation": one of "extract", "transform", "filter", "increment", "convert", "validate", "filter_keys", "remove_keys", "custom"
 - "key_entities": important field names, operations, or concepts from the request
-- "data_types": map of workflow path to detected type ("string", "number", "array_string", "array_object", "object", "unknown")
 - "expected_result_action": "return" or "save_to_wf_vars"
 - "needs_clarification": true if the request is too ambiguous to generate correct code
 - "clarification_questions": list of 1-3 questions if clarification is needed (empty list otherwise)
@@ -102,12 +100,6 @@ class PlannerOutput(TypedDict, total=False):
     planner_result: dict[str, Any]
     planner_skipped: bool
 
-
-# Valid operations
-_VALID_OPERATIONS = frozenset({
-    "extract", "transform", "filter", "increment", "convert",
-    "validate", "filter_keys", "remove_keys", "custom",
-})
 
 # Valid result actions
 _VALID_RESULT_ACTIONS = frozenset({"return", "save_to_wf_vars"})
@@ -145,19 +137,10 @@ def _normalize_planner_result(raw: dict, user_input: str) -> dict[str, Any]:
         paths = []
     paths = [str(p) for p in paths if isinstance(p, str) and p.strip()]
 
-    operation = str(raw.get("target_operation", "custom") or "custom").strip().lower()
-    if operation not in _VALID_OPERATIONS:
-        operation = "custom"
-
     entities = raw.get("key_entities", [])
     if not isinstance(entities, list):
         entities = []
     entities = [str(e) for e in entities if isinstance(e, str) and e.strip()]
-
-    data_types = raw.get("data_types", {})
-    if not isinstance(data_types, dict):
-        data_types = {}
-    data_types = {str(k): str(v) for k, v in data_types.items() if isinstance(k, str) and isinstance(v, str)}
 
     result_action = str(raw.get("expected_result_action", "return") or "return").strip().lower()
     if result_action not in _VALID_RESULT_ACTIONS:
@@ -181,9 +164,7 @@ def _normalize_planner_result(raw: dict, user_input: str) -> dict[str, Any]:
     return {
         "reformulated_task": reformulated,
         "identified_workflow_paths": paths,
-        "target_operation": operation,
         "key_entities": entities,
-        "data_types": data_types,
         "expected_result_action": result_action,
         "needs_clarification": needs_clarification,
         "clarification_questions": questions,
@@ -285,7 +266,6 @@ class PlannerAgent:
         logger.info(
             f"[{_AGENT_NAME}] completed",
             needs_clarification=result["needs_clarification"],
-            target_operation=result["target_operation"],
             confidence=result["confidence"],
             num_paths=len(result["identified_workflow_paths"]),
             num_questions=len(result["clarification_questions"]),
