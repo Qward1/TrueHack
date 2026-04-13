@@ -28,6 +28,10 @@ from src.tools.lua_tools import (
     validate_lowcode_llm_output,
     validate_lua_response,
 )
+from src.tools.rag_templates import (
+    render_template_prompt_block,
+    retrieve_template_matches,
+)
 from src.tools.target_tools import (
     load_target_code,
     resolve_lua_target,
@@ -1013,7 +1017,11 @@ def _format_planner_section_compact(compiled_request: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _build_generation_prompt(compiled_request: dict[str, Any]) -> str:
+def _build_generation_prompt(
+    compiled_request: dict[str, Any],
+    *,
+    retrieved_template_block: str = "",
+) -> str:
     task = str(compiled_request.get("task_text", "") or "").strip()
     provided_context = str(compiled_request.get("raw_context", "") or "").strip()
     clarification_text = str(compiled_request.get("clarification_text", "") or "").strip()
@@ -1026,6 +1034,7 @@ def _build_generation_prompt(compiled_request: dict[str, Any]) -> str:
         f"Workflow anchor:\n{prompt_context}" if prompt_context else "",
         f"Planner analysis:\n{planner_section}" if planner_section else "",
         f"Workflow context:\n{provided_context}" if provided_context else "",
+        retrieved_template_block,
         _PROMPT_STYLE_RULES,
         _PROMPT_SYNTHESIS_GUIDANCE,
         "Decision rules:\n"
@@ -1474,7 +1483,17 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             target_path=target_path,
         )
 
-        prompt = _build_generation_prompt(compiled_request)
+        retrieved_templates = []
+        if isinstance(compiled_request, dict):
+            retrieved_templates = await retrieve_template_matches(compiled_request)
+            compiled_request["retrieved_template_ids"] = [match.id for match in retrieved_templates]
+            compiled_request["retrieved_template_titles"] = [match.title for match in retrieved_templates]
+
+        retrieved_template_block = render_template_prompt_block(retrieved_templates)
+        prompt = _build_generation_prompt(
+            compiled_request,
+            retrieved_template_block=retrieved_template_block,
+        )
         generation_temperature = _generation_temperature(compiled_request if isinstance(compiled_request, dict) else {})
 
         logger.info(
@@ -1482,6 +1501,8 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             prompt_len=len(prompt),
             target_path=target_path,
             temperature=generation_temperature,
+            rag_templates=len(retrieved_templates),
+            rag_template_ids=[match.id for match in retrieved_templates],
         )
         raw = await llm.generate(
             prompt=prompt,
