@@ -51,6 +51,20 @@ class PipelineState(TypedDict):
     suggested_changes: list[str]
     clarifying_questions: list[str]
 
+    # Standalone verification chain preparation state
+    previous_fix_attempts: list[dict[str, Any]]
+    verification_chain_current_verifier: str
+    verification_chain_current_node: str
+    verification_chain_current_index: int
+    verification_chain_current_failure_stage: str
+    verification_chain_next_verifier: str
+    verification_chain_next_node: str
+    verification_chain_last_transition: str
+    verification_chain_stage_fix_counts: dict[str, int]
+    verification_chain_stage_fix_limits: dict[str, int]
+    verification_chain_stage_results: dict[str, dict[str, Any]]
+    verification_chain_history: list[dict[str, Any]]
+
     # User-visible output
     response: str
     response_type: str

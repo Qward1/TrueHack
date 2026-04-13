@@ -356,9 +356,18 @@ class TestStateBridgeAndNode(unittest.TestCase):
                 {
                     "generated_code": "return wf.vars.time",
                     "fix_verification_iterations": 0,
+                    "validation_passed": True,
+                    "failure_stage": "contract_verification",
                     "compiled_request": {
                         "verification_prompt": "Convert recall time.",
                     },
+                    "verification_chain_current_verifier": "ContractVerifier",
+                    "verification_chain_current_node": "verify_contract",
+                    "verification_chain_current_index": 0,
+                    "verification_chain_current_failure_stage": "contract_verification",
+                    "verification_chain_next_verifier": "ShapeTypeVerifier",
+                    "verification_chain_next_node": "verify_shape_type",
+                    "verification_chain_stage_fix_limits": {"ContractVerifier": 1},
                     "verification": {
                         "verifier_name": "ContractVerifier",
                         "passed": False,
@@ -376,8 +385,10 @@ class TestStateBridgeAndNode(unittest.TestCase):
         self.assertEqual(result["generated_code"], "return wf.initVariables.recallTime")
         self.assertEqual(result["fix_verification_iterations"], 1)
         self.assertFalse(result["verification_passed"])
-        self.assertEqual(result["failure_stage"], "")
+        self.assertEqual(result["failure_stage"], "contract_verification")
         self.assertEqual(result["previous_fix_attempts"][-1]["strategy"], "replace_wrong_path")
+        self.assertEqual(result["verification_chain_stage_fix_counts"]["ContractVerifier"], 1)
+        self.assertEqual(result["verification_chain_last_transition"], "fixer_changed_code")
 
     def test_node_keeps_passed_verification_state_on_noop(self) -> None:
         llm = StubLLM({})
@@ -399,6 +410,33 @@ class TestStateBridgeAndNode(unittest.TestCase):
         self.assertEqual(result["fix_verification_iterations"], 3)
         self.assertTrue(result["verification_passed"])
         self.assertFalse(result["universal_verification_fixer_result"]["changed"])
+        self.assertEqual(result["failure_stage"], "")
+
+    def test_node_handles_partial_verifier_result_without_crashing(self) -> None:
+        llm = StubLLM(
+            {
+                "fixed": True,
+                "changed": True,
+                "applied_strategy": "minimal_patch_from_verifier_brief",
+                "fixed_lua_code": "lua{return wf.vars.users or {}}lua",
+            }
+        )
+        node = create_universal_verification_fixer_node(llm)
+        result = asyncio.run(
+            node(
+                {
+                    "generated_code": "return wf.vars.users",
+                    "verification": {
+                        "verifier_name": "RobustnessVerifier",
+                        "passed": False,
+                        "summary": "Missing nil guard.",
+                    },
+                }
+            )
+        )
+        self.assertTrue(result["universal_verification_fixer_result"]["changed"])
+        self.assertEqual(result["previous_fix_attempts"][-1]["verifier_name"], "RobustnessVerifier")
+        self.assertEqual(result["verification_chain_stage_fix_counts"]["RobustnessVerifier"], 1)
 
 
 class TestVerificationChainRegistry(unittest.TestCase):

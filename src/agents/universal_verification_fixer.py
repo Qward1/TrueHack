@@ -120,6 +120,17 @@ class UniversalVerificationFixerNodeOutput(TypedDict):
     suggested_changes: list[str]
     clarifying_questions: list[str]
     previous_fix_attempts: list[dict[str, Any]]
+    verification_chain_current_verifier: str
+    verification_chain_current_node: str
+    verification_chain_current_index: int
+    verification_chain_current_failure_stage: str
+    verification_chain_next_verifier: str
+    verification_chain_next_node: str
+    verification_chain_last_transition: str
+    verification_chain_stage_fix_counts: dict[str, int]
+    verification_chain_stage_fix_limits: dict[str, int]
+    verification_chain_stage_results: dict[str, dict[str, Any]]
+    verification_chain_history: list[dict[str, Any]]
 
 
 def _normalize_nullable_string(value: object) -> str | None:
@@ -149,6 +160,18 @@ def _ensure_object(value: object) -> dict[str, Any]:
 
 def _ensure_list(value: object) -> list[Any]:
     return list(value) if isinstance(value, list) else []
+
+
+def _normalize_string(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _normalize_nonnegative_int(value: object, *, default: int = 0) -> int:
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError):
+        return default
+    return numeric if numeric >= 0 else default
 
 
 def _clamp_confidence(value: object) -> float:
@@ -257,6 +280,49 @@ def _normalize_previous_fix_attempts(value: object) -> list[dict[str, Any]]:
         if text:
             attempts.append({"note": text})
     return attempts
+
+
+def _normalize_history_entries(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    entries: list[dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, dict):
+            entries.append(dict(item))
+    return entries
+
+
+def _normalize_stage_results(value: object) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, dict[str, Any]] = {}
+    for key, item in value.items():
+        verifier_name = _normalize_string(key)
+        if verifier_name and isinstance(item, dict):
+            normalized[verifier_name] = dict(item)
+    return normalized
+
+
+def _normalize_stage_fix_counts(value: object) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, int] = {}
+    for key, item in value.items():
+        verifier_name = _normalize_string(key)
+        if verifier_name:
+            normalized[verifier_name] = _normalize_nonnegative_int(item, default=0)
+    return normalized
+
+
+def _normalize_stage_fix_limits(value: object) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, int] = {}
+    for key, item in value.items():
+        verifier_name = _normalize_string(key)
+        if verifier_name:
+            normalized[verifier_name] = max(1, _normalize_nonnegative_int(item, default=1))
+    return normalized
 
 
 def _build_noop_result(code: str, verifier_result: NormalizedVerifierResult, *, reason: str) -> UniversalVerificationFixerResult:
@@ -387,6 +453,13 @@ def _build_universal_verification_fixer_prompt(payload: UniversalVerificationFix
 
 
 def _select_verifier_result_from_state(state: dict[str, Any]) -> object:
+    current_verifier = _normalize_string(state.get("verification_chain_current_verifier"))
+    stage_results = state.get("verification_chain_stage_results")
+    if current_verifier and isinstance(stage_results, dict):
+        current_stage_result = stage_results.get(current_verifier)
+        if isinstance(current_stage_result, dict) and current_stage_result.get("verifier_name"):
+            return current_stage_result
+
     verification = state.get("verification")
     if isinstance(verification, dict) and verification.get("verifier_name"):
         return verification
@@ -422,7 +495,9 @@ def build_universal_verification_fixer_input_from_state(state: dict[str, Any]) -
             runtime_result = preview
 
     parsed_context = compiled_request.get("parsed_context")
-    before_state = parsed_context if compiled_request.get("has_parseable_context") else parsed_context
+    before_state = diagnostics.get("before_state")
+    if before_state is None and compiled_request.get("has_parseable_context"):
+        before_state = parsed_context
 
     return {
         "task": task,
@@ -548,27 +623,63 @@ def create_universal_verification_fixer_node(llm: LLMProvider) -> Callable:
     async def fix_verification_issue(state: dict[str, Any]) -> UniversalVerificationFixerNodeOutput:
         payload = build_universal_verification_fixer_input_from_state(state)
         verifier_result = _normalize_verifier_result(payload.get("verifier_result"))
-        fix_iter = int(state.get("fix_verification_iterations", 0) or 0)
+        fix_iter = _normalize_nonnegative_int(state.get("fix_verification_iterations"), default=0)
         previous_attempts = _normalize_previous_fix_attempts(state.get("previous_fix_attempts"))
+        validation_passed = bool(state.get("validation_passed", False))
+        current_failure_stage = _normalize_string(
+            state.get("verification_chain_current_failure_stage")
+        ) or _normalize_string(state.get("failure_stage"))
+        current_verifier = _normalize_string(state.get("verification_chain_current_verifier")) or verifier_result["verifier_name"]
+        stage_fix_counts = _normalize_stage_fix_counts(state.get("verification_chain_stage_fix_counts"))
+        stage_fix_limits = _normalize_stage_fix_limits(state.get("verification_chain_stage_fix_limits"))
+        stage_results = _normalize_stage_results(state.get("verification_chain_stage_results"))
+        history = _normalize_history_entries(state.get("verification_chain_history"))
 
         result = await agent.fix(payload)
         fixed_code = _normalize_code_for_storage(result["fixed_lua_code"])
 
-        new_attempt = {
-            "verifier_name": verifier_result["verifier_name"],
-            "error_code": result["applied_error_code"],
-            "strategy": result["applied_strategy"],
-            "changed": result["changed"],
-        }
-        updated_attempts = previous_attempts + [new_attempt]
+        verifier_passed = bool(verifier_result["passed"])
+        changed = bool(result["changed"])
+        if verifier_passed:
+            updated_attempts: list[dict[str, Any]] = []
+        else:
+            new_attempt = {
+                "verifier_name": current_verifier or verifier_result["verifier_name"],
+                "error_code": result["applied_error_code"],
+                "strategy": result["applied_strategy"],
+                "changed": changed,
+            }
+            updated_attempts = previous_attempts + [new_attempt]
+            stage_fix_counts[current_verifier or verifier_result["verifier_name"]] = (
+                stage_fix_counts.get(current_verifier or verifier_result["verifier_name"], 0) + 1
+            )
+
+        next_fix_iter = fix_iter if verifier_passed else fix_iter + 1
+        if current_verifier and current_verifier not in stage_fix_limits:
+            stage_fix_limits[current_verifier] = 1
+
+        history.append(
+            {
+                "entry_type": "fixer",
+                "verifier_name": current_verifier or verifier_result["verifier_name"],
+                "node_name": "fix_verification_issue",
+                "failure_stage": current_failure_stage,
+                "passed": verifier_passed,
+                "error_code": result["applied_error_code"],
+                "strategy": result["applied_strategy"],
+                "changed": changed,
+                "fixed": bool(result["fixed"]),
+                "summary": verifier_result["summary"],
+            }
+        )
 
         return {
             "generated_code": fixed_code,
             "universal_verification_fixer_result": result,
-            "fix_verification_iterations": fix_iter if verifier_result["passed"] else fix_iter + 1,
-            "failure_stage": "" if (verifier_result["passed"] or result["changed"]) else "verification_fix",
-            "validation_passed": True,
-            "verification_passed": bool(verifier_result["passed"]),
+            "fix_verification_iterations": next_fix_iter,
+            "failure_stage": "" if verifier_passed else current_failure_stage,
+            "validation_passed": validation_passed,
+            "verification_passed": verifier_passed,
             "save_success": False,
             "save_skipped": False,
             "save_skip_reason": "",
@@ -579,6 +690,24 @@ def create_universal_verification_fixer_node(llm: LLMProvider) -> Callable:
             "suggested_changes": [],
             "clarifying_questions": [],
             "previous_fix_attempts": updated_attempts,
+            "verification_chain_current_verifier": current_verifier,
+            "verification_chain_current_node": _normalize_string(state.get("verification_chain_current_node")),
+            "verification_chain_current_index": _normalize_nonnegative_int(
+                state.get("verification_chain_current_index"),
+                default=-1,
+            ),
+            "verification_chain_current_failure_stage": current_failure_stage,
+            "verification_chain_next_verifier": _normalize_string(state.get("verification_chain_next_verifier")),
+            "verification_chain_next_node": _normalize_string(state.get("verification_chain_next_node")),
+            "verification_chain_last_transition": (
+                "fixer_noop_pass"
+                if verifier_passed
+                else ("fixer_changed_code" if changed else "fixer_noop_failed")
+            ),
+            "verification_chain_stage_fix_counts": stage_fix_counts,
+            "verification_chain_stage_fix_limits": stage_fix_limits,
+            "verification_chain_stage_results": stage_results,
+            "verification_chain_history": history,
         }
 
     return fix_verification_issue

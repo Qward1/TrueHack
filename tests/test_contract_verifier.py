@@ -84,6 +84,64 @@ class TestContractVerifierPrompt(unittest.TestCase):
 
 
 class TestContractVerifierAgent(unittest.TestCase):
+    def test_evidence_first_pass_skips_llm_when_runtime_matches_expected_return_path(self) -> None:
+        llm = StubLLM(response={"passed": False, "summary": "Should never be used."})
+        agent = ContractVerifierAgent(llm)
+        result = asyncio.run(
+            agent.verify(
+                {
+                    "task": "Return wf.initVariables.recallTime.",
+                    "code": "return wf.initVariables.recallTime",
+                    "expected_result_action": "return",
+                    "expected_return_path": "wf.initVariables.recallTime",
+                    "expected_top_level_type": "scalar",
+                    "before_state": {"wf": {"initVariables": {"recallTime": "2026-04-13T10:20:30"}}},
+                    "runtime_result": "2026-04-13T10:20:30",
+                }
+            )
+        )
+        self.assertTrue(result["passed"])
+        self.assertEqual(llm.call_count, 0)
+        self.assertIn("runtime evidence", result["summary"].lower())
+
+    def test_evidence_first_fail_skips_llm_when_wrong_path_was_updated(self) -> None:
+        llm = StubLLM(response={"passed": True, "summary": "Should never be used."})
+        agent = ContractVerifierAgent(llm)
+        result = asyncio.run(
+            agent.verify(
+                {
+                    "task": "Save the count to wf.vars.count.",
+                    "code": "wf.vars.debug = 3\nreturn wf.vars.debug",
+                    "expected_result_action": "save_to_wf_vars",
+                    "expected_update_path": "wf.vars.count",
+                    "before_state": {"wf": {"vars": {"count": 1, "debug": 0}}},
+                    "after_state": {"wf": {"vars": {"count": 1, "debug": 3}}},
+                }
+            )
+        )
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["error_code"], "wrong_update_path")
+        self.assertEqual(result["field_path"], "wf.vars.debug")
+        self.assertEqual(llm.call_count, 0)
+
+    def test_evidence_first_fail_skips_llm_when_runtime_shape_is_wrong(self) -> None:
+        llm = StubLLM(response={"passed": True, "summary": "Should never be used."})
+        agent = ContractVerifierAgent(llm)
+        result = asyncio.run(
+            agent.verify(
+                {
+                    "task": "Return a scalar count.",
+                    "code": "return {1, 2, 3}",
+                    "expected_result_action": "return",
+                    "expected_top_level_type": "scalar",
+                    "runtime_result": [1, 2, 3],
+                }
+            )
+        )
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["error_code"], "wrong_top_level_type")
+        self.assertEqual(llm.call_count, 0)
+
     def test_forbidden_io_short_circuits_without_llm(self) -> None:
         llm = StubLLM(
             response={
@@ -156,7 +214,7 @@ class TestContractVerifierAgent(unittest.TestCase):
                     "expected_workflow_paths": ["wf.initVariables.recallTime"],
                     "expected_result_action": "return",
                     "expected_return_path": "wf.initVariables.recallTime",
-                    "runtime_result": "1681374030",
+                    "runtime_result": "runtime-preview",
                     "after_state": {"wf": {"vars": {"time": "1681374030"}}},
                 }
             )

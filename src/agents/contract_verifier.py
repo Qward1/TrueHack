@@ -44,6 +44,9 @@ _WORKFLOW_ROOT_RE = re.compile(r"\bwf\.(?:vars|initVariables)\b")
 _RETURN_WHOLE_WORKFLOW_RE = re.compile(
     r"(?im)^\s*return\s+\(?\s*(wf\.(?:vars|initVariables))\s*\)?\s*$"
 )
+_RETURN_PATH_RE = re.compile(
+    r"(?im)^\s*return\s+\(?\s*(wf\.(?:vars|initVariables)(?:\.[A-Za-z_][A-Za-z0-9_]*)+)\s*\)?\s*$"
+)
 _LOCAL_TABLE_ASSIGN_RE = re.compile(r"(?im)^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{")
 _FORBIDDEN_CALL_PATTERNS = (
     ("print", re.compile(r"(?<![\w.])print\s*\(")),
@@ -249,6 +252,316 @@ def _build_failed_result(
         "fixer_brief": _normalize_fixer_brief(normalized_fixer, passed=False),
         "confidence": _clamp_confidence(confidence),
     }
+
+
+def _build_passed_result(
+    *,
+    summary: str,
+    evidence: list[str] | None = None,
+    expected: dict[str, Any] | None = None,
+    actual: dict[str, Any] | None = None,
+    confidence: float = 1.0,
+) -> ContractVerifierResult:
+    return {
+        "verifier_name": _AGENT_NAME,
+        "passed": True,
+        "error_family": None,
+        "error_code": None,
+        "severity": "low",
+        "summary": str(summary or "Contract check passed.").strip(),
+        "field_path": None,
+        "evidence": _ensure_string_list(evidence or []),
+        "expected": _ensure_object(expected or {}),
+        "actual": _ensure_object(actual or {}),
+        "fixer_brief": _normalize_fixer_brief({}, passed=True),
+        "confidence": _clamp_confidence(confidence),
+    }
+
+
+def _jsonish_signature(value: object) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return repr(value)
+
+
+def _jsonish_equal(left: object, right: object) -> bool:
+    return _jsonish_signature(left) == _jsonish_signature(right)
+
+
+def _normalize_contract_type(value: object) -> str | None:
+    text = str(value or "").strip().lower()
+    mapping = {
+        "scalar": "scalar",
+        "string": "scalar",
+        "number": "scalar",
+        "boolean": "scalar",
+        "bool": "scalar",
+        "object": "object-like table",
+        "object-like table": "object-like table",
+        "object_like_table": "object-like table",
+        "map": "object-like table",
+        "array": "array-like table",
+        "list": "array-like table",
+        "array-like table": "array-like table",
+        "array_like_table": "array-like table",
+        "empty table": "empty table",
+        "empty_table": "empty table",
+        "nil": "nil",
+    }
+    normalized = mapping.get(text)
+    return normalized or None
+
+
+def _classify_top_level_type(value: object) -> str:
+    if value is None:
+        return "nil"
+    if isinstance(value, (bool, int, float, str)):
+        return "scalar"
+    if isinstance(value, list):
+        return "empty table" if not value else "array-like table"
+    if isinstance(value, dict):
+        if not value:
+            return "empty table"
+        numeric_keys: list[int] = []
+        for key in value.keys():
+            if isinstance(key, int):
+                numeric_keys.append(int(key))
+                continue
+            if isinstance(key, str) and key.isdigit():
+                numeric_keys.append(int(key))
+                continue
+            return "object-like table"
+        numeric_keys.sort()
+        if numeric_keys == list(range(1, len(numeric_keys) + 1)):
+            return "array-like table"
+        return "object-like table"
+    return "object-like table"
+
+
+def _split_workflow_path(path: str) -> list[str]:
+    normalized = str(path or "").strip()
+    if not normalized.startswith("wf."):
+        return []
+    return [token for token in normalized.split(".") if token]
+
+
+def _resolve_workflow_path_value(root: object, path: str) -> tuple[bool, object]:
+    tokens = _split_workflow_path(path)
+    if not tokens:
+        return False, None
+    current = root
+    for token in tokens:
+        if isinstance(current, dict) and token in current:
+            current = current[token]
+            continue
+        return False, None
+    return True, current
+
+
+def _collect_state_changes(before: object, after: object, prefix: str = "") -> list[dict[str, Any]]:
+    if _jsonish_equal(before, after):
+        return []
+    path = prefix
+    if isinstance(before, dict) and isinstance(after, dict):
+        changes: list[dict[str, Any]] = []
+        for key in sorted(set(before.keys()) | set(after.keys()), key=str):
+            child_path = f"{path}.{key}" if path else str(key)
+            if key not in before or key not in after:
+                changes.append({"path": child_path, "before": before.get(key), "after": after.get(key)})
+                continue
+            changes.extend(_collect_state_changes(before.get(key), after.get(key), child_path))
+        return changes
+    if isinstance(before, list) and isinstance(after, list):
+        return [{"path": path or "root", "before": before, "after": after}]
+    return [{"path": path or "root", "before": before, "after": after}]
+
+
+def _extract_direct_return_path(code: str) -> str | None:
+    match = _RETURN_PATH_RE.search(str(code or ""))
+    if not match:
+        return None
+    return _normalize_nullable_string(match.group(1))
+
+
+def _evaluate_contract_evidence(payload: ContractVerifierInput) -> ContractVerifierResult | None:
+    expected_result_action = _normalize_nullable_string(payload.get("expected_result_action")) or ""
+    expected_return_path = _normalize_nullable_string(payload.get("expected_return_path"))
+    expected_update_path = _normalize_nullable_string(payload.get("expected_update_path"))
+    expected_top_level_type = _normalize_contract_type(payload.get("expected_top_level_type"))
+    runtime_result = payload.get("runtime_result")
+    before_state = payload.get("before_state")
+    after_state = payload.get("after_state")
+    code = str(payload.get("code", "") or "")
+
+    if expected_result_action == "save_to_wf_vars" and expected_update_path and before_state is not None and after_state is not None:
+        changes = _collect_state_changes(before_state, after_state, "")
+        changed_paths = [change["path"] for change in changes]
+        target_change = next((change for change in changes if change["path"] == expected_update_path), None)
+        if target_change is None:
+            wrong_change = next((change for change in changes if change["path"].startswith("wf.")), None)
+            if wrong_change is not None:
+                return _build_failed_result(
+                    error_family="workflow_path",
+                    error_code="wrong_update_path",
+                    severity="high",
+                    summary=(
+                        f"The execution updated `{wrong_change['path']}` instead of the required "
+                        f"`{expected_update_path}`."
+                    ),
+                    field_path=str(wrong_change["path"]),
+                    evidence=[
+                        "Concrete evidence source: before_state/after_state diff.",
+                        f"Expected update path `{expected_update_path}` did not change.",
+                    ],
+                    expected={"update_path": expected_update_path},
+                    actual={"changed_paths": changed_paths, "relevant_diff": changes[:5]},
+                    fixer_brief={
+                        "goal": "Write the result to the correct workflow path only.",
+                        "must_change": [f"Update `{expected_update_path}` instead of `{wrong_change['path']}`."],
+                        "must_preserve": ["Keep the existing business logic if it already computes the right value."],
+                        "forbidden_fixes": ["Do not change unrelated workflow paths."],
+                        "suggested_patch": f"Move the save/update target to `{expected_update_path}`.",
+                        "patch_scope": "local",
+                    },
+                    confidence=1.0,
+                )
+            return _build_failed_result(
+                error_family="update_contract",
+                error_code="required_field_unchanged",
+                severity="high",
+                summary=f"The required workflow target `{expected_update_path}` did not change after execution.",
+                field_path=expected_update_path,
+                evidence=[
+                    "Concrete evidence source: before_state/after_state diff.",
+                    f"No change was recorded at `{expected_update_path}`.",
+                ],
+                expected={"update_path": expected_update_path},
+                actual={"changed_paths": changed_paths},
+                fixer_brief={
+                    "goal": "Write the final result to the required workflow path.",
+                    "must_change": [f"Assign or update `{expected_update_path}` with the final result."],
+                    "must_preserve": ["Keep unrelated workflow fields unchanged."],
+                    "forbidden_fixes": ["Do not leave the target field untouched."],
+                    "suggested_patch": f"Store the final result into `{expected_update_path}`.",
+                    "patch_scope": "local",
+                },
+                confidence=1.0,
+            )
+        actual_type = _classify_top_level_type(target_change["after"])
+        if expected_top_level_type and actual_type != expected_top_level_type:
+            return _build_failed_result(
+                error_family="result_shape",
+                error_code="wrong_top_level_type",
+                severity="high",
+                summary=(
+                    f"`{expected_update_path}` has the wrong top-level result shape after execution: "
+                    f"expected `{expected_top_level_type}`, got `{actual_type}`."
+                ),
+                field_path=expected_update_path,
+                evidence=[
+                    "Concrete evidence source: after_state target value.",
+                    f"Observed `{expected_update_path}` as `{actual_type}` after execution.",
+                ],
+                expected={"top_level_type": expected_top_level_type, "update_path": expected_update_path},
+                actual={"top_level_type": actual_type, "value": target_change["after"]},
+                fixer_brief={
+                    "goal": "Preserve the update target but fix the top-level result shape only.",
+                    "must_change": [f"Normalize the final value at `{expected_update_path}` to `{expected_top_level_type}`."],
+                    "must_preserve": ["Keep the existing workflow path target."],
+                    "forbidden_fixes": ["Do not change the required workflow target."],
+                    "suggested_patch": f"Keep writing to `{expected_update_path}` but normalize the result shape to `{expected_top_level_type}`.",
+                    "patch_scope": "local",
+                },
+                confidence=1.0,
+            )
+        return _build_passed_result(
+            summary=f"Concrete execution evidence shows the required workflow target `{expected_update_path}` was updated.",
+            evidence=[
+                "Concrete evidence source: before_state/after_state diff.",
+                f"`{expected_update_path}` changed after execution.",
+            ],
+            expected={"update_path": expected_update_path, "top_level_type": expected_top_level_type},
+            actual={"update_path": expected_update_path, "top_level_type": actual_type},
+            confidence=0.96,
+        )
+
+    if expected_top_level_type and runtime_result is not None:
+        actual_type = _classify_top_level_type(runtime_result)
+        if actual_type != expected_top_level_type:
+            return _build_failed_result(
+                error_family="result_shape",
+                error_code="wrong_top_level_type",
+                severity="high",
+                summary=(
+                    f"The runtime result has the wrong top-level shape: expected "
+                    f"`{expected_top_level_type}`, got `{actual_type}`."
+                ),
+                evidence=[
+                    "Concrete evidence source: runtime_result.",
+                    f"Observed runtime_result as `{actual_type}`.",
+                ],
+                expected={"top_level_type": expected_top_level_type},
+                actual={"top_level_type": actual_type, "runtime_result": runtime_result},
+                fixer_brief={
+                    "goal": "Fix only the top-level result shape.",
+                    "must_change": [f"Normalize the returned value to `{expected_top_level_type}`."],
+                    "must_preserve": ["Keep the existing business logic."],
+                    "forbidden_fixes": ["Do not replace the whole workflow contract with a different one."],
+                    "suggested_patch": f"Wrap or unwrap the final return so the top-level shape becomes `{expected_top_level_type}`.",
+                    "patch_scope": "local",
+                },
+                confidence=1.0,
+            )
+
+    if expected_result_action == "return" and expected_return_path and runtime_result is not None:
+        roots = [before_state, after_state]
+        for root in roots:
+            found_expected, expected_value = _resolve_workflow_path_value(root, expected_return_path) if root is not None else (False, None)
+            if found_expected and _jsonish_equal(runtime_result, expected_value):
+                return _build_passed_result(
+                    summary=f"Concrete runtime evidence matches the expected return target `{expected_return_path}`.",
+                    evidence=[
+                        "Concrete evidence source: runtime_result matched the expected workflow path value.",
+                        f"Resolved `{expected_return_path}` to the same value as runtime_result.",
+                    ],
+                    expected={"return_path": expected_return_path},
+                    actual={"return_path": expected_return_path, "runtime_result": runtime_result},
+                    confidence=0.95,
+                )
+
+        actual_return_path = _extract_direct_return_path(code)
+        if actual_return_path and actual_return_path != expected_return_path:
+            for root in roots:
+                found_actual, actual_value = _resolve_workflow_path_value(root, actual_return_path) if root is not None else (False, None)
+                if found_actual and _jsonish_equal(runtime_result, actual_value):
+                    return _build_failed_result(
+                        error_family="return_contract",
+                        error_code="wrong_return_path",
+                        severity="high",
+                        summary=(
+                            f"The script returns `{actual_return_path}` instead of the required "
+                            f"`{expected_return_path}`."
+                        ),
+                        field_path=actual_return_path,
+                        evidence=[
+                            "Concrete evidence source: runtime_result plus explicit return path.",
+                            f"runtime_result matches `{actual_return_path}`, not `{expected_return_path}`.",
+                        ],
+                        expected={"return_path": expected_return_path},
+                        actual={"return_path": actual_return_path, "runtime_result": runtime_result},
+                        fixer_brief={
+                            "goal": "Return the correct workflow target only.",
+                            "must_change": [f"Return `{expected_return_path}` instead of `{actual_return_path}`."],
+                            "must_preserve": ["Keep the existing business logic if it already computes the right value."],
+                            "forbidden_fixes": ["Do not return the wrong workflow path or the whole workflow table."],
+                            "suggested_patch": f"Replace the final return target with `{expected_return_path}`.",
+                            "patch_scope": "local",
+                        },
+                        confidence=1.0,
+                    )
+
+    return None
 
 
 def _detect_local_contract_failure(payload: ContractVerifierInput) -> ContractVerifierResult | None:
@@ -513,7 +826,7 @@ def to_aggregate_verification_result(result: ContractVerifierResult) -> dict[str
 
 
 class ContractVerifierAgent:
-    """LLM-backed contract-only verifier with local hard blockers."""
+    """LLM-backed contract-only verifier with evidence-first behavior."""
 
     def __init__(self, llm: LLMProvider) -> None:
         self._llm = llm
@@ -533,6 +846,16 @@ class ContractVerifierAgent:
             has_runtime_result=payload.get("runtime_result") is not None,
             has_after_state=payload.get("after_state") is not None,
         )
+
+        evidence_result = _evaluate_contract_evidence(payload)
+        if evidence_result is not None:
+            logger.info(
+                f"[{_AGENT_NAME}] evidence_result",
+                passed=evidence_result["passed"],
+                error_code=evidence_result["error_code"] or "none",
+                field_path=evidence_result["field_path"] or "none",
+            )
+            return evidence_result
 
         local_failure = _detect_local_contract_failure(payload)
         if local_failure is not None:
