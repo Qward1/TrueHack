@@ -34,8 +34,12 @@ class LLMLoggingHelpersTests(unittest.TestCase):
             "OLLAMA_MODEL_CODE_GENERATOR",
         )
         self.assertEqual(
-            llm_module._agent_model_env_key("RequirementsVerifier"),
-            "OLLAMA_MODEL_REQUIREMENTS_VERIFIER",
+            llm_module._agent_model_env_key("ContractVerifier"),
+            "OLLAMA_MODEL_CONTRACT_VERIFIER",
+        )
+        self.assertEqual(
+            llm_module._agent_model_env_key("UniversalVerificationFixer"),
+            "OLLAMA_MODEL_UNIVERSAL_VERIFICATION_FIXER",
         )
 
     def test_resolve_agent_model_prefers_agent_override(self) -> None:

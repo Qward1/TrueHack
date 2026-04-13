@@ -133,6 +133,22 @@ class TestRobustnessVerifierAgent(unittest.TestCase):
         self.assertEqual(result["error_code"], "unsafe_ipairs")
         self.assertEqual(llm.call_count, 0)
 
+    def test_known_list_source_does_not_flag_ipairs_risk(self) -> None:
+        llm = StubLLM(response={"passed": True, "summary": "OK"})
+        agent = RobustnessVerifierAgent(llm)
+        result = asyncio.run(
+            agent.verify(
+                {
+                    "task": "Sum quantities.",
+                    "source_field_path": "wf.vars.items",
+                    "before_state": {"wf": {"vars": {"items": [{"quantity": "1"}]}}},
+                    "code": "for _, item in ipairs(wf.vars.items) do\n    total = total + (tonumber(item.quantity) or 0)\nend",
+                }
+            )
+        )
+        self.assertTrue(result["passed"])
+        self.assertEqual(llm.call_count, 1)
+
     def test_short_string_unhandled_skips_llm(self) -> None:
         llm = StubLLM(response={"passed": True, "summary": "Should not be used."})
         agent = RobustnessVerifierAgent(llm)

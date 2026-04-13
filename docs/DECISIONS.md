@@ -2,6 +2,21 @@
 
 # Decisions log
 
+## 2026-04-14
+### Decision
+Standalone modular verification (`ContractVerifier -> ShapeTypeVerifier -> SemanticLogicVerifier -> RuntimeStateVerifier -> RobustnessVerifier -> UniversalVerificationFixer`) is now the active verification/fix contour in the canonical graph.
+
+### Why
+The previous single-stage verification/fix loop has already been removed, while the new self-contained verifier agents, shared fixer, stage registry, history, and retry semantics are ready for production use.
+
+### Consequences
+- `build_graph()` routes successful validation into `verify_contract` instead of saving immediately.
+- Stage-to-stage routing is delegated to `route_after_verification_stage_result()` and `route_after_verification_fix()`, not duplicated in the graph layer.
+- The external aggregate contract stays stable through `verification` / `verification_passed`, even though the internal contour is now multi-stage.
+- A fixer patch with `changed=true` resolves the current stage and lets the next verifier continue; a no-op fixer keeps the earlier blocking verifier failure active and still prevents save.
+
+---
+
 ## 2026-04-12
 ### Decision
 Per-agent Ollama model selection is resolved centrally inside `src/core/llm.py`, not by branching the pipeline into separate client implementations.
@@ -26,7 +41,7 @@ Different LLM steps have different quality/latency requirements, but adding dedi
 Используем `app.py + src/graph` как единственный поддерживаемый runtime.
 
 ### Why
-В проекте было дублирование orchestration между graph path и legacy runtime.
+В проекте было дублирование orchestration между graph path и previous runtime.
 
 ### Consequences
 Вся новая логика встраивается только в canonical graph pipeline.
@@ -74,11 +89,11 @@ Generation/refine/fix/verify/explain используют единый LLM provi
 Временно отключаем e2e gate в каноническом runtime.
 
 ### Why
-Нужно упростить текущий рабочий цикл до `generate/refine -> validate -> verify -> save -> explain`,
+Нужно упростить текущий рабочий цикл до `generate/refine -> validate -> active verification gate -> save -> explain`,
 сохранив пост-объяснение и предложения улучшений после записи файла.
 
 ### Consequences
-`save_code` вызывается после успешной локальной валидации и проверки требований.
+`save_code` вызывается после успешной локальной валидации и прохождения активного verification gate.
 `src/tools/lua_tools.py` сохраняет e2e helpers, но graph path их сейчас не вызывает.
 
 ---
@@ -226,7 +241,7 @@ LLM-only verification was insufficient for public-sample tasks: the model could 
 - generation/refine/fix prompts теперь требуют только одно правило формата: ответ должен начинаться с `lua{` и заканчиваться `}lua`, без кавычек и без code fences;
 - raw LLM output считается невалидным, если он приходит в fences или quoted wrapper;
 - generation/fix prompts сокращены до задачи, основного workflow path, текущего context и короткого mandatory-fix списка;
-- `fix_code` больше не подсовывает модели её прошлый сломанный ответ;
+- `fix_validation_code` больше не подсовывает модели её прошлый сломанный ответ;
 - для shape-sensitive задач prompt contract теперь явно фиксирует определение массива: numeric keys `1..n` без пропусков, пустая table считается массивом.
 
 ---
@@ -246,7 +261,7 @@ LLM-only verification was insufficient for public-sample tasks: the model could 
   - explicit `.lua` path;
   - директорию;
   - active target текущего чата.
-- Если новый turn не содержит path и active target ещё не задан, pipeline всё равно выполняет `validate -> verify -> explain/respond`, но `save_code` намеренно пропускает запись на диск.
+- Если новый turn не содержит path и active target ещё не задан, pipeline всё равно выполняет `validate -> active verification gate -> explain/respond`, но `save_code` намеренно пропускает запись на диск.
 - Пользователь получает код в чате без save-error.
 
 ---
@@ -305,9 +320,9 @@ Static deterministic verification guard is removed from the active pipeline.
 The guard was producing false positives, obscuring the real logic failures, and sending the fix loop after the wrong problem. The product now relies on stronger semantic verification with concrete runtime evidence instead.
 
 ### Consequences
-- `verify_requirements` now depends on semantic LLM review plus parsed workflow context and updated workflow state.
-- Fix prompts receive semantic `missing_requirements` and failed-check reasons directly.
-- False-positive first-pass verifier approvals can be challenged by a second contradiction-focused verifier pass that uses workflow-state evidence.
+- The previous semantic verifier node and its verifier-side prompt/normalization helpers have been removed from the graph.
+- Verification-related runtime evidence remains in pipeline state because the standalone modular contour consumes it.
+- The modular verification chain is now the active graph-wired contour that consumes this runtime evidence.
 
 ---
 
@@ -400,7 +415,7 @@ Raw stderr alone is often too noisy. For recurring Lua failures such as `bad arg
 
 ### Consequences
 - validation diagnostics now include generic repair hints extracted from runtime errors;
-- `fix_code` prompt includes these hints together with raw stderr;
+- `fix_validation_code` prompt includes these hints together with raw stderr;
 - this remains API-agnostic and is not hardcoded to one function like `os.time`.
 
 ---
@@ -413,8 +428,8 @@ Fix-loop must not trust the first model repair attempt blindly.
 Логи показали, что модель может игнорировать diagnostics и вернуть почти тот же код или повторить те же semantic requirement failures. Без дополнительной проверки pipeline тратит итерации fix-loop на косметические или пустые правки.
 
 ### Consequences
-- after the first `fix_code` model call, the pipeline assesses the candidate before returning to validation;
-- if the candidate is empty, not a plausible standalone Lua file, materially unchanged, or still repeats the same semantic requirement failures, `fix_code` performs one stricter internal retry immediately;
+- after the first `fix_validation_code` model call, the pipeline assesses the candidate before returning to validation;
+- if the candidate is empty, not a plausible standalone Lua file, materially unchanged, or still repeats the same semantic requirement failures, `fix_validation_code` performs one stricter internal retry immediately;
 - the stricter retry explicitly lists why the previous fix attempt is rejected and demands a materially different full Lua script.
 
 ---
@@ -540,7 +555,7 @@ Many workflow scripts satisfy the task by updating `wf.vars` and returning `nil`
 
 ### Consequences
 - validation harness serializes both the direct Lua result and the updated workflow snapshot;
-- verifier and verification-fix prompts can judge mutation tasks against the updated workflow state when direct result is `null`;
+- validation and modular verification prompts can judge mutation tasks against the updated workflow state when direct result is `null`;
 - runtime marker extraction is CRLF-safe, so service markers are stripped reliably on Windows.
 
 ---

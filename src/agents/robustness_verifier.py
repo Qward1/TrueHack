@@ -578,6 +578,8 @@ def _detect_ipairs_risk(payload: RobustnessVerifierInput, code: str, candidates:
             edge_case = f"`{source_path or expr}` is nil."
             error_code = "unsafe_ipairs"
             summary = f"`{expr}` may be nil, but the code calls `ipairs` on it without a guard."
+        elif isinstance(source_value, (list, dict)):
+            continue
         else:
             edge_case = f"`{source_path or expr}` is not a table."
             error_code = "fragile_collection_handling"

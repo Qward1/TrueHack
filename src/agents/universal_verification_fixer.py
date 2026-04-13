@@ -123,6 +123,7 @@ class UniversalVerificationFixerNodeOutput(TypedDict):
     verification_chain_current_verifier: str
     verification_chain_current_node: str
     verification_chain_current_index: int
+    verification_chain_current_stage_passed: bool
     verification_chain_current_failure_stage: str
     verification_chain_next_verifier: str
     verification_chain_next_node: str
@@ -653,6 +654,16 @@ def create_universal_verification_fixer_node(llm: LLMProvider) -> Callable:
             stage_fix_counts[current_verifier or verifier_result["verifier_name"]] = (
                 stage_fix_counts.get(current_verifier or verifier_result["verifier_name"], 0) + 1
             )
+            stage_result_key = current_verifier or verifier_result["verifier_name"]
+            stage_result = stage_results.get(stage_result_key)
+            if isinstance(stage_result, dict):
+                updated_stage_result = dict(stage_result)
+                updated_stage_result["resolved_by_fixer"] = changed
+                updated_stage_result["fixed_by_fixer"] = changed
+                updated_stage_result["fixer_changed"] = changed
+                updated_stage_result["fixer_applied_error_code"] = result["applied_error_code"]
+                updated_stage_result["fixer_applied_strategy"] = result["applied_strategy"]
+                stage_results[stage_result_key] = updated_stage_result
 
         next_fix_iter = fix_iter if verifier_passed else fix_iter + 1
         if current_verifier and current_verifier not in stage_fix_limits:
@@ -696,6 +707,7 @@ def create_universal_verification_fixer_node(llm: LLMProvider) -> Callable:
                 state.get("verification_chain_current_index"),
                 default=-1,
             ),
+            "verification_chain_current_stage_passed": verifier_passed,
             "verification_chain_current_failure_stage": current_failure_stage,
             "verification_chain_next_verifier": _normalize_string(state.get("verification_chain_next_verifier")),
             "verification_chain_next_node": _normalize_string(state.get("verification_chain_next_node")),

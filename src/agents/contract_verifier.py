@@ -914,7 +914,7 @@ class ContractVerifierAgent:
 
 
 def create_contract_verifier_node(llm: LLMProvider) -> Callable:
-    """Factory for future verification-pipeline wiring."""
+    """Factory for the active contract-verification stage node."""
     agent = ContractVerifierAgent(llm)
 
     async def contract_verify(state: dict[str, Any]) -> ContractVerifierNodeOutput:

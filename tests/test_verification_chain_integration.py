@@ -221,7 +221,7 @@ class TestVerificationChainIntegration(unittest.TestCase):
         )
         self.assertEqual(route_after_limit, "verify_shape_type")
 
-    def test_registry_defaults_are_ready_for_future_activation(self) -> None:
+    def test_registry_defaults_match_active_runtime_chain(self) -> None:
         specs = get_verification_chain_specs()
         self.assertEqual([spec["verifier_name"] for spec in specs], [
             "ContractVerifier",

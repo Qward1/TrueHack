@@ -12,7 +12,6 @@ from typing import Any
 
 import structlog
 
-from src.core.llm import LLMProvider
 from src.tools.local_runtime import (
     run_lua_file,
     to_cmd_path,
@@ -22,7 +21,6 @@ logger = structlog.get_logger(__name__)
 
 DEFAULT_LUA_BIN = os.getenv("LUA_BIN", "lua55")
 DEFAULT_STARTUP_TIMEOUT = 3.0
-DEFAULT_VERIFICATION_TEMPERATURE = 0.05
 LOWCODE_LUA_VERSION = "Lua 5.5"
 LOWCODE_JSONSTRING_OPEN = "lua{"
 LOWCODE_JSONSTRING_CLOSE = "}lua"
@@ -54,58 +52,6 @@ LOWCODE_RESPONSE_FORMAT_REQUIREMENT = (
     "return ...\n"
     "}lua"
 )
-DEFAULT_VERIFICATION_SYSTEM_PROMPT = (
-    "You are a strict verifier of Lua workflow solutions. "
-    "Return passed=true only when the user's request is satisfied by clear evidence. "
-    "Judge using, in this order: "
-    "1. observed runtime result, "
-    "2. updated workflow state, "
-    "3. code. "
-    "If runtime result or updated workflow state is provided, treat it as the main source of truth. "
-    "Do not claim any mismatch that contradicts the observed runtime result or updated workflow state. "
-    "\n\n"
-    "Verify only what is relevant to the current task. "
-    "First infer: "
-    "- expected operation, "
-    "- expected result shape: scalar / object / array / workflow update, "
-    "- expected workflow paths to read and update. "
-    "Then check only those expectations. "
-    "Do not import unrelated failure patterns from other tasks. "
-    "Do not mention entities, fields, or shapes that are absent from the current request and evidence. "
-    "\n\n"
-    "Fail when:\n"
-    "- the result shape is wrong,\n"
-    "- the updated workflow path/value is wrong,\n"
-    "- the wrong workflow path is read,\n"
-    "- the actual operation differs materially from the request,\n"
-    "- the observed result contradicts the requested format or logic,\n"
-    "- the code uses demo data instead of workflow data.\n"
-    "\n"
-    "Type and shape rules:\n"
-    "- Distinguish scalar, object, and array carefully.\n"
-    "- A Lua array is a table with integer keys 1..n without gaps.\n"
-    "- A Lua object is a table with string keys or mixed non-array structure.\n"
-    "- Respect explicit type/shape hints in the request or context.\n"
-    "- If a scalar is requested, object/array result is a failure.\n"
-    "- If an object is requested, scalar/array result is a failure.\n"
-    "- If an array is requested, scalar/object result is a failure.\n"
-    "- For workflow update tasks, verify the exact updated path and stored value.\n"
-    "\n"
-    "Reasoning rules:\n"
-    "- Prefer concrete observed behavior over speculation from code reading.\n"
-    "- Compare the actual result against the request, not against generic coding style.\n"
-    "- Never report vague failures. Name the exact mismatch.\n"
-    "- When passed=false, missing_requirements must not be empty.\n"
-    "\n"
-    "Every failure summary must state:\n"
-    "1. what was requested,\n"
-    "2. what was actually produced,\n"
-    "3. the exact mismatch.\n"
-    "\n"
-    "Return strict JSON only:\n"
-    "{\"passed\": true, \"summary\": \"short summary\", \"missing_requirements\": [], \"warnings\": []}"
-)
-
 ZERO_WIDTH_PATTERN = re.compile(r"[\u200b\u200c\u200d\ufeff]")
 LOWCODE_JSONSTRING_PATTERN = re.compile(r"lua\{\s*([\s\S]*?)\s*\}lua", re.IGNORECASE)
 JSON_LUA_PAYLOAD_KEYS = ("lua", "code", "script", "source", "content")
@@ -2037,150 +1983,6 @@ def analyze_lua_response(text: str) -> dict[str, Any]:
         "normalized": normalized,
         "excerpt": normalized[:500].strip(),
     }
-
-def _extract_json_block(text: str) -> dict[str, Any]:
-    cleaned = text.strip()
-    fence = re.search(r"```(?:json)?\s*(.*?)```", cleaned, re.DOTALL)
-    if fence:
-        cleaned = fence.group(1).strip()
-    try:
-        data = json.loads(cleaned)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start != -1 and end > start:
-        try:
-            data = json.loads(cleaned[start:end + 1])
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
-
-    raise RuntimeError(f"Unexpected verification response: {text}")
-
-
-def _ensure_string_list(value: object) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(item).strip() for item in value if str(item).strip()]
-
-
-def _normalize_verification_result(data: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "passed": bool(data.get("passed", False)),
-        "summary": str(data.get("summary", "")).strip(),
-        "missing_requirements": _ensure_string_list(data.get("missing_requirements")),
-        "warnings": _ensure_string_list(data.get("warnings")),
-    }
-
-
-async def async_verify_requirements(
-    llm: LLMProvider,
-    prompt: str,
-    code: str,
-    run_output: str = "",
-    extra_context: str = "",
-) -> dict[str, Any]:
-    """Run requirement verification using the same local LLM provider as the graph."""
-    messages = [
-        {"role": "system", "content": DEFAULT_VERIFICATION_SYSTEM_PROMPT},
-        {"role": "user", "content": f"User request:\n{prompt}\n\n{LOWCODE_CONTRACT_TEXT}"},
-    ]
-    extra_context_text = str(extra_context or "").strip()
-    if extra_context_text:
-        messages.append(
-            {
-                "role": "user",
-                "content": extra_context_text,
-            }
-        )
-    if run_output.strip():
-        messages.append(
-            {
-                "role": "user",
-                "content": f"Runtime output:\n{run_output or 'none'}",
-            }
-        )
-    messages.extend(
-        [
-            {"role": "user", "content": f"Lua solution under review:\n```lua\n{code}\n```"},
-            {
-                "role": "user",
-                "content": (
-                "Check whether the Lua solution above fully satisfies the user request. "
-                "Return strict JSON only in this shape:\n"
-                '{'
-                '"passed": true, '
-                '"summary": "short summary", '
-                '"missing_or_unfulfilled_requirements": [] - unfulfilled requirements that must be filled in if there are errors, '
-                '"warnings": [], '
-                '}'
-            ),
-        },
-        ]
-    )
-
-    raw = await llm.chat(
-        messages,
-        temperature=DEFAULT_VERIFICATION_TEMPERATURE,
-        agent_name="RequirementsVerifier",
-    )
-    normalized = _normalize_verification_result(_extract_json_block(raw))
-    has_concrete_runtime_evidence = any(
-        marker in extra_context_text
-        for marker in (
-            "Original workflow state before execution",
-            "Updated workflow state after execution",
-            "Original workflow value at ",
-            "Updated workflow value at ",
-        )
-    )
-    if normalized["passed"] and extra_context_text and has_concrete_runtime_evidence:
-        challenge_messages = [
-            {
-                "role": "system",
-                "content": (
-                    DEFAULT_VERIFICATION_SYSTEM_PROMPT
-                    + " Perform a second-pass contradiction hunt. Assume the first verdict may be wrong. "
-                    + "Compare the original workflow state to the updated workflow state and search that concrete evidence for any counterexample. "
-                    + "If the observed before/after state change violates the request, you must return passed=false and explain exactly what is wrong."
-                ),
-            },
-            {"role": "user", "content": f"User request:\n{prompt}\n\n{LOWCODE_CONTRACT_TEXT}"},
-            {"role": "user", "content": extra_context_text},
-            {"role": "user", "content": f"Lua solution under review:\n```lua\n{code}\n```"},
-            {
-                "role": "user",
-                "content": (
-                    "The previous provisional verdict said the solution passed. "
-                    "Challenge that verdict. Use the concrete before/after workflow-state evidence to look for any wrong extra items, missing required transformations, incorrect mutations, or incorrect handling of empty values. "
-                    "Return the same strict JSON shape."
-                ),
-            },
-        ]
-        if run_output.strip():
-            challenge_messages.append(
-                {
-                    "role": "user",
-                    "content": f"Runtime output:\n{run_output or 'none'}",
-                }
-            )
-        challenge_raw = await llm.chat(
-            challenge_messages,
-            temperature=DEFAULT_VERIFICATION_TEMPERATURE,
-            agent_name="RequirementsVerifier",
-        )
-        challenge = _normalize_verification_result(_extract_json_block(challenge_raw))
-        if not challenge.get("passed", False) or challenge.get("missing_requirements"):
-            normalized = challenge
-    if not normalized["summary"]:
-        normalized["summary"] = "Verification completed."
-    return normalized
-
 
 def extract_function_names(code: str) -> list[str]:
     """Return ordered Lua function names defined in the file."""

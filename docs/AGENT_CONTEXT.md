@@ -9,7 +9,7 @@
 - Единый LLM abstraction layer: `src/core/llm.py`
 
 ## Канонический pipeline
-`resolve_target -> route_intent -> generate|refine|answer -> validate -> verify -> save -> explain_solution -> respond`
+`resolve_target -> route_intent -> generate|refine|answer -> validate -> verify_contract -> verify_shape_type -> verify_semantic_logic -> verify_runtime_state -> verify_robustness -> save -> explain_solution -> respond`
 
 ### Поведение pipeline
 - Generated/refined/fixed Lua now targets the LowCode contract:
@@ -31,7 +31,7 @@
   - prompt contract больше не заставляет все задачи схлопываться в короткий `return` и допускает multi-step workflow scripts, loops, guards, table traversal и helper functions, когда это требуется логикой;
   - prompts теперь используют один format contract: ответ обязан начинаться с `lua{` и заканчиваться `}lua`, без кавычек и без code fences;
   - service noise в generation/fix prompt сокращён: без ranked candidates / confidence / длинных diagnostic dumps;
-  - `fix_code` не подсовывает модели прошлый assistant output с ошибочным кодом, а даёт короткий список mandatory fixes и заставляет переписать скрипт заново;
+  - `fix_validation_code` не подсовывает модели прошлый assistant output с ошибочным кодом, а даёт короткий список mandatory fixes и заставляет переписать скрипт заново;
   - generate/refine/fix use a lower temperature for parseable workflow context to reduce wrapper noise and shallow shortcut generations.
 - `src/tools/lua_tools.py` normalizer дополнительно умеет доставать Lua из structured LLM responses, если модель вернула JSON envelope с полем `lua` / `code` / `script`, а не чистый code body, включая fenced/meta-wrapped JSON payloads.
 - `validate_code` запускает локальную диагностику через `lua` в temporary LowCode harness:
@@ -40,16 +40,13 @@
   - строит nested mock paths для найденных `wf.vars.*` / `wf.initVariables.*`, включая alias-derived field access;
   - извлекает общие runtime repair hints из типовых Lua ошибок для следующего fix-шага.
 - validation hint analysis (`CodeValidator`) now uses the numbered script, runtime traceback, and the exact validation workflow context together; its prompt requires `root cause`, `why it fails on this context`, and an `exact repair path` instead of a bare traceback restatement.
-- `fix_code` выполняет итеративные правки по стадии ошибки:
+- `fix_validation_code` выполняет итеративные правки по стадии ошибки:
   - validation;
-  - requirements;
-  - если первый fix-ответ остаётся пустым, почти не меняет код или детерминированно повторяет те же requirement failures, node делает один stricter internal retry before returning to validate.
+  - если первый fix-ответ остаётся пустым, почти не меняет код или детерминированно повторяет тот же runtime failure, node делает один stricter internal retry before returning to validate.
 - validation-fix prompt intentionally keeps only runtime-failure context: `run_error`, line/context hints, `llm_fix_hint`, and the current numbered code block, without task/planner/workflow-context payload from `compiled_request`.
-- `verify_requirements` — семантическая LLM-проверка соответствия исходному запросу, которая возвращает итоговый verdict через `summary`, `missing_requirements` и `warnings`.
-- verifier работает как основной semantic gate: он получает parsed workflow context, before/after workflow-state evidence и updated workflow state из validation harness без дублирующего planner summary блока.
-- если `Parsed workflow context` совпадает с `Original workflow state before execution`, verifier prompt оставляет только один полный snapshot и отдельные точечные значения по выбранному workflow path.
-- verifier и verification-fix prompts также трактуют явные type/shape hints из compiled workflow context (`selected_primary_type`, `requested_item_keys`, `semantic_expectations`) как обязательные ограничения, а не как факультативные подсказки.
-- для задач cleanup/remove/filter и shape-sensitive задач fix-loop теперь получает semantic requirement failures и verifier summary, а не отдельный статический guard verdict.
+- legacy semantic verifier node удалён из active graph.
+- active modular verification contour живёт в `src/agents/*` и использует тот же внешний aggregate verdict (`verification`, `verification_passed`, `summary`, `missing_requirements`, `warnings`) через stage-by-stage orchestration в `src/agents/verification_chain.py`.
+- runtime/state evidence из validation harness сохраняется в pipeline state для modular verifier-агентов и их общего fixer-а.
 - Если в тексте задачи указан bare field name без полного `wf.vars.*` / `wf.initVariables.*`, compiler пытается однозначно разрешить его через parseable workflow context и добавить в expected workflow paths.
 - Если intent классифицирован как `change`, но текущий код отсутствует, pipeline идёт в `generate_code`, а не в `refine_code`.
 - `route_intent` теперь hybrid:
@@ -57,7 +54,7 @@
   - только затем обращается к LLM как к tie-breaker для неоднозначных случаев;
   - без existing code в чате и без pasted Lua в текущем сообщении change-like wording (`исправь`, `улучши`, `очисти`, `оберни`) трактуется как `create`, а не `change`;
   - если пользователь прислал Lua прямо в сообщении, этот код считается доступным контекстом для `change` / `inspect`.
-- `save_code` выполняется только после успешной локальной валидации и проверки требований.
+- `save_code` выполняется только после успешной локальной валидации и полного modular verification chain.
 - если новый чат не содержит явного path и active target ещё не выбран, `save_code` не пишет файл и помечает save как intentionally skipped.
 - `save_code` сохраняет два артефакта:
   - чистый `.lua` файл в canonical target path;
@@ -96,7 +93,6 @@
 - `src/tools/lua_tools.py`:
   - нормализация Lua-ответа;
   - локальная диагностика и LowCode validation harness;
-  - verification helper;
   - временно неиспользуемые e2e helpers для будущего возврата e2e-gate.
 - `src/tools/local_runtime.py`:
   - низкоуровневые wrappers для `lua`;
@@ -127,11 +123,10 @@
 - Prompt assembly splits the user message into `task` and pasted workflow context.
 - Generation, refine, and fix prompts now use abstract synthesis guidance instead of embedded code templates/few-shot snippets.
 - The canonical style is: direct `wf.vars` / `wf.initVariables` access, no recreated demo input tables, no console wrappers, and the amount of Lua structure the task actually needs.
-- Semantic verification is the primary save gate:
-  - verifier/fix prompts receive parsed workflow context, expected workflow paths, before/after workflow-state evidence, and semantic requirement failures;
-  - verifier contract uses `passed`, `summary`, `missing_requirements`, and `warnings`, without numeric score fields or checklist objects;
-  - save remains blocked on failed validation or failed semantic verification;
-  - no separate deterministic verification guard remains in the active pipeline.
+- Modular verification is now the active verification contour:
+  - standalone verifiers/fixer keep the aggregate verdict fields `passed`, `summary`, `missing_requirements`, and `warnings`;
+  - orchestration state for that contour lives in `verification_chain_*`;
+  - active graph wiring now routes successful validation into `verify_contract` and then through the full stage chain plus `fix_verification_issue`.
 - `docs/_pdf_text.txt` remains an offline working aid only and is not read at runtime.
 
 ## 2026-04-11 update: compiled workflow context
@@ -145,17 +140,14 @@
 - The compiled request is now used to steer model generation and verification, not to emit canned Lua templates directly.
 - If the workflow path cannot be selected confidently, the pipeline stops before generation, asks a clarification question, and does not save code.
 
-## 2026-04-12 update: validation and verifier hardening
+## 2026-04-12 update: validation and verification-contour prep
 - Workflow-context parsing now tolerates loose pasted JSON fragments and fenced JSON-like blocks before the compiler builds the request.
 - `src/tools/lua_tools.py` normalizes malformed LowCode wrappers before validation, including fenced `lua{...}lua` variants and partial trailing wrapper noise.
 - Runtime marker extraction now tolerates both LF and CRLF output from the temporary Lua harness.
-- `validate_code` now captures both the actual returned value and the updated workflow snapshot from the temporary workflow harness and exposes them to `verify_requirements`.
-- `verify_requirements` now evaluates logic against:
-  - parsed workflow context;
-  - workflow anchor and concrete workflow-state evidence;
-  - updated workflow state after execution when the script mutates `wf.*` and returns `nil`.
+- `validate_code` now captures both the actual returned value and the updated workflow snapshot from the temporary workflow harness.
+- Those runtime artifacts are preserved in state for the standalone modular verification contour under `src/agents/*`.
 - `explain_solution` now normalizes explainer sections from either JSON arrays or single strings before falling back to generic text.
-- `prepare_response` always includes the current code payload in the user response, even on failed validation/verification turns; the response stays diagnostic and saving still remains blocked.
+- `prepare_response` always includes the current code payload in the user response, even on failed validation turns; the response stays diagnostic and saving can still be skipped.
 
 ## 2026-04-12 update: per-agent model overrides
 - `src/core/llm.py` remains the single LLM abstraction layer, but each LLM-backed agent can now use its own Ollama model via env without adding a second client path.
@@ -165,12 +157,16 @@
   - shared fallback `OLLAMA_MODEL`;
   - built-in default model.
 - Supported agent-specific env keys in the canonical pipeline:
-  - `OLLAMA_MODEL_INTENT_ROUTER`
-  - `OLLAMA_MODEL_TASK_PLANNER`
-  - `OLLAMA_MODEL_CODE_GENERATOR`
-  - `OLLAMA_MODEL_CODE_REFINER`
-  - `OLLAMA_MODEL_VALIDATION_FIXER`
-  - `OLLAMA_MODEL_VERIFICATION_FIXER`
-  - `OLLAMA_MODEL_REQUIREMENTS_VERIFIER`
-  - `OLLAMA_MODEL_SOLUTION_EXPLAINER`
-  - `OLLAMA_MODEL_QUESTION_ANSWERER`
+- `OLLAMA_MODEL_INTENT_ROUTER`
+- `OLLAMA_MODEL_TASK_PLANNER`
+- `OLLAMA_MODEL_CODE_GENERATOR`
+- `OLLAMA_MODEL_CODE_REFINER`
+- `OLLAMA_MODEL_VALIDATION_FIXER`
+- `OLLAMA_MODEL_CONTRACT_VERIFIER`
+- `OLLAMA_MODEL_SHAPE_TYPE_VERIFIER`
+- `OLLAMA_MODEL_SEMANTIC_LOGIC_VERIFIER`
+- `OLLAMA_MODEL_RUNTIME_STATE_VERIFIER`
+- `OLLAMA_MODEL_ROBUSTNESS_VERIFIER`
+- `OLLAMA_MODEL_UNIVERSAL_VERIFICATION_FIXER`
+- `OLLAMA_MODEL_SOLUTION_EXPLAINER`
+- `OLLAMA_MODEL_QUESTION_ANSWERER`

@@ -5,9 +5,9 @@
 ## Current status
 Репозиторий работает в одном каноническом runtime (`app.py + src/graph`) и поддерживает полный цикл:
 
-`generate/refine -> local validate -> fix -> requirement verify -> save -> explain/respond`
+`generate/refine -> local validate -> fix_validation -> verify_contract -> verify_shape_type -> verify_semantic_logic -> verify_runtime_state -> verify_robustness -> save -> explain/respond`
 
-Если в чате есть явный target path или уже выбран active target, сохранение итогового кода происходит после успешной локальной валидации и проверки требований:
+Если в чате есть явный target path или уже выбран active target, сохранение итогового кода происходит после успешной локальной валидации и полного modular verification chain:
 - canonical artifact: чистый `.lua` файл;
 - дополнительный artifact: sidecar `*.jsonstring.txt` как JSON object, где value содержит `lua{...}lua`.
 Если path не указан и active target отсутствует, код проходит pipeline и возвращается в чат без записи на диск.
@@ -45,21 +45,19 @@
 - validation-fix prompt is now runtime-focused and no longer includes task/planner/workflow-context sections from `compiled_request`
 - normalized runtime repair hints для common Lua errors (`bad argument`, `nil` access/call, arithmetic/type mismatch, concatenation)
 - stricter internal fix retry:
-  - если первый fix-кандидат пустой, почти идентичен прошлому коду или повторяет те же semantic requirement failures, pipeline делает ещё один более жёсткий fix-call до возврата в validation
-- LLM verification требований
-- workflow-state-aware semantic verification:
-- verifier sees parsed workflow context and the before/after workflow snapshot captured during validation, without отдельного planner-summary дубля;
-- если parsed workflow context и original workflow state совпадают, verifier prompt не дублирует оба полных snapshot-а;
-  - explicit type/shape hints from compiled workflow context (`selected_primary_type`, `requested_item_keys`, `semantic_expectations`) are treated as mandatory verifier/fixer constraints;
-  - verifier returns `passed`, `summary`, `missing_requirements`, and `warnings`, without any numeric score field or checklist object;
-  - if the first verifier pass returns an optimistic false positive while the workflow-state evidence contradicts the request, a second contradiction-focused verifier pass can overrule it
+  - если первый fix-кандидат пустой, почти идентичен прошлому коду или повторяет тот же runtime failure, pipeline делает ещё один более жёсткий fix-call до возврата в validation
+- active modular verification contour работает из `src/agents/*`;
+- unified aggregate verdict остаётся совместимым с внешним pipeline contract:
+  - verifiers collapse results to `passed`, `summary`, `missing_requirements`, and `warnings`;
+  - runtime/state evidence from validation is preserved for the modular contour;
+  - active graph использует этот contour как единственный verification/fix path после validation
 - model-driven Lua synthesis with compiler-assisted context:
   - prompts no longer rely on embedded code templates or shortest-return bias;
   - compiler still supplies path inventory, clarification gating, and verification hints, but prompt payloads now only keep the task, selected workflow path, current context, and short mandatory-fix lists;
   - generation can legitimately produce longer multi-step workflow scripts when the task needs normalization, iteration, guards, or helper functions;
   - generation/refine/fix now run with a lower temperature for parseable workflow context;
   - raw model output is now treated as invalid unless it starts with `lua{` and ends with `}lua`, without surrounding quotes or code fences;
-  - `fix_code` no longer includes the previous broken assistant answer in the repair prompt, to reduce pattern-copying loops
+- `fix_validation_code` no longer includes the previous broken assistant answer in the repair prompt, to reduce pattern-copying loops
 - response normalization for generation/fix:
   - runtime extracts Lua both from plain `lua{...}lua` and from structured JSON envelopes with code-bearing fields;
   - extraction also covers fenced/meta-wrapped JSON payloads, so validation does not execute literal escape-text like `\\n ...`;
@@ -67,9 +65,7 @@
 - user-facing/export formatting:
   - чат и sidecar now emit JSON payloads with a named field whose value is the wrapped `lua{...}lua` string;
   - field name is chosen from selected save path, selected primary workflow path, or target stem
-- verifier/fix loop for cleanup and shape-sensitive tasks:
-  - save is blocked by semantic `missing_requirements` and failed verifier verdicts;
-  - fix prompts now carry concrete logic failures, including contradictions between the request and the observed workflow-state changes
+- previous single-stage verifier loop удалён из active graph wiring;
 - route guard для `change` without code:
   - если existing code отсутствует, pipeline не уходит в `refine_code` и не пишет warning fallback;
   - вместо этого запрос обрабатывается как generate-path с сохранением intent
@@ -94,9 +90,9 @@
 
 ## Что удалено/не используется
 - второй runtime (`main.py`)
-- legacy standalone editor path
+- previous standalone editor path
 - generic README/text artifact orchestration в продуктовой логике
-- direct legacy LLM client path
+- direct previous LLM client path
 
 ## Что еще не закрыто
 - фиксация финального demo flow под жюри
@@ -140,13 +136,13 @@ README описывает канонический запуск через `app.
 ## 2026-04-11 update: LowCode generation alignment
 - The pipeline now assembles prompts around task/context splitting instead of sending raw user text as-is.
 - Prompt steering is now abstract and model-driven: it describes workflow-script constraints and synthesis strategy without embedding concrete code templates from sample tasks.
-- Requirement verification now relies on semantic LLM review plus concrete runtime evidence from validation.
-- Save is blocked when semantic verification returns `passed=false` or non-empty `missing_requirements`.
+- Runtime evidence for solution checks is still captured during validation and stored in pipeline state.
+- Active graph save is gated by both validation and the modular verification contour.
 - Automated regression coverage exists in `tests/` via stdlib `unittest`:
   - prompt/context splitting;
   - runtime-result-aware logic verification;
   - pipeline scenario: app-style generation goes into fix-loop;
-  - pipeline scenario: workflow-style generation passes validate -> verify -> save.
+  - pipeline scenario: workflow-style generation passes validate -> modular verification chain -> save.
 
 ## 2026-04-12 update: TaskPlanner integrated into canonical pipeline
 - New LangGraph node `plan_request` powered by `src/agents/planner.py` runs between intent routing and `prepare_generation_context`.
@@ -176,7 +172,7 @@ README описывает канонический запуск через `app.
 - The local validation harness now captures both the actual returned Lua value and the updated workflow snapshot on the provided workflow context.
 - Semantic verification now sees parsed workflow context and the updated workflow state, so logic review can fail on wrong mutations instead of only reviewing source text.
 - `explain_solution` now accepts explainer section fields as either JSON arrays or plain strings before generic fallback text is used.
-- If validation or requirement verification still fails after the fix loop, the user-facing response remains diagnostic, still shows the current code payload, and does not save artifacts to disk.
+- If validation or modular verification still fails after the fix loop, the user-facing response remains diagnostic, still shows the current code payload, and does not save artifacts to disk.
 
 ## 2026-04-12 update: per-agent Ollama models
 - The canonical runtime still uses one `LLMProvider`, but model selection is now resolved per LLM agent at call time.
@@ -184,12 +180,10 @@ README описывает канонический запуск через `app.
   - CLI `--model` or env `OLLAMA_MODEL` set the base model for the whole app.
 - Optional per-agent env overrides now exist for the LLM-backed nodes/helpers:
   - `OLLAMA_MODEL_INTENT_ROUTER`
-  - `OLLAMA_MODEL_TASK_PLANNER`
-  - `OLLAMA_MODEL_CODE_GENERATOR`
-  - `OLLAMA_MODEL_CODE_REFINER`
-  - `OLLAMA_MODEL_VALIDATION_FIXER`
-  - `OLLAMA_MODEL_VERIFICATION_FIXER`
-  - `OLLAMA_MODEL_REQUIREMENTS_VERIFIER`
-  - `OLLAMA_MODEL_SOLUTION_EXPLAINER`
-  - `OLLAMA_MODEL_QUESTION_ANSWERER`
+- `OLLAMA_MODEL_TASK_PLANNER`
+- `OLLAMA_MODEL_CODE_GENERATOR`
+- `OLLAMA_MODEL_CODE_REFINER`
+- `OLLAMA_MODEL_VALIDATION_FIXER`
+- `OLLAMA_MODEL_SOLUTION_EXPLAINER`
+- `OLLAMA_MODEL_QUESTION_ANSWERER`
 - Prompt audit logs now record both `agent_name` and the effective `model` used for that request, which makes per-agent routing visible in saved logs.

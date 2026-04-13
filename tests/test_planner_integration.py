@@ -19,7 +19,13 @@ ROUTE_SYSTEM_PREFIX = "You are an intent classifier"
 EXPLAIN_SYSTEM_PREFIX = "You explain generated Lua code"
 VERIFY_SYSTEM_PREFIX = "You review whether a Lua solution fully satisfies the user's request."
 FIX_VALIDATION_SYSTEM_PREFIX = "You fix Lua 5.5 workflow scripts that fail during execution."
-FIX_VERIFICATION_SYSTEM_PREFIX = "You fix Lua 5.5 workflow scripts that fail requirement verification."
+VERIFIER_AGENT_NAMES = {
+    "ContractVerifier",
+    "ShapeTypeVerifier",
+    "SemanticLogicVerifier",
+    "RuntimeStateVerifier",
+    "RobustnessVerifier",
+}
 
 
 def _success_diagnostics() -> dict:
@@ -117,9 +123,9 @@ class IntegrationStubLLM:
         agent_name: str = "",
     ) -> str:
         system = str(messages[0].get("content", "")) if messages else ""
-        if system.startswith(FIX_VALIDATION_SYSTEM_PREFIX) or system.startswith(FIX_VERIFICATION_SYSTEM_PREFIX):
+        if system.startswith(FIX_VALIDATION_SYSTEM_PREFIX) or agent_name == "UniversalVerificationFixer":
             return self.generate_response
-        if system.startswith(VERIFY_SYSTEM_PREFIX):
+        if system.startswith(VERIFY_SYSTEM_PREFIX) or agent_name in VERIFIER_AGENT_NAMES:
             return json.dumps({
                 "passed": True,
                 "summary": "ok",

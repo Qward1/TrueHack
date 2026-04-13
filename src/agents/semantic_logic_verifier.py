@@ -495,7 +495,7 @@ def _infer_boolean_connector(task: str) -> str:
         return "and"
     if has_or and not has_and:
         return "or"
-    return "and"
+    return ""
 
 
 def _parse_filter_clause(task_lower: str, field: str) -> _FilterClause | None:

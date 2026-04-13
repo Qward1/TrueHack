@@ -7,7 +7,7 @@
 - генерирует или дорабатывает LowCode workflow/LUS script на `Lua 5.5`;
 - запускает локальную проверку через `lua` в temporary LowCode harness;
 - делает fix loop при ошибках;
-- выполняет LLM-проверку соответствия исходному запросу;
+- выполняет modular LLM-проверку через цепочку verifier-агентов и общий post-verification fixer;
 - если в чате указан явный target path или уже есть active target, сохраняет код после успешной локальной валидации и проверки требований:
   - как чистый целевой `.lua` файл;
   - как sidecar JSON-артефакт рядом с ним, где значение поля содержит JsonString `lua{...}lua`;
@@ -91,8 +91,12 @@ python app.py --host 127.0.0.1 --port 8765 --workspace C:\Work\LuaProjects --mod
 - `OLLAMA_MODEL_CODE_GENERATOR`
 - `OLLAMA_MODEL_CODE_REFINER`
 - `OLLAMA_MODEL_VALIDATION_FIXER`
-- `OLLAMA_MODEL_VERIFICATION_FIXER`
-- `OLLAMA_MODEL_REQUIREMENTS_VERIFIER`
+- `OLLAMA_MODEL_CONTRACT_VERIFIER`
+- `OLLAMA_MODEL_SHAPE_TYPE_VERIFIER`
+- `OLLAMA_MODEL_SEMANTIC_LOGIC_VERIFIER`
+- `OLLAMA_MODEL_RUNTIME_STATE_VERIFIER`
+- `OLLAMA_MODEL_ROBUSTNESS_VERIFIER`
+- `OLLAMA_MODEL_UNIVERSAL_VERIFICATION_FIXER`
 - `OLLAMA_MODEL_SOLUTION_EXPLAINER`
 - `OLLAMA_MODEL_QUESTION_ANSWERER`
 
@@ -101,7 +105,6 @@ python app.py --host 127.0.0.1 --port 8765 --workspace C:\Work\LuaProjects --mod
 ```env
 OLLAMA_MODEL=qwen2.5-coder:7b-instruct
 OLLAMA_MODEL_INTENT_ROUTER=qwen2.5-coder:3b-instruct
-OLLAMA_MODEL_REQUIREMENTS_VERIFIER=qwen2.5-coder:14b-instruct
 OLLAMA_MODEL_SOLUTION_EXPLAINER=qwen2.5-coder:3b-instruct
 ```
 
@@ -147,7 +150,7 @@ C:\Work\LuaProjects\<slug>\<slug>.lua
 Верни последний email из wf.vars.emails
 ```
 
-Система выполнит полный цикл `generate/refine -> validate -> verify -> explain/respond`, но не будет создавать `.lua` файл и sidecar, если в этом чате ещё нет active target.
+Система выполнит полный цикл `generate/refine -> validate -> modular verification chain -> explain/respond`, но не будет создавать `.lua` файл и sidecar, если в этом чате ещё нет active target.
 
 ## LowCode contract
 - generation target: `Lua 5.5`
@@ -171,12 +174,13 @@ C:\Work\LuaProjects\<slug>\<slug>.lua
 Основная ветка:
 
 ```text
-resolve_target -> route_intent -> generate/refine -> validate -> verify -> save -> explain_solution -> respond
+resolve_target -> route_intent -> generate/refine -> validate -> verify_contract -> verify_shape_type -> verify_semantic_logic -> verify_runtime_state -> verify_robustness -> save -> explain_solution -> respond
 ```
 
-Если проваливается validation/verify:
-- запускается `fix_code`;
-- затем pipeline повторяет цикл проверок;
+Если проваливается validation/modular verification:
+- при runtime/syntax fail запускается `fix_validation_code`;
+- при failed verifier запускается `fix_verification_issue`;
+- затем pipeline повторяет нужную часть цикла проверок;
 - если лимит fix-итераций исчерпан, файл не сохраняется.
 
 ## Что видно в ответе
@@ -232,10 +236,10 @@ Canonical runtime — Ollama с OpenAI-compatible API на `http://127.0.0.1:114
   - prompts больше не подталкивают каждую задачу к shortest-return шаблону и допускают multi-step scripts, loops, guards и helper functions, когда это нужно задаче;
   - prompts теперь используют один жёсткий format contract: ответ должен начинаться с `lua{` и заканчиваться `}lua`, без кавычек и без code fences;
   - в generation/fix prompts сокращён служебный шум: вместо ranked candidates / confidence / длинных diagnostics модель получает задачу, основной workflow path, текущий context и короткий список обязательных исправлений;
-  - `fix_code` больше не подсовывает модели прошлый сломанный assistant output и переписывает сценарий по short mandatory-fix list;
+  - `fix_validation_code` больше не подсовывает модели прошлый сломанный assistant output и переписывает сценарий по short mandatory-fix list;
   - generate/refine/fix теперь используют более консервативную temperature policy для parseable workflow context и shape-sensitive tasks;
   - raw LLM output считается невалидным, если модель вернула fences, quoted wrapper или не начала ответ с `lua{`;
-- verification теперь использует semantic verdict через `summary` + `missing_requirements`, а не только свободный summary;
+- verification теперь использует modular verdict через unified structured outputs verifier-агентов и внешний aggregate `verification` / `verification_passed`;
 - verifier теперь получает concrete runtime evidence:
   - updated workflow snapshot after execution for mutation scripts;
   - contradiction-focused second pass can overturn an optimistic false positive;
@@ -251,7 +255,7 @@ Canonical runtime — Ollama с OpenAI-compatible API на `http://127.0.0.1:114
 - задачи очистки/удаления ключей внутри workflow-объектов больше не считаются простым `return`-сценарием и проходят semantic verification на реальную трансформацию данных;
 - если пользователь в задаче упоминает bare field name из parseable workflow context, runtime пытается однозначно привязать его к `wf.vars.*` или `wf.initVariables.*` и использует это в verification/save gate;
 - fix-loop теперь получает не только raw Lua runtime error, но и нормализованные repair hints для типовых ошибок аргументов, nil access/call, arithmetic/type mismatch и concatenation;
-- `fix_code` теперь делает один внутренний stricter retry, если первый fix-ответ:
+- `fix_validation_code` теперь делает один внутренний stricter retry, если первый fix-ответ:
   - не является внятным standalone Lua;
   - почти не меняет код;
   - или детерминированно повторяет те же requirement failures;

@@ -1,9 +1,4 @@
-"""Internal registry and orchestration helpers for the standalone verification chain.
-
-This module does not activate the new pipeline yet.
-It defines the future-ready verifier order, stable stage metadata, state defaults,
-and route helpers so the chain can later be enabled with a small graph change.
-"""
+"""Registry and orchestration helpers for the modular verification chain."""
 
 from __future__ import annotations
 
@@ -151,6 +146,7 @@ def get_verification_chain_state_defaults() -> dict[str, Any]:
         "verification_chain_current_verifier": "",
         "verification_chain_current_node": "",
         "verification_chain_current_index": -1,
+        "verification_chain_current_stage_passed": False,
         "verification_chain_current_failure_stage": "",
         "verification_chain_next_verifier": "",
         "verification_chain_next_node": "",
@@ -229,11 +225,30 @@ def get_verification_stage_fix_count(state: dict[str, Any], verifier_name: objec
     return counts.get(spec["verifier_name"], 0)
 
 
+def _get_current_stage_passed(state: dict[str, Any], current_spec: VerificationStageSpec) -> bool:
+    current_stage_passed = state.get("verification_chain_current_stage_passed")
+    if isinstance(current_stage_passed, bool):
+        return current_stage_passed
+
+    stage_results = _normalize_stage_results(state.get("verification_chain_stage_results"))
+    current_result = stage_results.get(current_spec["verifier_name"])
+    if isinstance(current_result, dict):
+        return bool(current_result.get("passed", False))
+
+    verification = state.get("verification")
+    if isinstance(verification, dict):
+        verifier_name = _normalize_string(verification.get("verifier_name"))
+        if verifier_name == current_spec["verifier_name"]:
+            return bool(verification.get("passed", False))
+
+    return bool(state.get("verification_passed", False))
+
+
 def route_after_verification_stage_result(state: dict[str, Any]) -> str:
     current_spec = get_current_verification_stage_spec(state)
     if current_spec is None:
         return "complete"
-    if not bool(state.get("verification_passed", False)):
+    if not _get_current_stage_passed(state, current_spec):
         return "fix_verification_issue"
     next_spec = get_next_verification_stage_spec(current_spec["verifier_name"])
     return next_spec["node_name"] if next_spec is not None else "complete"
@@ -284,26 +299,45 @@ def _coerce_verifier_output(
     spec: VerificationStageSpec,
 ) -> tuple[dict[str, Any], dict[str, Any], bool]:
     coerced_output = dict(output)
-    verification = dict(coerced_output.get("verification")) if isinstance(coerced_output.get("verification"), dict) else {}
     result = coerced_output.get(spec["result_state_key"])
     if not isinstance(result, dict):
         result = {}
-    passed = bool(result.get("passed", verification.get("passed", False)))
-    verification["passed"] = passed
-    verification["verifier_name"] = spec["verifier_name"]
-    verification.setdefault("summary", _normalize_string(result.get("summary")) or ("Verification passed." if passed else "Verification failed."))
-    verification["error_family"] = result.get("error_family")
-    verification["error_code"] = result.get("error_code")
-    verification["severity"] = _normalize_string(result.get("severity")) or ("low" if passed else "high")
-    verification["field_path"] = result.get("field_path")
-    verification["evidence"] = list(result.get("evidence", [])) if isinstance(result.get("evidence"), list) else []
-    verification["expected"] = dict(result.get("expected", {})) if isinstance(result.get("expected"), dict) else {}
-    verification["actual"] = dict(result.get("actual", {})) if isinstance(result.get("actual"), dict) else {}
-    verification["fixer_brief"] = dict(result.get("fixer_brief", {})) if isinstance(result.get("fixer_brief"), dict) else {}
-    verification["confidence"] = result.get("confidence", verification.get("confidence", 0.0))
-    verification["warnings"] = list(verification.get("warnings", [])) if isinstance(verification.get("warnings"), list) else []
-    verification["error"] = bool(verification.get("error", False))
-    if not verification.get("missing_requirements") and not passed:
+    verification = _build_aggregate_verification(result, spec=spec)
+    passed = bool(verification.get("passed", False))
+    result = dict(result)
+    result["verifier_name"] = spec["verifier_name"]
+    coerced_output["verification"] = verification
+    coerced_output["verification_passed"] = passed
+    coerced_output["failure_stage"] = "" if passed else spec["failure_stage"]
+    return coerced_output, cast(dict[str, Any], result), passed
+
+
+def _build_aggregate_verification(
+    result: dict[str, Any],
+    *,
+    spec: VerificationStageSpec,
+) -> dict[str, Any]:
+    passed = bool(result.get("passed", False))
+    verification = {
+        "passed": passed,
+        "verifier_name": spec["verifier_name"],
+        "summary": _normalize_string(result.get("summary")) or ("Verification passed." if passed else "Verification failed."),
+        "error_family": result.get("error_family"),
+        "error_code": result.get("error_code"),
+        "severity": _normalize_string(result.get("severity")) or ("low" if passed else "high"),
+        "field_path": result.get("field_path"),
+        "evidence": list(result.get("evidence", [])) if isinstance(result.get("evidence"), list) else [],
+        "expected": dict(result.get("expected", {})) if isinstance(result.get("expected"), dict) else {},
+        "actual": dict(result.get("actual", {})) if isinstance(result.get("actual"), dict) else {},
+        "fixer_brief": dict(result.get("fixer_brief", {})) if isinstance(result.get("fixer_brief"), dict) else {},
+        "confidence": result.get("confidence", 0.0),
+        "warnings": list(result.get("warnings", [])) if isinstance(result.get("warnings"), list) else [],
+        "error": bool(result.get("error", False)),
+        "missing_requirements": list(result.get("missing_requirements", []))
+        if isinstance(result.get("missing_requirements"), list)
+        else [],
+    }
+    if not verification["missing_requirements"] and not passed:
         missing = verification["fixer_brief"].get("must_change") if isinstance(verification["fixer_brief"], dict) else []
         if isinstance(missing, list) and missing:
             verification["missing_requirements"] = [str(item).strip() for item in missing if str(item).strip()]
@@ -311,10 +345,21 @@ def _coerce_verifier_output(
             verification["missing_requirements"] = [verification["summary"]]
     elif passed:
         verification["missing_requirements"] = []
-    coerced_output["verification"] = verification
-    coerced_output["verification_passed"] = passed
-    coerced_output["failure_stage"] = "" if passed else spec["failure_stage"]
-    return coerced_output, cast(dict[str, Any], result), passed
+    return verification
+
+
+def _find_first_blocking_stage(
+    stage_results: dict[str, dict[str, Any]],
+) -> tuple[VerificationStageSpec | None, dict[str, Any]]:
+    for stage_spec in _STAGE_SPECS:
+        stage_result = stage_results.get(stage_spec["verifier_name"])
+        if (
+            isinstance(stage_result, dict)
+            and not bool(stage_result.get("passed", False))
+            and not bool(stage_result.get("resolved_by_fixer", False))
+        ):
+            return _copy_stage_spec(stage_spec), dict(stage_result)
+    return None, {}
 
 
 def _wrap_verifier_node(
@@ -346,13 +391,23 @@ def _wrap_verifier_node(
         else:
             previous_fix_attempts = _normalize_previous_fix_attempts(state.get("previous_fix_attempts"))
 
+        blocking_spec, blocking_result = _find_first_blocking_stage(stage_results)
+        aggregate_verification = dict(coerced_output["verification"])
+        aggregate_passed = blocking_spec is None
+        if blocking_spec is not None and blocking_spec["verifier_name"] != spec["verifier_name"]:
+            aggregate_verification = _build_aggregate_verification(blocking_result, spec=blocking_spec)
+        blocking_failure_stage = blocking_spec["failure_stage"] if blocking_spec is not None else ""
+
         coerced_output.update(
             {
+                "verification": aggregate_verification,
+                "verification_passed": aggregate_passed,
                 "previous_fix_attempts": previous_fix_attempts,
                 "verification_chain_current_verifier": spec["verifier_name"],
                 "verification_chain_current_node": spec["node_name"],
                 "verification_chain_current_index": spec["index"],
-                "verification_chain_current_failure_stage": spec["failure_stage"],
+                "verification_chain_current_stage_passed": passed,
+                "verification_chain_current_failure_stage": blocking_failure_stage,
                 "verification_chain_next_verifier": next_spec["verifier_name"] if next_spec is not None else "",
                 "verification_chain_next_node": next_spec["node_name"] if next_spec is not None else "",
                 "verification_chain_last_transition": "verifier_pass" if passed else "verifier_fail",
@@ -362,6 +417,7 @@ def _wrap_verifier_node(
                 "verification_chain_stage_fix_limits": get_verification_stage_fix_limits(state),
                 "verification_chain_stage_results": stage_results,
                 "verification_chain_history": history,
+                "failure_stage": blocking_failure_stage,
             }
         )
         return coerced_output

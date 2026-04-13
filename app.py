@@ -1503,7 +1503,12 @@ class AppRuntime:
             response_type=result.get("response_type", ""),
             save_success=result.get("save_success", False),
             validation_passed=result.get("validation_passed", False),
-            verification_passed=bool(result.get("verification", {}).get("passed", False)),
+            verification_passed=bool(
+                result.get(
+                    "verification_passed",
+                    bool(result.get("verification", {}).get("passed", False)),
+                )
+            ),
         )
 
         # Update state from pipeline result

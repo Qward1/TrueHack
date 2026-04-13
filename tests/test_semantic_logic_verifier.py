@@ -175,6 +175,27 @@ class TestSemanticLogicVerifierAgent(unittest.TestCase):
         self.assertEqual(result["error_code"], "boolean_operator_mismatch")
         self.assertEqual(llm.call_count, 0)
 
+    def test_non_boolean_task_does_not_default_to_and_mismatch(self) -> None:
+        llm = StubLLM(response={"passed": True, "summary": "OK"})
+        agent = SemanticLogicVerifierAgent(llm)
+        result = asyncio.run(
+            agent.verify(
+                {
+                    "task": "Convert recallTime into unix time.",
+                    "source_field_path": "wf.initVariables.recallTime",
+                    "selected_operation": "llm",
+                    "code": (
+                        "local baseText, timezone_text = isoDate:match(\"^(%d+%-%d+%-%d+T%d+:%d+:%d+)(Z|[+-]%d+:%d+)$\")\n"
+                        "if not baseText or not timezone_text then\n"
+                        "    return nil\n"
+                        "end\n"
+                    ),
+                }
+            )
+        )
+        self.assertTrue(result["passed"])
+        self.assertEqual(llm.call_count, 1)
+
     def test_verify_calls_llm_when_no_evidence_or_local_blocker(self) -> None:
         llm = StubLLM(
             response={

@@ -17,7 +17,6 @@ from src.tools.lua_tools import (
     LOWCODE_LUA_VERSION,
     LOWCODE_RESPONSE_FORMAT_REQUIREMENT,
     async_run_diagnostics,
-    async_verify_requirements,
     compile_lowcode_request,
     extract_function_names,
     format_lowcode_json_payload,
@@ -43,8 +42,6 @@ _AGENT_GENERATE_CODE = "CodeGenerator"
 _AGENT_REFINE_CODE = "CodeRefiner"
 _AGENT_VALIDATE_CODE = "CodeValidator"
 _AGENT_FIX_VALIDATION_CODE = "ValidationFixer"
-_AGENT_FIX_VERIFICATION_CODE = "VerificationFixer"
-_AGENT_VERIFY_REQUIREMENTS = "RequirementsVerifier"
 _AGENT_SAVE_CODE = "CodeSaver"
 _AGENT_EXPLAIN = "SolutionExplainer"
 _AGENT_ANSWER = "QuestionAnswerer"
@@ -122,18 +119,6 @@ _FIX_VALIDATION_SYSTEM = (
     "Repair exactly the failing area identified in the error analysis. "
     "Preserve all working logic and structure. "
     "Do not convert the script into a console app.\n\n"
-    f"{LOWCODE_RESPONSE_FORMAT_REQUIREMENT}"
-)
-
-_FIX_VERIFICATION_SYSTEM = (
-    f"You fix {LOWCODE_LUA_VERSION} workflow scripts that fail requirement verification. "
-    "You receive the broken script, a verification summary, and a list of unmet requirements. "
-    "Return the corrected script.\n"
-    f"{LOWCODE_CONTRACT_TEXT}"
-    "Implement the missing or incorrect logic so every listed requirement is satisfied. "
-    "Do not change parts of the script that already work correctly. "
-    "Pay close attention to the real data types and shapes used by the workflow values. "
-    "If the task, workflow anchor, verification summary, or workflow context indicates array/object/scalar expectations, requested item keys, or semantic expectations, preserve and enforce those type constraints explicitly in the fixed script.\n\n"
     f"{LOWCODE_RESPONSE_FORMAT_REQUIREMENT}"
 )
 
@@ -403,117 +388,6 @@ def _compact_json_for_prompt(value: object, limit: int = 4000) -> str:
     if len(rendered) <= limit:
         return rendered
     return rendered[: limit - 3].rstrip() + "..."
-
-
-def _build_verification_extra_context(
-    compiled_request: dict[str, Any],
-    diagnostics: dict[str, Any],
-) -> str:
-    if not isinstance(compiled_request, dict):
-        compiled_request = {}
-    if not isinstance(diagnostics, dict):
-        diagnostics = {}
-
-    sections: list[str] = []
-    planner_result = compiled_request.get("planner_result") or {}
-
-    selected_type = str(compiled_request.get("selected_primary_type", "") or "").strip()
-    semantic_expectations = [
-        str(item).strip()
-        for item in compiled_request.get("semantic_expectations", [])
-        if str(item).strip()
-    ]
-    requested_item_keys = [
-        str(key).strip()
-        for key in compiled_request.get("requested_item_keys", [])
-        if str(key).strip()
-    ]
-    verifier_instructions: list[str] = []
-    selected_operation = str(compiled_request.get("selected_operation", "") or "").strip().lower()
-    if selected_operation == "filter":
-        verifier_instructions.append(
-            "This is a filter/select task: every returned item must satisfy the requested condition."
-        )
-        verifier_instructions.append(
-            "For 'has value' / 'non-empty' conditions, treat nil, empty strings, and whitespace-only strings as empty values."
-        )
-        verifier_instructions.append(
-            "If any returned item violates the requested filter rule, set passed=false and name the violating item by identifiers like id, SKU, email, or name when available."
-        )
-    if requested_item_keys:
-        verifier_instructions.append(
-            "Relevant workflow item fields to inspect: " + ", ".join(requested_item_keys)
-        )
-    if selected_type:
-        verifier_instructions.append(
-            "Treat this workflow path type hint as mandatory during verification: "
-            + selected_type
-        )
-    if semantic_expectations:
-        verifier_instructions.append(
-            "Treat these semantic/type expectations as mandatory during verification: "
-            + ", ".join(semantic_expectations)
-        )
-    if selected_type or semantic_expectations or requested_item_keys:
-        verifier_instructions.append(
-            "Pay extra attention to whether the code and the observed runtime/workflow-state result preserve the required data types and shapes."
-        )
-    if verifier_instructions:
-        sections.append("Verification instructions:\n- " + "\n- ".join(verifier_instructions))
-
-    parsed_context = compiled_request.get("parsed_context")
-    if compiled_request.get("has_parseable_context") and parsed_context is not None:
-        sections.append(
-            "Parsed workflow context used during validation:\n"
-            + _compact_json_for_prompt(parsed_context)
-        )
-
-    workflow_state = diagnostics.get("workflow_state")
-    selected_path = str(compiled_request.get("selected_primary_path", "") or "").strip()
-    if not selected_path and isinstance(planner_result, dict):
-        identified_paths = [
-            str(path).strip()
-            for path in planner_result.get("identified_workflow_paths", []) or []
-            if str(path).strip()
-        ]
-        if identified_paths:
-            selected_path = identified_paths[0]
-    if workflow_state is not None:
-        if (
-            compiled_request.get("has_parseable_context")
-            and parsed_context is not None
-            and not _workflow_snapshots_equivalent(parsed_context, workflow_state)
-        ):
-            sections.append(
-                "Original workflow state before execution:\n"
-                + _compact_json_for_prompt(parsed_context)
-            )
-        if compiled_request.get("has_parseable_context") and parsed_context is not None and selected_path:
-            original_found, original_value = _resolve_workflow_path_value(parsed_context, selected_path)
-            if original_found:
-                sections.append(
-                    f"Original workflow value at {selected_path} before execution:\n"
-                    + _compact_json_for_prompt(original_value)
-                )
-        sections.append(
-            "Updated workflow state after execution:\n"
-            + _compact_json_for_prompt(workflow_state)
-        )
-        if selected_path:
-            found, selected_value = _resolve_workflow_path_value(workflow_state, selected_path)
-            if found:
-                sections.append(
-                    f"Updated workflow value at {selected_path} after execution:\n"
-                    + _compact_json_for_prompt(selected_value)
-                )
-        sections.append(
-            "Compare the original workflow state before execution with the updated workflow state after execution. "
-            "Judge whether the observed before/after change matches the user request. "
-            "The script may satisfy the task either by returning a value or by updating wf.vars / wf.initVariables. "
-            "If the return value is null, verify against the workflow-state difference above."
-        )
-
-    return "\n\n".join(section for section in sections if section.strip())
 
 
 def _build_clarification_response(compiled_request: dict[str, Any]) -> str:
@@ -1002,41 +876,6 @@ def _build_validator_hint_prompt(
         "Identify the concrete root cause in the code, explain why it breaks on this validation context, "
         "and describe the exact code-level repair path."
     )
-
-
-def _build_fix_verification_prompt(
-    *,
-    code: str,
-    verification_summary: str,
-    missing_requirements: list,
-    runtime_result: str,
-    workflow_state: str,
-    compiled_request: dict[str, Any],
-) -> str:
-    """Prompt for fixing logic/requirement failures (verification failures)."""
-    task_text = str(compiled_request.get("task_text", "") or "").strip()
-    provided_context = str(compiled_request.get("raw_context", "") or "").strip()
-    if len(provided_context) > 600:
-        provided_context = provided_context[:600].rstrip() + "..."
-    prompt_context = _format_prompt_workflow_context(compiled_request)
-    summary_text = str(verification_summary or "").strip()
-    missing_str = "\n".join(f"- {r}" for r in (missing_requirements or []) if str(r).strip())
-    sections = [
-        f"Task:\n{task_text}" if task_text else "",
-        f"Original workflow context:\n{provided_context}" if provided_context else "",
-        f"Workflow anchor:\n{prompt_context}" if prompt_context else "",
-        f"Verification summary:\n{summary_text}" if summary_text else "",
-        f"Unmet requirements:\n{missing_str}" if missing_str else "",
-        f"Runtime result during validation:\n{runtime_result}" if runtime_result else "",
-        f"Updated workflow state after execution:\n{workflow_state}" if workflow_state else "",
-        f"Current code with line numbers:\n{_format_numbered_code_block(code)}",
-        "Fix the logic so all listed requirements are satisfied.",
-        "Do not change parts of the script that already work correctly.",
-        "Ensure the workflow paths used match the task and the workflow anchor.",
-        _PROMPT_STYLE_RULES,
-        LOWCODE_RESPONSE_FORMAT_REQUIREMENT,
-    ]
-    return _join_prompt_sections(*sections)
 
 
 def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
@@ -1650,6 +1489,8 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         return {
             "generated_code": code,
             "validation_passed": passed,
+            "verification": {},
+            "verification_passed": passed,
             "failure_stage": "" if passed else "validation",
             "diagnostics": diagnostics,
         }
@@ -1789,225 +1630,6 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             "explanation": {},
             "suggested_changes": [],
             "clarifying_questions": [],
-        }
-
-    async def fix_verification_code(state: PipelineState) -> dict:
-        """Fix logic/requirements failures (called after verify_requirements failure)."""
-        code = _normalize_runtime_candidate(state.get("generated_code", ""))
-        verification = state.get("verification", {})
-        diagnostics = state.get("diagnostics", {})
-        fix_iter = state.get("fix_verification_iterations", 0)
-        compiled_request = state.get("compiled_request", {}) if isinstance(state.get("compiled_request"), dict) else {}
-
-        missing_requirements = verification.get("missing_requirements", []) if isinstance(verification, dict) else []
-        verification_summary = str(verification.get("summary", "") or "").strip() if isinstance(verification, dict) else ""
-        runtime_result = str(diagnostics.get("result_preview", "") or "").strip()
-        workflow_state_value = diagnostics.get("workflow_state")
-        workflow_state = ""
-        if workflow_state_value is not None:
-            workflow_state = _compact_json_for_prompt(workflow_state_value)
-
-        logger.info(
-            f"[{_AGENT_FIX_VERIFICATION_CODE}] started",
-            iteration=fix_iter + 1,
-            missing_count=len(missing_requirements),
-            code_len=len(code),
-        )
-
-        prompt = _build_fix_verification_prompt(
-            code=code,
-            verification_summary=verification_summary,
-            missing_requirements=missing_requirements,
-            runtime_result=runtime_result,
-            workflow_state=workflow_state,
-            compiled_request=compiled_request,
-        )
-        messages = [
-            {"role": "system", "content": _FIX_VERIFICATION_SYSTEM},
-            {"role": "user", "content": prompt},
-        ]
-        logger.info(f"[{_AGENT_FIX_VERIFICATION_CODE}/llm.chat] calling", temperature=0.0)
-        raw = await llm.chat(
-            messages,
-            temperature=0.05,
-            agent_name=_AGENT_FIX_VERIFICATION_CODE,
-        )
-        fixed_analysis = validate_lowcode_llm_output(raw)
-        fixed = fixed_analysis["normalized"]
-        if not fixed and is_truncated_lowcode_response(raw):
-            continued = await _attempt_continuation(raw, _AGENT_FIX_VERIFICATION_CODE)
-            if continued:
-                cont_analysis = validate_lowcode_llm_output(continued)
-                if cont_analysis["normalized"]:
-                    fixed = cont_analysis["normalized"]
-        if not fixed:
-            fixed = code
-        logger.info(
-            f"[{_AGENT_FIX_VERIFICATION_CODE}/llm.chat] done",
-            raw_len=len(raw),
-            fixed_len=len(fixed),
-            valid=fixed_analysis["valid"],
-        )
-
-        # Internal retry if the candidate is empty or unchanged.
-        if not fixed.strip() or _code_signature(fixed) == _code_signature(code):
-            note = (
-                "The previous fix attempt returned unchanged code."
-                if fixed.strip()
-                else "The previous fix attempt returned empty code."
-            )
-            retry_prompt = _build_fix_verification_prompt(
-                code=code,
-                verification_summary=verification_summary,
-                missing_requirements=missing_requirements + [note],
-                runtime_result=runtime_result,
-                workflow_state=workflow_state,
-                compiled_request=compiled_request,
-            )
-            logger.info(f"[{_AGENT_FIX_VERIFICATION_CODE}/llm.chat] retry calling", temperature=0.0)
-            retry_raw = await llm.chat(
-                [{"role": "system", "content": _FIX_VERIFICATION_SYSTEM}, {"role": "user", "content": retry_prompt}],
-                temperature=0.0,
-                agent_name=_AGENT_FIX_VERIFICATION_CODE,
-            )
-            retry_fixed = validate_lowcode_llm_output(retry_raw)["normalized"]
-            if retry_fixed:
-                fixed = retry_fixed
-
-        logger.info(f"[{_AGENT_FIX_VERIFICATION_CODE}] completed", iteration=fix_iter + 1, code_len=len(fixed))
-        return {
-            "generated_code": fixed,
-            "compiled_request": compiled_request,
-            "fix_verification_iterations": fix_iter + 1,
-            "failure_stage": "",
-            "validation_passed": True,
-            "verification_passed": False,
-            "save_success": False,
-            "save_skipped": False,
-            "save_skip_reason": "",
-            "save_error": "",
-            "saved_to": "",
-            "saved_jsonstring_to": "",
-            "explanation": {},
-            "suggested_changes": [],
-            "clarifying_questions": [],
-        }
-
-    async def verify_requirements(state: PipelineState) -> dict:
-        code = state.get("generated_code", "")
-        diagnostics = state.get("diagnostics", {})
-        compiled_request = state.get("compiled_request", {})
-        # The verifier must never see raw user_input/base_prompt. Use planner-processed
-        # task_text via compiled_request["verification_prompt"]; fall back only to other
-        # compiled_request fields (never to state["user_input"]).
-        verification_prompt = ""
-        if isinstance(compiled_request, dict):
-            verification_prompt = str(compiled_request.get("verification_prompt", "") or "").strip()
-            if not verification_prompt:
-                verification_prompt = str(compiled_request.get("task_text", "") or "").strip()
-            if not verification_prompt:
-                verification_prompt = str(compiled_request.get("original_task", "") or "").strip()
-        verification_extra_context = _build_verification_extra_context(
-            compiled_request if isinstance(compiled_request, dict) else {},
-            diagnostics if isinstance(diagnostics, dict) else {},
-        )
-
-        logger.info(
-            f"[{_AGENT_VERIFY_REQUIREMENTS}] started",
-            code_len=len(code),
-            verification_prompt_len=len(verification_prompt),
-            selected_operation=compiled_request.get("selected_operation", "") if isinstance(compiled_request, dict) else "",
-            selected_primary_path=compiled_request.get("selected_primary_path", "") if isinstance(compiled_request, dict) else "",
-        )
-
-        try:
-            logger.info(
-                f"[{_AGENT_VERIFY_REQUIREMENTS}/async_verify_requirements] calling",
-                prompt_len=len(verification_prompt),
-                has_run_output=bool(diagnostics.get("run_output", "")),
-                has_runtime_result=bool(isinstance(diagnostics, dict) and diagnostics.get("result_preview", "")),
-            )
-            verification = await async_verify_requirements(
-                llm,
-                prompt=verification_prompt,
-                code=code,
-                run_output=diagnostics.get("run_output", ""),
-                extra_context=verification_extra_context,
-            )
-            logger.info(
-                f"[{_AGENT_VERIFY_REQUIREMENTS}/async_verify_requirements] done",
-                passed=verification.get("passed"),
-                missing=verification.get("missing_requirements", []),
-            )
-            verification["error"] = False
-        except Exception as exc:
-            logger.warning(
-                f"[{_AGENT_VERIFY_REQUIREMENTS}/async_verify_requirements] failed",
-                error=str(exc),
-            )
-            verification = {
-                "passed": False,
-                "summary": f"LLM verification unavailable: {exc}",
-                "missing_requirements": ["Semantic verification unavailable or invalid response."],
-                "warnings": ["verification_unavailable"],
-                "error": True,
-            }
-
-        llm_passed = bool(verification.get("passed"))
-        combined_missing = [
-            str(item).strip()
-            for item in verification.get("missing_requirements", [])
-            if str(item).strip()
-        ]
-        combined_warnings = [
-            str(item).strip()
-            for item in verification.get("warnings", [])
-            if str(item).strip()
-        ]
-        llm_summary = str(verification.get("summary", "")).strip()
-        compiled_request_summary = ""
-        if isinstance(compiled_request, dict) and compiled_request:
-            compiled_request_summary = (
-                "Compiled request: "
-                f"parseable_context={bool(compiled_request.get('has_parseable_context', False))}, "
-                f"selected_operation={compiled_request.get('selected_operation', 'llm')}, "
-                f"selected_path={compiled_request.get('selected_primary_path', 'none') or 'none'}, "
-                f"needs_clarification={bool(compiled_request.get('needs_clarification', False))}"
-            )
-        summary_parts = [part for part in (compiled_request_summary, llm_summary) if part]
-        combined_summary = " ".join(part for part in summary_parts if part).strip()
-        passed = not verification.get("error") and llm_passed and not combined_missing
-        verification = {
-            **verification,
-            "passed": passed,
-            "summary": combined_summary or llm_summary or "Verification completed.",
-            "missing_requirements": combined_missing,
-            "warnings": combined_warnings,
-            "selected_operation": compiled_request.get("selected_operation", "") if isinstance(compiled_request, dict) else "",
-            "selected_primary_path": compiled_request.get("selected_primary_path", "") if isinstance(compiled_request, dict) else "",
-            "needs_clarification": compiled_request.get("needs_clarification", False) if isinstance(compiled_request, dict) else False,
-            "has_parseable_context": compiled_request.get("has_parseable_context", False) if isinstance(compiled_request, dict) else False,
-        }
-        diagnostics_updated = dict(diagnostics)
-        diagnostics_updated["verification_summary"] = verification.get("summary", "")
-        diagnostics_updated["verification_checked"] = not verification.get("error", False)
-        diagnostics_updated["verification_passed"] = passed
-        diagnostics_updated["selected_operation"] = verification.get("selected_operation", "")
-        diagnostics_updated["selected_primary_path"] = verification.get("selected_primary_path", "")
-        diagnostics_updated["has_parseable_context"] = verification.get("has_parseable_context", False)
-        diagnostics_updated["failure_kind"] = "requirements" if not passed else diagnostics.get("failure_kind", "")
-
-        logger.info(
-            f"[{_AGENT_VERIFY_REQUIREMENTS}] completed",
-            passed=passed,
-            failure_stage="" if passed else "requirements",
-        )
-        return {
-            "verification": verification,
-            "verification_passed": passed,
-            "compiled_request": compiled_request,
-            "failure_stage": "" if passed else "requirements",
-            "diagnostics": diagnostics_updated,
         }
 
     async def save_code(state: PipelineState) -> dict:
@@ -2373,8 +1995,6 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         "refine_code": refine_code,
         "validate_code": validate_code,
         "fix_validation_code": fix_validation_code,
-        "fix_verification_code": fix_verification_code,
-        "verify_requirements": verify_requirements,
         "save_code": save_code,
         "explain_solution": explain_solution,
         "answer_question": answer_question,

@@ -7,7 +7,7 @@
 `Верни последний email из wf.vars.emails`
 
 ### Expected pipeline
-`resolve_target -> route_intent(create) -> generate -> validate -> verify -> save -> explain_solution -> respond`
+`resolve_target -> route_intent(create) -> generate -> validate -> verify_contract -> verify_shape_type -> verify_semantic_logic -> verify_runtime_state -> verify_robustness -> save -> explain_solution -> respond`
 
 ### Pass criteria
 - новый file target не создается
@@ -61,7 +61,7 @@
 `Верни wf.vars.total + 1, но в коде есть ошибка обращения к полю`
 
 ### Pass criteria
-- при провале runtime-валидации через `lua` запускается минимум одна итерация `fix_code`
+- при провале runtime-валидации через `lua` запускается минимум одна итерация `fix_validation_code`
 - после исчерпания лимита итераций файл не сохраняется
 
 ## 6. Verification failure -> fix loop
@@ -70,7 +70,7 @@
 
 ### Pass criteria
 - если verification вернул недостающие требования, pipeline уходит в fix-loop
-- после фикса снова идут validate -> verify -> save
+- после фикса снова идут validate -> modular verification chain -> save
 
 ## 6a. LowCode init variables are mocked in validation
 ### Prompt
@@ -163,7 +163,7 @@ return emails[#emails]
 
 ### Pass criteria
 - semantic verification reports that the solution ignores the provided workflow structure;
-- pipeline enters `fix_code` instead of saving immediately;
+- pipeline enters `fix_verification_issue` instead of saving immediately;
 - the corrected result switches to direct `wf.vars` usage before save.
 
 ## 13. Remove-key task rejects plain direct return
@@ -177,7 +177,7 @@ return wf.vars.RESTbody.result
 
 ### Pass criteria
 - semantic verification does not accept the code just because the path is correct;
-- pipeline enters `fix_code` instead of saving immediately;
+- pipeline enters `fix_verification_issue` instead of saving immediately;
 - corrected code explicitly transforms object items before return and references the requested keys.
 
 ## 14. Explicit workflow path mismatch blocks save
@@ -201,7 +201,7 @@ return recallTime
 ### Pass criteria
 - compiler resolves `wf.vars.cart.items` as the primary workflow path;
 - model generation returns a valid workflow script for array count;
-- validate -> verify -> save still run normally after generation.
+- validate -> modular verification chain -> save still run normally after generation.
 
 ## 16. Multi-step workflow task is allowed to stay multi-line
 ### Prompt
@@ -210,7 +210,7 @@ return recallTime
 ### Pass criteria
 - generation is allowed to produce a multi-line workflow script with conditions/loops/helpers;
 - prompt steering does not collapse the task into a one-line `return`;
-- validate -> verify -> save accepts the longer script when it follows the workflow contract.
+- validate -> modular verification chain -> save accepts the longer script when it follows the workflow contract.
 
 ## 16a. Array normalization rejects table-only shortcut logic
 ### Prompt
@@ -231,7 +231,7 @@ return wf.vars.contacts
 - `next(x)` / empty-vs-non-empty tests are not accepted as a substitute for object-vs-array shape detection;
 - simply marking the original workflow object/scalar as an array via `_utils.array.markAsArray(source)` is rejected;
 - `_utils.array.new(...)` with inline arguments is rejected;
-- pipeline enters `fix_code` instead of saving immediately;
+- pipeline enters `fix_verification_issue` instead of saving immediately;
 - corrected code distinguishes object-like vs array-like tables and creates new arrays with `_utils.array.new()` + `_utils.array.markAsArray(arr)`.
 
 ## 17. Ambiguous path selection asks before generation
@@ -250,7 +250,7 @@ return wf.vars.contacts
 
 ### Pass criteria
 - first-step intent is normalized to `create`, even if the raw LLM classifier suggests `change`;
-- pipeline goes directly through generate -> validate -> verify -> save;
+- pipeline goes directly through generate -> validate -> modular verification chain -> save;
 - no refine fallback warning is emitted for the normal no-code path.
 
 ## 18a. Pasted Lua enables `change` without prior chat code
@@ -301,7 +301,7 @@ return wf.vars.RESTbody.result
 ### Pass criteria
 - compiler infers `wf.initVariables.recallTime` as the expected workflow path even though the prompt does not contain the full path;
 - semantic verification rejects code that uses a different workflow path;
-- pipeline enters `fix_code` instead of saving the wrong script.
+- pipeline enters `fix_verification_issue` instead of saving the wrong script.
 
 ## 20. Runtime bad-argument diagnostics produce generic repair hints
 ### Prompt
@@ -310,7 +310,7 @@ Any workflow task where generated code triggers a Lua runtime error like `bad ar
 ### Pass criteria
 - validation returns failure with `failure_kind=runtime`;
 - diagnostics contain normalized fix hints about expected argument type and required conversion/validation;
-- `fix_code` prompt includes these hints together with raw runtime error;
+- `fix_validation_code` prompt includes these hints together with raw runtime error;
 - corrected code passes validation and save gate without hardcoding to one specific stdlib function.
 
 ## 21. Structured JSON envelope with embedded Lua is normalized before validation
@@ -327,7 +327,7 @@ json
 ### Pass criteria
 - normalizer extracts the embedded Lua body before validation;
 - runtime does not try to execute the surrounding JSON metadata as Lua;
-- validate -> verify -> save continue on the extracted script body.
+- validate -> modular verification chain -> save continue on the extracted script body.
 
 ## 21a. Fenced JSON envelope with embedded Lua is normalized before validation
 ### Simulated model output
@@ -347,8 +347,8 @@ json
 Shape-sensitive workflow task where the first fix response repeats the same `next(...)` / source-marking / table-only shortcut logic or otherwise stays materially unchanged.
 
 ### Pass criteria
-- `fix_code` does not accept the first repair attempt blindly;
-- if the first repair still repeats the same semantic requirement failures, `fix_code` performs one stricter internal retry;
+- `fix_validation_code` does not accept the first repair attempt blindly;
+- if the first repair still repeats the same validation failure, `fix_validation_code` performs one stricter internal retry;
 - the second attempt is the one returned to validation.
 
 ## 21d. Prompt format contract stays single and strict
@@ -377,7 +377,7 @@ Workflow task that updates `wf.vars.*` in place and does not `return` a value, f
 ### Pass criteria
 - validation harness serializes the updated workflow snapshot after execution;
 - verifier prompt includes the updated workflow state and the concrete selected workflow path value after execution;
-- requirement verification can fail or pass the mutation task based on the updated workflow data, not only on `null` direct result.
+- runtime/state-driven verification can fail or pass the mutation task based on the updated workflow data, not only on `null` direct result.
 
 ## 21f. Explainer string fields do not trigger generic fallback sections
 ### Prompt

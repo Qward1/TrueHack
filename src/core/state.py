@@ -56,6 +56,7 @@ class PipelineState(TypedDict):
     verification_chain_current_verifier: str
     verification_chain_current_node: str
     verification_chain_current_index: int
+    verification_chain_current_stage_passed: bool
     verification_chain_current_failure_stage: str
     verification_chain_next_verifier: str
     verification_chain_next_node: str
