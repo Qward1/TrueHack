@@ -32,7 +32,7 @@ services:
       APP_RUNTIME_DIR: /runtime
       APP_WORKSPACE: /workspace
     ports:
-      - "8765:8765"
+      - "8000:8000"
     volumes:
       - ./workspace:/workspace
       - ./runtime:/runtime

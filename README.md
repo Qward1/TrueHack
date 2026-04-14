@@ -73,7 +73,7 @@ python app.py --model truehack
 python app.py --model qwen2.5-coder:3b-instruct
 
 # Все параметры
-python app.py --host 127.0.0.1 --port 8765 --workspace C:\Work\LuaProjects --model qwen2.5-coder:7b-instruct --url http://127.0.0.1:11434/v1
+python app.py --host 127.0.0.1 --port 8000 --workspace C:\Work\LuaProjects --model qwen2.5-coder:7b-instruct --url http://127.0.0.1:11434/v1
 ```
 
 ### Docker Compose
@@ -86,7 +86,7 @@ python app.py --host 127.0.0.1 --port 8765 --workspace C:\Work\LuaProjects --mod
 - ждет готовности Ollama перед стартом UI;
 - проверяет, что все модели из `.env` уже есть в Ollama;
 - если какой-то модели нет, автоматически делает `pull`;
-- после этого запускает web UI на `http://127.0.0.1:8765`;
+- после этого запускает web UI на `http://127.0.0.1:8000`;
 - не монтирует весь исходный код в контейнер `app`, поэтому запуск не ломается из-за Windows `CRLF`.
 
 Подготовка:

@@ -35,6 +35,7 @@ DEFAULT_REQUEST_TIMEOUT = 600.0
 
 CHAT_DB_NAME = ".lua_console_chats.db"
 MAX_CHAT_TITLE_LENGTH = 72
+OPENAPI_SPEC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "openapi.yaml")
 AGENT_LABELS_RU = {
     "TaskPlanner": "Планировщик задачи",
     "IntentRouter": "Маршрутизатор интента",
@@ -381,7 +382,7 @@ HTML_PAGE = """<!doctype html>
       margin: 0 auto;
       padding: 10px 18px;
       display: grid;
-      grid-template-columns: minmax(340px, 0.82fr) minmax(0, 1.78fr);
+      grid-template-columns: minmax(244px, 0.58fr) minmax(0, 1.78fr);
       gap: 10px;
       height: 100vh;
       height: 100dvh;
@@ -1404,11 +1405,55 @@ HTML_PAGE = """<!doctype html>
 </html>
 """
 
+SWAGGER_PAGE = """<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LocalScriptLua API Docs</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #f7f1e7;
+    }
+    #swagger-ui {
+      height: 100%;
+    }
+    .topbar {
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>
+    window.ui = SwaggerUIBundle({
+      url: "/openapi.yaml",
+      dom_id: "#swagger-ui",
+      deepLinking: true,
+      displayRequestDuration: true,
+      defaultModelsExpandDepth: 2,
+      defaultModelExpandDepth: 2,
+      presets: [SwaggerUIBundle.presets.apis],
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+def load_openapi_spec() -> str:
+    with open(OPENAPI_SPEC_PATH, "r", encoding="utf-8") as handle:
+        return handle.read()
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="LocalScriptLua — canonical web runtime.")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind the local web UI.")
-    parser.add_argument("--port", type=int, default=8765, help="Port for the local web UI.")
+    parser.add_argument("--port", type=int, default=8000, help="Port for the local web UI.")
     parser.add_argument("--no-browser", action="store_true", help="Do not auto-open the browser.")
     parser.add_argument("--console-chat", action="store_true", help="Run interactive console chat instead of the web UI.")
     parser.add_argument("--generate", default="", help="Run a one-shot generate request in console mode and exit.")
@@ -2013,9 +2058,29 @@ class AppRuntime:
 
 def make_handler(runtime: AppRuntime):
     class Handler(BaseHTTPRequestHandler):
+        def _send_cors_headers(self) -> None:
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept")
+
+        def do_OPTIONS(self) -> None:
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self._send_cors_headers()
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def do_GET(self) -> None:
             if self.path == "/":
                 self.respond_html(HTML_PAGE)
+                return
+            if self.path in {"/swagger", "/swagger/"}:
+                self.respond_html(SWAGGER_PAGE)
+                return
+            if self.path == "/openapi.yaml":
+                try:
+                    self.respond_text(load_openapi_spec(), "application/yaml; charset=utf-8")
+                except FileNotFoundError:
+                    self.send_error(HTTPStatus.NOT_FOUND, "OpenAPI spec not found")
                 return
             if self.path == "/api/state":
                 self.respond_json(runtime.build_full_payload())
@@ -2084,6 +2149,7 @@ def make_handler(runtime: AppRuntime):
         def respond_html(self, body: str) -> None:
             encoded = body.encode("utf-8")
             self.send_response(HTTPStatus.OK)
+            self._send_cors_headers()
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
@@ -2092,7 +2158,17 @@ def make_handler(runtime: AppRuntime):
         def respond_json(self, payload: dict) -> None:
             encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(HTTPStatus.OK)
+            self._send_cors_headers()
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def respond_text(self, body: str, content_type: str) -> None:
+            encoded = body.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self._send_cors_headers()
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
             self.wfile.write(encoded)
@@ -2114,7 +2190,7 @@ def _extract_latest_assistant_text(payload: dict) -> str:
 
 def run_console_chat(runtime: AppRuntime) -> int:
     print("LocalScriptLua — console chat")
-    print("Команды: /help, /retry, /code, /path, /status, /prompt")
+    print("Команды: /new, /help, /retry, /code, /path, /status, /prompt")
     print("Для выхода: /exit или /quit")
     while True:
         try:
