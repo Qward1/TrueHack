@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import unittest
 from pathlib import Path
@@ -14,10 +13,9 @@ from src.graph.nodes import _build_generation_prompt, _format_planner_section
 
 
 # System prompt prefixes used by various agents in the pipeline.
-PLANNER_SYSTEM_PREFIX = "You are a task analyst for a Lua workflow script generator."
+PLANNER_SYSTEM_PREFIX = "You are a task analyst for a LowCode Lua 5.5 workflow script generator."
 ROUTE_SYSTEM_PREFIX = "You are an intent classifier"
 EXPLAIN_SYSTEM_PREFIX = "You explain generated Lua code"
-VERIFY_SYSTEM_PREFIX = "You review whether a Lua solution fully satisfies the user's request."
 FIX_VALIDATION_SYSTEM_PREFIX = "You fix Lua 5.5 workflow scripts that fail during execution."
 VERIFIER_AGENT_NAMES = {
     "ContractVerifier",
@@ -26,6 +24,7 @@ VERIFIER_AGENT_NAMES = {
     "RuntimeStateVerifier",
     "RobustnessVerifier",
 }
+UNIVERSAL_FIXER_AGENT_NAME = "UniversalVerificationFixer"
 
 
 def _success_diagnostics() -> dict:
@@ -112,6 +111,39 @@ class IntegrationStubLLM:
                 "suggested_changes": [],
                 "clarifying_questions": [],
             }
+        if agent_name in VERIFIER_AGENT_NAMES:
+            return {
+                "verifier_name": agent_name,
+                "passed": True,
+                "error_family": None,
+                "error_code": None,
+                "severity": "low",
+                "summary": "ok",
+                "field_path": None,
+                "evidence": [],
+                "expected": {},
+                "actual": {},
+                "fixer_brief": {
+                    "goal": "",
+                    "must_change": [],
+                    "must_preserve": [],
+                    "forbidden_fixes": [],
+                    "suggested_patch": "",
+                    "patch_scope": "none",
+                },
+                "confidence": 0.99,
+            }
+        if agent_name == UNIVERSAL_FIXER_AGENT_NAME:
+            return {
+                "fixed": True,
+                "changed": False,
+                "applied_error_family": "",
+                "applied_error_code": "",
+                "applied_strategy": "noop",
+                "preserved_constraints": [],
+                "remaining_risks": [],
+                "fixed_lua_code": "lua{return wf.vars.value}lua",
+            }
         raise AssertionError(f"unexpected generate_json system: {system[:80]}")
 
     async def chat(
@@ -123,15 +155,8 @@ class IntegrationStubLLM:
         agent_name: str = "",
     ) -> str:
         system = str(messages[0].get("content", "")) if messages else ""
-        if system.startswith(FIX_VALIDATION_SYSTEM_PREFIX) or agent_name == "UniversalVerificationFixer":
+        if system.startswith(FIX_VALIDATION_SYSTEM_PREFIX):
             return self.generate_response
-        if system.startswith(VERIFY_SYSTEM_PREFIX) or agent_name in VERIFIER_AGENT_NAMES:
-            return json.dumps({
-                "passed": True,
-                "summary": "ok",
-                "missing_requirements": [],
-                "warnings": [],
-            })
         raise AssertionError(f"unexpected chat system: {system[:80]}")
 
 
@@ -139,7 +164,13 @@ class PlannerEnabledPipelineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_path = Path("tests_tmp_planner_int")
         self.tmp_path.mkdir(exist_ok=True)
-        self._env_patch = patch.dict(os.environ, {"PLANNER_ENABLED": "true"})
+        self._env_patch = patch.dict(
+            os.environ,
+            {
+                "PLANNER_ENABLED": "true",
+                "RAG_TEMPLATES_ENABLED": "false",
+            },
+        )
         self._env_patch.start()
 
     def tearDown(self) -> None:
@@ -253,6 +284,52 @@ class PlannerEnabledPipelineTests(unittest.TestCase):
         # Generation should run despite planner wanting more clarification.
         self.assertGreaterEqual(llm.generate_calls, 1)
 
+    def test_active_code_clarification_answer_refines_existing_code(self) -> None:
+        llm = IntegrationStubLLM(planner_response={
+            "reformulated_task": "Modify the current Lua script so it returns only VIP contacts from wf.vars.contacts.",
+            "identified_workflow_paths": ["wf.vars.contacts"],
+            "target_operation": "filter",
+            "expected_result_action": "return",
+            "followup_action": "refine_existing_code",
+            "needs_clarification": False,
+            "clarification_questions": [],
+            "confidence": 0.92,
+        })
+        result = self._run_engine(
+            llm,
+            user_input="только VIP-контакты",
+            current_code="return wf.vars.contacts",
+            base_prompt="Верни контакты из wf.vars.contacts",
+            active_clarifying_questions=["Нужно вернуть все контакты или только VIP?"],
+        )
+        self.assertEqual(result["intent"], "change")
+        self.assertEqual(result["change_requests"], ["только VIP-контакты"])
+        self.assertIn("Current code:", llm.last_generate_prompt)
+        self.assertIn("Change request:", llm.last_generate_prompt)
+
+    def test_active_code_clarification_new_task_starts_fresh_generation(self) -> None:
+        llm = IntegrationStubLLM(planner_response={
+            "reformulated_task": "Return the last order from wf.vars.orders.",
+            "identified_workflow_paths": ["wf.vars.orders"],
+            "target_operation": "extract",
+            "expected_result_action": "return",
+            "followup_action": "start_new_generation",
+            "needs_clarification": False,
+            "clarification_questions": [],
+            "confidence": 0.94,
+        })
+        result = self._run_engine(
+            llm,
+            user_input="сделай новый скрипт для последнего заказа из wf.vars.orders",
+            current_code="return wf.vars.contacts",
+            base_prompt="Верни контакты из wf.vars.contacts",
+            active_clarifying_questions=["Нужно вернуть все контакты или только VIP?"],
+        )
+        self.assertEqual(result["intent"], "create")
+        self.assertEqual(result["change_requests"], [])
+        self.assertNotIn("Current code:", llm.last_generate_prompt)
+        self.assertIn("Task:\nReturn the last order from wf.vars.orders.", llm.last_generate_prompt)
+
 
 class PlannerPromptIntegrationTests(unittest.TestCase):
     def test_format_planner_section_renders_fields(self) -> None:
@@ -273,28 +350,35 @@ class PlannerPromptIntegrationTests(unittest.TestCase):
         self.assertEqual(_format_planner_section({}), "")
         self.assertEqual(_format_planner_section({"planner_result": {}}), "")
 
-    def test_generation_prompt_prefers_workflow_anchor_over_planner_section(self) -> None:
+    def test_generation_prompt_includes_planner_section(self) -> None:
         compiled_request = {
-            "task_text": "Return wf.vars.emails[#wf.vars.emails]",
+            "task_text": "Get last email",
             "raw_context": "",
             "clarification_text": "",
-            "selected_primary_path": "wf.vars.emails",
             "planner_result": {
                 "reformulated_task": "Return wf.vars.emails[#wf.vars.emails]",
                 "identified_workflow_paths": ["wf.vars.emails"],
+                "target_operation": "extract",
             },
         }
         prompt = _build_generation_prompt(compiled_request)
-        self.assertIn("Workflow anchor:", prompt)
+        self.assertIn("Planner analysis:", prompt)
+        self.assertIn("- reformulated_task: Return wf.vars.emails[#wf.vars.emails]", prompt)
+        self.assertIn("- target_operation: extract", prompt)
         self.assertIn("wf.vars.emails", prompt)
-        self.assertNotIn("Planner analysis:", prompt)
 
 
 class PlannerDisabledPipelineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_path = Path("tests_tmp_planner_disabled")
         self.tmp_path.mkdir(exist_ok=True)
-        self._env_patch = patch.dict(os.environ, {"PLANNER_ENABLED": "false"})
+        self._env_patch = patch.dict(
+            os.environ,
+            {
+                "PLANNER_ENABLED": "false",
+                "RAG_TEMPLATES_ENABLED": "false",
+            },
+        )
         self._env_patch.start()
 
     def tearDown(self) -> None:

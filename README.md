@@ -89,6 +89,7 @@ python app.py --host 127.0.0.1 --port 8765 --workspace C:\Work\LuaProjects --mod
 - `OLLAMA_MODEL_INTENT_ROUTER`
 - `OLLAMA_MODEL_TASK_PLANNER`
 - `OLLAMA_MODEL_CODE_GENERATOR`
+- `OLLAMA_MODEL_TEMPLATE_SELECTOR`
 - `OLLAMA_MODEL_CODE_REFINER`
 - `OLLAMA_MODEL_VALIDATION_FIXER`
 - `OLLAMA_MODEL_CONTRACT_VERIFIER`
@@ -107,6 +108,20 @@ OLLAMA_MODEL=qwen2.5-coder:7b-instruct
 OLLAMA_MODEL_INTENT_ROUTER=qwen2.5-coder:3b-instruct
 OLLAMA_MODEL_SOLUTION_EXPLAINER=qwen2.5-coder:3b-instruct
 ```
+
+Опциональный template-RAG для `CodeGenerator`:
+- включается через `RAG_TEMPLATES_ENABLED=true`;
+- берёт шаблоны из локального `lua_rag_templates_kb.jsonl`;
+- сначала ищет top-k кандидатов, затем `TemplateSelector` выбирает один лучший шаблон;
+- в generation prompt попадает только compact Lua template block, а не весь retrieval text;
+- если planner выключен и `RAG_TEMPLATES_REQUIRE_PLANNER=true`, template-RAG не активируется.
+
+Настройки template-RAG:
+- `RAG_TEMPLATES_ENABLED`
+- `RAG_TEMPLATES_KB_PATH`
+- `RAG_TEMPLATES_TOP_K`
+- `RAG_TEMPLATES_REQUIRE_PLANNER`
+- `RAG_TEMPLATES_EMBED_MODEL`
 
 ## Как задавать путь для Lua
 
@@ -182,6 +197,13 @@ resolve_target -> route_intent -> generate/refine -> validate -> verify_contract
 - при failed verifier запускается `fix_verification_issue`;
 - затем pipeline повторяет нужную часть цикла проверок;
 - если лимит fix-итераций исчерпан, файл не сохраняется.
+
+TaskPlanner теперь работает как активный pre-generation агент:
+- анализирует задачу до compiler/generator;
+- может запрашивать уточнение и вести clarification follow-up;
+- в follow-up с активным кодом различает:
+  - ответ на уточняющий вопрос для `refine_existing_code`;
+  - новую логическую задачу для `start_new_generation`.
 
 ## Что видно в ответе
 - user-facing JSON payload, где значение поля содержит `lua{ ... }lua`;

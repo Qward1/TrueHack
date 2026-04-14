@@ -10,6 +10,7 @@ from typing import Any, Callable
 import structlog
 
 from src.core.llm import LLMProvider
+from src.core.logging_runtime import write_runtime_audit
 from src.core.state import PipelineState
 from src.tools.lua_tools import (
     LOWCODE_CONTRACT_TEXT,
@@ -27,6 +28,11 @@ from src.tools.lua_tools import (
     validate_lowcode_llm_output,
     analyze_lua_response,
 )
+from src.tools.rag_templates import (
+    render_template_prompt_block,
+    render_template_selection_prompt,
+    retrieve_template_matches,
+)
 from src.tools.target_tools import (
     load_target_code,
     resolve_lua_target,
@@ -39,6 +45,7 @@ logger = structlog.get_logger(__name__)
 _AGENT_RESOLVE_TARGET = "TargetResolver"
 _AGENT_ROUTE_INTENT = "IntentRouter"
 _AGENT_GENERATE_CODE = "CodeGenerator"
+_AGENT_TEMPLATE_SELECTOR = "TemplateSelector"
 _AGENT_REFINE_CODE = "CodeRefiner"
 _AGENT_VALIDATE_CODE = "CodeValidator"
 _AGENT_FIX_VALIDATION_CODE = "ValidationFixer"
@@ -74,6 +81,22 @@ Effective code available for modification: {effective_has_code}
 User message: {user_input}
 
 JSON only:"""
+
+_TEMPLATE_SELECTOR_SYSTEM = """
+You select the single best Lua template candidate for the code generator.
+
+Return strict JSON only with exactly these fields:
+- "selected_index": 1-based integer index of the best candidate
+- "selected_id": candidate id string copied exactly from the candidate list
+- "reason": short explanation
+
+Rules:
+1. Choose exactly one candidate from the provided list.
+2. Prefer the candidate whose operation and data shape most directly match the current task.
+3. Prefer the most specific structurally compatible template over a generic one.
+4. Do not invent ids or indexes.
+5. If uncertain, choose the safest candidate that least conflicts with the task.
+"""
 
 _GENERATE_SYSTEM = (
     f"You write {LOWCODE_LUA_VERSION} workflow scripts for varied automation tasks.\n"
@@ -365,10 +388,58 @@ def _format_planner_section(compiled_request: dict[str, Any]) -> str:
     ]
     if paths:
         parts.append(f"Planner-identified workflow paths: {', '.join(paths)}")
+    operation = str(planner.get("target_operation", "") or "").strip()
+    if operation:
+        parts.append(f"Target operation: {operation}")
     expected_action = str(planner.get("expected_result_action", "") or "").strip()
     if expected_action:
         parts.append(f"Expected result action: {expected_action}")
+    data_types = planner.get("data_types", {})
+    if isinstance(data_types, dict) and data_types:
+        typed = ", ".join(
+            f"{key}={value}"
+            for key, value in data_types.items()
+            if str(key).strip() and str(value).strip()
+        )
+        if typed:
+            parts.append(f"Path types: {typed}")
     return "\n\n".join(parts)
+
+
+def _format_planner_section_compact(compiled_request: dict[str, Any]) -> str:
+    planner = compiled_request.get("planner_result") or {}
+    if not isinstance(planner, dict) or not planner:
+        return ""
+
+    reformulated = str(planner.get("reformulated_task", "") or "").strip()
+    paths = [
+        str(path).strip()
+        for path in planner.get("identified_workflow_paths", []) or []
+        if str(path).strip()
+    ]
+    operation = str(planner.get("target_operation", "") or "").strip()
+    action = str(planner.get("expected_result_action", "") or "").strip()
+    data_types = planner.get("data_types", {})
+
+    parts: list[str] = []
+    if reformulated:
+        parts.append(f"- reformulated_task: {reformulated}")
+    if operation:
+        parts.append(f"- target_operation: {operation}")
+    if action:
+        parts.append(f"- expected_result_action: {action}")
+    if paths:
+        parts.append(f"- workflow_paths: {', '.join(paths)}")
+    if isinstance(data_types, dict) and data_types:
+        typed = ", ".join(
+            f"{key}={value}"
+            for key, value in data_types.items()
+            if str(key).strip() and str(value).strip()
+        )
+        if typed:
+            parts.append(f"- data_types: {typed}")
+
+    return "\n".join(parts)
 
 
 def _workflow_snapshots_equivalent(left: object, right: object) -> bool:
@@ -772,21 +843,101 @@ def _assess_fix_candidate(
     return deduped
 
 
-def _build_generation_prompt(compiled_request: dict[str, Any]) -> str:
+async def _select_best_template_match(
+    *,
+    llm: LLMProvider,
+    compiled_request: dict[str, Any],
+    matches: list[Any],
+) -> tuple[Any | None, dict[str, Any]]:
+    if not matches:
+        return None, {}
+    if len(matches) == 1:
+        return matches[0], {
+            "selected_index": 1,
+            "selected_id": matches[0].id,
+            "reason": "single_candidate",
+        }
+
+    selector_prompt = render_template_selection_prompt(compiled_request, matches)
+    if not selector_prompt.strip():
+        return matches[0], {
+            "selected_index": 1,
+            "selected_id": matches[0].id,
+            "reason": "selector_prompt_empty",
+        }
+
+    selection = await llm.generate_json(
+        prompt=selector_prompt,
+        system=_TEMPLATE_SELECTOR_SYSTEM,
+        temperature=0.0,
+        agent_name=_AGENT_TEMPLATE_SELECTOR,
+    )
+    if not isinstance(selection, dict):
+        return matches[0], {
+            "selected_index": 1,
+            "selected_id": matches[0].id,
+            "reason": "invalid_selector_response",
+        }
+
+    selected_index = selection.get("selected_index")
+    try:
+        selected_index = int(selected_index)
+    except (TypeError, ValueError):
+        selected_index = 0
+
+    selected_id = str(selection.get("selected_id", "") or "").strip()
+    if 1 <= selected_index <= len(matches):
+        candidate = matches[selected_index - 1]
+        if not selected_id or selected_id == candidate.id:
+            return candidate, {
+                "selected_index": selected_index,
+                "selected_id": candidate.id,
+                "reason": str(selection.get("reason", "") or "").strip(),
+            }
+
+    if selected_id:
+        for idx, candidate in enumerate(matches, start=1):
+            if candidate.id == selected_id:
+                return candidate, {
+                    "selected_index": idx,
+                    "selected_id": candidate.id,
+                    "reason": str(selection.get("reason", "") or "").strip(),
+                }
+    return matches[0], {
+        "selected_index": 1,
+        "selected_id": matches[0].id,
+        "reason": "selector_fallback_first_candidate",
+    }
+
+
+def _build_generation_prompt(
+    compiled_request: dict[str, Any],
+    *,
+    retrieved_template_block: str = "",
+) -> str:
     task = str(compiled_request.get("task_text", "") or "").strip()
     provided_context = str(compiled_request.get("raw_context", "") or "").strip()
     clarification_text = str(compiled_request.get("clarification_text", "") or "").strip()
     prompt_context = _format_prompt_workflow_context(compiled_request)
+    planner_section = _format_planner_section_compact(compiled_request)
     sections = [
         f"Task:\n{task}",
-        f"Clarification from user:\n{clarification_text}" if clarification_text else "",
+        f"Clarification:\n{clarification_text}" if clarification_text else "",
         f"Workflow anchor:\n{prompt_context}" if prompt_context else "",
-        (
-            "Provided workflow context:\n"
-            f"{provided_context}"
-        ) if provided_context else "",
+        f"Planner analysis:\n{planner_section}" if planner_section else "",
+        ("Workflow context:\n" f"{provided_context}") if provided_context else "",
+        retrieved_template_block,
         _PROMPT_STYLE_RULES,
         _PROMPT_SYNTHESIS_GUIDANCE,
+        "Decision rules:\n"
+        "1. Prefer explicit task text and workflow context over planner hints.\n"
+        "2. Use only explicit workflow paths.\n"
+        "3. Do not invent demo input tables.\n"
+        "4. For datetime conversion, parse components explicitly.\n"
+        "5. Do not pass ISO 8601 strings directly to os.time(...).\n"
+        "6. Handle timezone offsets explicitly when present.\n"
+        "7. Save to wf.vars only if explicitly requested.\n"
+        "8. Output only lua{...}lua.",
         LOWCODE_RESPONSE_FORMAT_REQUIREMENT,
     ]
     return _join_prompt_sections(*sections)
@@ -804,6 +955,7 @@ def _build_refine_prompt(
     provided_context = str(compiled_request.get("raw_context", "") or "").strip()
     clarification_text = str(compiled_request.get("clarification_text", "") or "").strip()
     prompt_context = _format_prompt_workflow_context(compiled_request)
+    planner_section = _format_planner_section(compiled_request)
     sections = [
         f"Original task:\n{original_task}" if original_task else "",
         (
@@ -812,6 +964,7 @@ def _build_refine_prompt(
         ) if provided_context else "",
         f"Change clarification:\n{clarification_text}" if clarification_text else "",
         f"Workflow anchor:\n{prompt_context}" if prompt_context else "",
+        f"Planner analysis:\n{planner_section}" if planner_section else "",
         (
             "Existing functions you must preserve unless the user explicitly removes them:\n"
             f"{function_list}"
@@ -1190,7 +1343,6 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         compiled_request = state.get("compiled_request", {})
         target_directory = state.get("target_directory", state.get("workspace_root", ""))
         target_explicit = state.get("target_explicit", False)
-        compiled_request = state.get("compiled_request", {})
 
         logger.info(
             f"[{_AGENT_GENERATE_CODE}] started",
@@ -1199,7 +1351,41 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             target_path=target_path,
         )
 
-        prompt = _build_generation_prompt(compiled_request)
+        retrieved_templates = []
+        selected_template = None
+        selection_meta: dict[str, Any] = {}
+        if isinstance(compiled_request, dict):
+            retrieved_templates = await retrieve_template_matches(compiled_request)
+            compiled_request["retrieved_template_ids"] = [match.id for match in retrieved_templates]
+            compiled_request["retrieved_template_titles"] = [match.title for match in retrieved_templates]
+            selected_template, selection_meta = await _select_best_template_match(
+                llm=llm,
+                compiled_request=compiled_request,
+                matches=retrieved_templates,
+            )
+            if selected_template is not None:
+                compiled_request["selected_template_id"] = selected_template.id
+                compiled_request["selected_template_title"] = selected_template.title
+            write_runtime_audit(
+                "rag_template_selection",
+                selected_operation=str(compiled_request.get("selected_operation", "") or "").strip(),
+                selected_primary_type=str(compiled_request.get("selected_primary_type", "") or "").strip(),
+                top_k=len(retrieved_templates),
+                candidate_ids=[match.id for match in retrieved_templates],
+                candidate_titles=[match.title for match in retrieved_templates],
+                selected_template_id=(selected_template.id if selected_template is not None else ""),
+                selected_template_title=(selected_template.title if selected_template is not None else ""),
+                selector_reason=str(selection_meta.get("reason", "") or "").strip(),
+                selector_index=selection_meta.get("selected_index"),
+            )
+
+        retrieved_template_block = render_template_prompt_block(
+            [selected_template] if selected_template is not None else []
+        )
+        prompt = _build_generation_prompt(
+            compiled_request,
+            retrieved_template_block=retrieved_template_block,
+        )
         generation_temperature = _generation_temperature(compiled_request if isinstance(compiled_request, dict) else {})
 
         logger.info(
@@ -1207,6 +1393,9 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             prompt_len=len(prompt),
             target_path=target_path,
             temperature=generation_temperature,
+            rag_templates=len(retrieved_templates),
+            rag_template_ids=[match.id for match in retrieved_templates],
+            rag_selected_template_id=(selected_template.id if selected_template is not None else ""),
         )
         raw = await llm.generate(
             prompt=prompt,

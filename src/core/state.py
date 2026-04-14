@@ -50,6 +50,7 @@ class PipelineState(TypedDict):
     explanation: dict[str, Any]
     suggested_changes: list[str]
     clarifying_questions: list[str]
+    active_clarifying_questions: list[str]
 
     # Standalone verification chain preparation state
     previous_fix_attempts: list[dict[str, Any]]

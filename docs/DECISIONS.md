@@ -17,6 +17,35 @@ The previous single-stage verification/fix loop has already been removed, while 
 
 ---
 
+## 2026-04-14
+### Decision
+Planner and template-RAG improvements are transplanted from `rag-templates`, but the current branch remains the source of truth for verification/fix architecture.
+
+### Why
+The donor branch contains a better planner and useful template retrieval logic for generation, but it also still carries the removed legacy verifier/fixer contour. A full branch merge would risk reintroducing obsolete verification code into the active graph.
+
+### Consequences
+- `src/agents/planner.py` follows the donor planner contract, including:
+  - `target_operation`;
+  - `data_types`;
+  - `followup_action`;
+  - `active_clarifying_questions`.
+- `app.py`, `PipelineEngine`, and `PipelineState` now bridge `active_clarifying_questions` into the planner.
+- `CodeGenerator` can optionally use local template-RAG from `src/tools/rag_templates.py` and `lua_rag_templates_kb.jsonl`.
+- Template retrieval is generation-only:
+  - it does not alter validation;
+  - it does not alter modular verification routing;
+  - it does not reintroduce legacy verifier/fixer symbols.
+- The active verification/fix contour remains:
+  - `ContractVerifier`
+  - `ShapeTypeVerifier`
+  - `SemanticLogicVerifier`
+  - `RuntimeStateVerifier`
+  - `RobustnessVerifier`
+  - `UniversalVerificationFixer`
+
+---
+
 ## 2026-04-12
 ### Decision
 Per-agent Ollama model selection is resolved centrally inside `src/core/llm.py`, not by branching the pipeline into separate client implementations.

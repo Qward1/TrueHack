@@ -34,6 +34,10 @@ class LLMLoggingHelpersTests(unittest.TestCase):
             "OLLAMA_MODEL_CODE_GENERATOR",
         )
         self.assertEqual(
+            llm_module._agent_model_env_key("TemplateSelector"),
+            "OLLAMA_MODEL_TEMPLATE_SELECTOR",
+        )
+        self.assertEqual(
             llm_module._agent_model_env_key("ContractVerifier"),
             "OLLAMA_MODEL_CONTRACT_VERIFIER",
         )

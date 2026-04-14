@@ -1483,6 +1483,7 @@ class AppRuntime:
                     planner_pending_questions=sd.get("planner_pending_questions", []),
                     planner_original_input=sd.get("planner_original_input", ""),
                     planner_clarification_attempts=sd.get("planner_clarification_attempts", 0),
+                    active_clarifying_questions=sd.get("last_clarifying_questions", []),
                 )
             )
         except Exception as exc:

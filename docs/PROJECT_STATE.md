@@ -5,7 +5,7 @@
 ## Current status
 Репозиторий работает в одном каноническом runtime (`app.py + src/graph`) и поддерживает полный цикл:
 
-`generate/refine -> local validate -> fix_validation -> verify_contract -> verify_shape_type -> verify_semantic_logic -> verify_runtime_state -> verify_robustness -> save -> explain/respond`
+`plan_request -> prepare_generation_context -> generate/refine -> local validate -> fix_validation -> verify_contract -> verify_shape_type -> verify_semantic_logic -> verify_runtime_state -> verify_robustness -> save -> explain/respond`
 
 Если в чате есть явный target path или уже выбран active target, сохранение итогового кода происходит после успешной локальной валидации и полного modular verification chain:
 - canonical artifact: чистый `.lua` файл;
@@ -19,8 +19,14 @@
   - при ambiguity задаёт 1-3 уточняющих вопроса и возвращает clarification response;
   - на следующем turn ответ пользователя идёт **напрямую** в планировщик через `route_from_start` bypass — без захода в `resolve_target`/`route_intent`;
   - после 2 попыток уточнения принудительно продолжает pipeline;
-  - planner result сохраняется в state, но generation/refine/fix prompts больше не дублируют его отдельной секцией, если те же данные уже выражены через `Task` и `Workflow anchor`;
+  - planner result сохраняется в state, а generation/refine prompts используют только compact planner analysis вместо полного noisy dump;
+  - planner получает `active_clarifying_questions` для follow-up по текущему коду и может различить `refine_existing_code` vs `start_new_generation`;
   - отключается через `PLANNER_ENABLED=false`
+- optional template-RAG для `CodeGenerator`:
+  - retrieval идёт из локального `lua_rag_templates_kb.jsonl`;
+  - top-k кандидаты выбираются локально, затем `TemplateSelector` выбирает один лучший шаблон;
+  - в generation prompt попадает только selected template block, без полного retrieval текста;
+  - при `RAG_TEMPLATES_REQUIRE_PLANNER=true` слой активен только вместе с planner.
 - path-aware Lua target logic:
   - explicit `.lua` path;
   - директория -> slug-папка + slug.lua;
@@ -182,8 +188,18 @@ README описывает канонический запуск через `app.
   - `OLLAMA_MODEL_INTENT_ROUTER`
 - `OLLAMA_MODEL_TASK_PLANNER`
 - `OLLAMA_MODEL_CODE_GENERATOR`
+- `OLLAMA_MODEL_TEMPLATE_SELECTOR`
 - `OLLAMA_MODEL_CODE_REFINER`
 - `OLLAMA_MODEL_VALIDATION_FIXER`
 - `OLLAMA_MODEL_SOLUTION_EXPLAINER`
 - `OLLAMA_MODEL_QUESTION_ANSWERER`
 - Prompt audit logs now record both `agent_name` and the effective `model` used for that request, which makes per-agent routing visible in saved logs.
+
+## 2026-04-14 update: donor planner + RAG integration
+- В интеграционную ветку подтянут planner и template-RAG improvements из `rag-templates`, но active verification/fix contour сохранён из текущей ветки.
+- Legacy verifier/fixer не возвращены и в active graph по-прежнему отсутствуют.
+- Current branch remains the source of truth for:
+  - modular verifier agents;
+  - `UniversalVerificationFixer`;
+  - `verification_chain.py`;
+  - save gate и aggregate verification contract.

@@ -9,7 +9,7 @@
 - Единый LLM abstraction layer: `src/core/llm.py`
 
 ## Канонический pipeline
-`resolve_target -> route_intent -> generate|refine|answer -> validate -> verify_contract -> verify_shape_type -> verify_semantic_logic -> verify_runtime_state -> verify_robustness -> save -> explain_solution -> respond`
+`resolve_target -> route_intent -> plan_request -> prepare_generation_context -> generate|refine|answer -> validate -> verify_contract -> verify_shape_type -> verify_semantic_logic -> verify_runtime_state -> verify_robustness -> save -> explain_solution -> respond`
 
 ### Поведение pipeline
 - Generated/refined/fixed Lua now targets the LowCode contract:
@@ -28,6 +28,8 @@
 - Генерация и fix/refine теперь model-driven:
   - compiler даёт path inventory, ranked candidates и clarification gate;
   - финальный скрипт всегда синтезирует LLM по текущей задаче и контексту;
+  - перед генерацией работает `TaskPlanner`, а generation prompt получает только compact planner analysis вместо полного planner dump;
+  - optional template-RAG может подобрать один релевантный Lua template snippet из локального JSONL knowledge base и добавить в generation prompt только выбранный template block;
   - prompt contract больше не заставляет все задачи схлопываться в короткий `return` и допускает multi-step workflow scripts, loops, guards, table traversal и helper functions, когда это требуется логикой;
   - prompts теперь используют один format contract: ответ обязан начинаться с `lua{` и заканчиваться `}lua`, без кавычек и без code fences;
   - service noise в generation/fix prompt сокращён: без ranked candidates / confidence / длинных diagnostic dumps;
@@ -71,6 +73,9 @@
 - `app.py` сохраняет:
   - `target_path`, `workspace_root`, `current_code`, `base_prompt`, `change_requests`;
   - `last_suggested_changes`, `last_clarifying_questions`, `last_e2e_summary`.
+- planner follow-up использует `last_clarifying_questions` как `active_clarifying_questions`, чтобы различать:
+  - ответ на уточняющий вопрос по текущему коду;
+  - новую логическую задачу, которая должна начать fresh generation.
 - title чата строится из очищенного prompt и при наличии target не зависит от сырого пути пользователя.
 - Follow-up поддерживает ссылки на предложения:
   - пример: `примени предложение 1`;
@@ -94,6 +99,11 @@
   - нормализация Lua-ответа;
   - локальная диагностика и LowCode validation harness;
   - временно неиспользуемые e2e helpers для будущего возврата e2e-gate.
+- `src/tools/rag_templates.py`:
+  - локальный template-RAG retriever для generation;
+  - загрузка JSONL KB;
+  - top-k retrieval;
+  - render template selection prompt и compact template block для `CodeGenerator`.
 - `src/tools/local_runtime.py`:
   - низкоуровневые wrappers для `lua`;
   - сохраненные, но неиспользуемые wrappers для `luacheck`;
@@ -160,6 +170,7 @@
 - `OLLAMA_MODEL_INTENT_ROUTER`
 - `OLLAMA_MODEL_TASK_PLANNER`
 - `OLLAMA_MODEL_CODE_GENERATOR`
+- `OLLAMA_MODEL_TEMPLATE_SELECTOR`
 - `OLLAMA_MODEL_CODE_REFINER`
 - `OLLAMA_MODEL_VALIDATION_FIXER`
 - `OLLAMA_MODEL_CONTRACT_VERIFIER`
@@ -170,3 +181,14 @@
 - `OLLAMA_MODEL_UNIVERSAL_VERIFICATION_FIXER`
 - `OLLAMA_MODEL_SOLUTION_EXPLAINER`
 - `OLLAMA_MODEL_QUESTION_ANSWERER`
+
+## 2026-04-14 update: planner follow-up and template RAG
+- `TaskPlanner` из donor-ветки теперь активен как source of truth для clarification follow-up semantics:
+  - planner может вернуть `followup_action = refine_existing_code` или `start_new_generation`;
+  - `create_planner_node()` при необходимости меняет `intent` и сбрасывает follow-up state для нового logical task.
+- В pipeline добавлен `active_clarifying_questions` state bridge из `app.py` в planner.
+- `CodeGenerator` поддерживает optional template-RAG:
+  - retrieval идёт из локального `lua_rag_templates_kb.jsonl`;
+  - `TemplateSelector` выбирает один лучший template candidate;
+  - в generation prompt попадает только selected template block, а не весь retrieval text;
+  - слой управляется env-переменными `RAG_TEMPLATES_*` и не трогает validation или modular verification contour.

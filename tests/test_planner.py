@@ -8,7 +8,6 @@ from unittest.mock import patch
 from src.agents.planner import (
     PlannerAgent,
     PlannerOutput,
-    _PLANNER_SYSTEM,
     _build_clarification_response,
     _extract_workflow_paths_from_text,
     _is_planner_enabled,
@@ -92,14 +91,20 @@ class TestNormalizePlannerResult(unittest.TestCase):
         raw = {
             "reformulated_task": "Get last email from wf.vars.emails",
             "identified_workflow_paths": ["wf.vars.emails"],
+            "target_operation": "extract",
             "key_entities": ["emails", "last"],
+            "data_types": {"wf.vars.emails": "array_string"},
             "expected_result_action": "return",
+            "followup_action": "none",
             "needs_clarification": False,
             "clarification_questions": [],
             "confidence": 0.9,
         }
         result = _normalize_planner_result(raw, "original input")
         self.assertEqual(result["reformulated_task"], "Get last email from wf.vars.emails")
+        self.assertEqual(result["target_operation"], "extract")
+        self.assertEqual(result["data_types"], {"wf.vars.emails": "array_string"})
+        self.assertEqual(result["followup_action"], "none")
         self.assertAlmostEqual(result["confidence"], 0.9)
         self.assertFalse(result["needs_clarification"])
 
@@ -118,6 +123,11 @@ class TestNormalizePlannerResult(unittest.TestCase):
         raw = {"expected_result_action": "something_weird"}
         result = _normalize_planner_result(raw, "task")
         self.assertEqual(result["expected_result_action"], "return")
+
+    def test_invalid_followup_action_defaults_to_none(self) -> None:
+        raw = {"followup_action": "unexpected_mode"}
+        result = _normalize_planner_result(raw, "task")
+        self.assertEqual(result["followup_action"], "none")
 
     def test_confidence_clamped(self) -> None:
         raw = {"confidence": 5.0}
@@ -166,27 +176,6 @@ class TestPlannerAgentDisabled(unittest.TestCase):
 
 
 class TestPlannerAgentPlan(unittest.TestCase):
-    def test_prompt_forbids_invented_paths(self) -> None:
-        llm = StubLLM(response={
-            "reformulated_task": "Верни wf.vars.emails",
-            "identified_workflow_paths": ["wf.vars.emails"],
-            "key_entities": ["emails"],
-            "expected_result_action": "return",
-            "needs_clarification": False,
-            "clarification_questions": [],
-            "confidence": 0.9,
-        })
-        agent = PlannerAgent(llm, enabled=True)
-        asyncio.run(agent.plan(
-            user_input="Верни email",
-            has_context=True,
-            workflow_paths=["wf.vars.emails"],
-        ))
-        self.assertEqual(llm.last_system, _PLANNER_SYSTEM)
-        self.assertIn("Workflow paths found in request", llm.last_prompt)
-        self.assertIn("reformulated_task", llm.last_prompt)
-        self.assertIn("expected_result_action", llm.last_prompt)
-
     def test_reformulates_task_with_context(self) -> None:
         llm = StubLLM(response={
             "reformulated_task": "Получить последний элемент массива wf.vars.emails",
@@ -360,6 +349,18 @@ class TestPlannerAgentPlan(unittest.TestCase):
         self.assertIn("true", llm.last_prompt)  # has_context
         self.assertIn("task analyst", llm.last_system)
 
+    def test_prompt_includes_active_clarifying_questions(self) -> None:
+        llm = StubLLM(response={"reformulated_task": "x", "confidence": 0.5})
+        agent = PlannerAgent(llm, enabled=True)
+        asyncio.run(agent.plan(
+            user_input="только VIP",
+            current_code="return wf.vars.contacts",
+            active_clarifying_questions=["Нужно вернуть все контакты или только VIP?"],
+        ))
+        self.assertIn("Active clarification questions for current code", llm.last_prompt)
+        self.assertIn("только VIP", llm.last_prompt)
+        self.assertIn("Нужно вернуть все контакты или только VIP?", llm.last_prompt)
+
 
 class TestEnvToggle(unittest.TestCase):
     def test_env_true(self) -> None:
@@ -465,6 +466,58 @@ class TestCreatePlannerNode(unittest.TestCase):
             asyncio.run(node(state))
             # Verify prompt contains "true" for has_context
             self.assertIn("true", llm.last_prompt)
+
+    def test_node_refine_existing_code_updates_intent(self) -> None:
+        llm = StubLLM(response={
+            "reformulated_task": "Оставь только VIP контакты из wf.vars.contacts",
+            "identified_workflow_paths": ["wf.vars.contacts"],
+            "target_operation": "filter",
+            "expected_result_action": "return",
+            "followup_action": "refine_existing_code",
+            "needs_clarification": False,
+            "clarification_questions": [],
+            "confidence": 0.9,
+        })
+        with patch.dict(os.environ, {"PLANNER_ENABLED": "true"}):
+            node = create_planner_node(llm)
+            state = {
+                "user_input": "только VIP",
+                "intent": "create",
+                "current_code": "return wf.vars.contacts",
+                "compiled_request": {},
+                "active_clarifying_questions": ["Нужно вернуть все контакты или только VIP?"],
+                "base_prompt": "Верни контакты из wf.vars.contacts",
+                "change_requests": [],
+            }
+            result = asyncio.run(node(state))
+            self.assertEqual(result["intent"], "change")
+
+    def test_node_start_new_generation_resets_followup_state(self) -> None:
+        llm = StubLLM(response={
+            "reformulated_task": "Верни последний заказ из wf.vars.orders",
+            "identified_workflow_paths": ["wf.vars.orders"],
+            "target_operation": "extract",
+            "expected_result_action": "return",
+            "followup_action": "start_new_generation",
+            "needs_clarification": False,
+            "clarification_questions": [],
+            "confidence": 0.9,
+        })
+        with patch.dict(os.environ, {"PLANNER_ENABLED": "true"}):
+            node = create_planner_node(llm)
+            state = {
+                "user_input": "сделай новый скрипт для последнего заказа",
+                "intent": "change",
+                "current_code": "return wf.vars.contacts",
+                "compiled_request": {},
+                "active_clarifying_questions": ["Нужно вернуть все контакты или только VIP?"],
+                "base_prompt": "Верни контакты из wf.vars.contacts",
+                "change_requests": ["только VIP"],
+            }
+            result = asyncio.run(node(state))
+            self.assertEqual(result["intent"], "create")
+            self.assertEqual(result["base_prompt"], "")
+            self.assertEqual(result["change_requests"], [])
 
 
 if __name__ == "__main__":
