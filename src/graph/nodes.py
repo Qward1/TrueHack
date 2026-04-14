@@ -357,6 +357,11 @@ def _format_prompt_workflow_context(compiled_request: dict[str, Any]) -> str:
     lines: list[str] = []
     selected_path = str(compiled_request.get("selected_primary_path", "") or "").strip()
     selected_type = str(compiled_request.get("selected_primary_type", "") or "").strip()
+    expected_paths = [
+        str(path).strip()
+        for path in compiled_request.get("expected_workflow_paths", [])
+        if str(path).strip()
+    ]
     semantic_expectations = [
         str(item).strip()
         for item in compiled_request.get("semantic_expectations", [])
@@ -368,7 +373,9 @@ def _format_prompt_workflow_context(compiled_request: dict[str, Any]) -> str:
         if str(key).strip()
     ]
 
-    if selected_path:
+    if len(expected_paths) > 1:
+        lines.append(f"Use workflow paths together: {', '.join(expected_paths)}")
+    elif selected_path:
         lines.append(f"Use workflow path: {selected_path}")
     if selected_type:
         lines.append(f"Path type: {selected_type}")

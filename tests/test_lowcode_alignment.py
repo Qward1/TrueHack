@@ -117,6 +117,37 @@ class LowcodeAlignmentTests(unittest.TestCase):
         self.assertEqual(compiled["selected_primary_path"], "wf.vars.contacts")
         self.assertIn("array_normalization", compiled["semantic_expectations"])
 
+    def test_compile_request_infers_two_object_paths_for_compare_task(self) -> None:
+        compiled = compile_lowcode_request(
+            task_text="Сравни старую и новую версии карточки клиента и верни список полей, которые изменились.",
+            raw_context="""{
+  "wf": {
+    "vars": {
+      "oldClient": {
+        "name": "ООО Вектор",
+        "email": "info@vector.ru",
+        "phone": "+79990000000",
+        "status": "lead"
+      },
+      "newClient": {
+        "name": "ООО Вектор",
+        "email": "sales@vector.ru",
+        "phone": "+79990000000",
+        "status": "client"
+      }
+    }
+  }
+}""",
+        )
+
+        self.assertFalse(compiled["needs_clarification"])
+        self.assertEqual(compiled["selected_primary_path"], "wf.vars.oldClient")
+        self.assertEqual(
+            compiled["expected_workflow_paths"],
+            ["wf.vars.oldClient", "wf.vars.newClient"],
+        )
+        self.assertIn("compare_values", compiled["semantic_expectations"])
+
     def test_compile_request_preserves_parsed_context_for_runtime_validation(self) -> None:
         compiled = compile_lowcode_request(
             task_text="Convert wf.initVariables.recallTime to unix timestamp.",

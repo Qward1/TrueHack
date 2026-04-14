@@ -191,6 +191,7 @@ SEMANTIC_STEM_GROUPS: dict[str, tuple[str, ...]] = {
     "iso": ("iso", "8601"),
     "epoch": ("epoch", "unix", "юникс", "unixtime"),
     "remove_keys": ("remove", "delete", "drop", "clear", "clean", "очист", "удал", "убери", "выкин"),
+    "compare": ("compare", "diff", "difference", "changed", "changes", "changed_fields", "сравн", "отлич", "измен", "верс"),
 }
 STRUCTURED_OPERATION_ALLOWED_TYPES: dict[str, set[str]] = {
     "count": {"array_scalar", "array_object"},
@@ -234,6 +235,14 @@ RUNTIME_RESULT_START = "__TRUEHACK_RESULT_START__"
 RUNTIME_RESULT_END = "__TRUEHACK_RESULT_END__"
 RUNTIME_WORKFLOW_START = "__TRUEHACK_WORKFLOW_START__"
 RUNTIME_WORKFLOW_END = "__TRUEHACK_WORKFLOW_END__"
+COMPARE_OBJECT_TYPES = frozenset({"object", "array_object"})
+COMPARE_ROLE_HINT_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("old", "new"),
+    ("previous", "current"),
+    ("before", "after"),
+    ("source", "target"),
+    ("src", "dst"),
+)
 
 
 def merge_process_output(stdout: str, stderr: str) -> str:
@@ -849,6 +858,139 @@ def infer_explicit_paths_from_bare_field_names(task_text: str, inventory: list[d
     return inferred
 
 
+def _looks_like_comparison_task(task_text: str) -> bool:
+    tokens = _canonicalize_tokens(_extract_task_tokens(task_text))
+    return "compare" in tokens
+
+
+def _normalize_compare_name(name: str) -> str:
+    cleaned = re.sub(r"[^a-zа-яё0-9]+", "", str(name or "").lower())
+    for group in COMPARE_ROLE_HINT_GROUPS:
+        for hint in group:
+            if cleaned.startswith(hint) and len(cleaned) > len(hint):
+                cleaned = cleaned[len(hint):]
+            if cleaned.endswith(hint) and len(cleaned) > len(hint):
+                cleaned = cleaned[:-len(hint)]
+    return cleaned
+
+
+def _compare_role_rank(path: str) -> int:
+    lower = str(path or "").lower()
+    preferred_first = ("old", "previous", "before", "source", "src")
+    preferred_last = ("new", "current", "after", "target", "dst")
+    if any(hint in lower for hint in preferred_first):
+        return 0
+    if any(hint in lower for hint in preferred_last):
+        return 2
+    return 1
+
+
+def _pair_has_role_hints(left_path: str, right_path: str) -> bool:
+    left = str(left_path or "").lower()
+    right = str(right_path or "").lower()
+    for group in COMPARE_ROLE_HINT_GROUPS:
+        left_matches = [hint for hint in group if hint in left]
+        right_matches = [hint for hint in group if hint in right]
+        if left_matches and right_matches and set(left_matches) != set(right_matches):
+            return True
+    return False
+
+
+def _segments_share_parent(left_segments: list[str], right_segments: list[str]) -> bool:
+    return len(left_segments) > 0 and len(left_segments) == len(right_segments) and left_segments[:-1] == right_segments[:-1]
+
+
+def _segments_are_nested(left_segments: list[str], right_segments: list[str]) -> bool:
+    if len(left_segments) == len(right_segments):
+        return False
+    shorter, longer = (left_segments, right_segments) if len(left_segments) < len(right_segments) else (right_segments, left_segments)
+    return longer[: len(shorter)] == shorter
+
+
+def infer_comparison_paths(task_text: str, inventory: list[dict[str, Any]], explicit_paths: list[str] | None = None) -> list[str]:
+    """Infer a stable pair of comparable workflow paths for generic compare/diff tasks."""
+    if not _looks_like_comparison_task(task_text) or not inventory:
+        return []
+
+    inventory_by_path = {
+        str(entry.get("path", "")).strip(): entry
+        for entry in inventory
+        if str(entry.get("path", "")).strip()
+    }
+    explicit_exact = [
+        str(path).strip()
+        for path in (explicit_paths or [])
+        if str(path).strip() in inventory_by_path
+    ]
+    explicit_object_like = [
+        path for path in explicit_exact
+        if str(inventory_by_path[path].get("type", "") or "") in COMPARE_OBJECT_TYPES
+    ]
+    if len(explicit_object_like) == 2:
+        return sorted(explicit_object_like, key=lambda path: (_compare_role_rank(path), path))
+    if len(explicit_object_like) > 2:
+        return []
+
+    candidates = [
+        entry for entry in inventory
+        if str(entry.get("type", "") or "") in COMPARE_OBJECT_TYPES
+    ]
+    if len(candidates) < 2:
+        return []
+
+    pair_scores: list[tuple[float, tuple[str, str]]] = []
+    for index, left in enumerate(candidates):
+        left_path = str(left.get("path", "") or "")
+        left_segments = [str(segment).strip() for segment in left.get("segments", []) if str(segment).strip()]
+        left_type = str(left.get("type", "") or "")
+        left_keys = set(str(key).strip().lower() for key in (left.get("child_keys", []) or left.get("item_keys", []) or []) if str(key).strip())
+        for right in candidates[index + 1:]:
+            right_path = str(right.get("path", "") or "")
+            right_segments = [str(segment).strip() for segment in right.get("segments", []) if str(segment).strip()]
+            right_type = str(right.get("type", "") or "")
+            if not left_path or not right_path or left_type != right_type:
+                continue
+            if _segments_are_nested(left_segments, right_segments):
+                continue
+
+            score = 0.0
+            if _segments_share_parent(left_segments, right_segments):
+                score += 6.0
+            elif len(left_segments) == 1 and len(right_segments) == 1:
+                score += 4.0
+
+            shared_keys = left_keys & set(
+                str(key).strip().lower()
+                for key in (right.get("child_keys", []) or right.get("item_keys", []) or [])
+                if str(key).strip()
+            )
+            score += min(8.0, float(len(shared_keys)) * 2.0)
+
+            left_leaf = left_segments[-1] if left_segments else left_path
+            right_leaf = right_segments[-1] if right_segments else right_path
+            if _normalize_compare_name(left_leaf) and _normalize_compare_name(left_leaf) == _normalize_compare_name(right_leaf):
+                score += 6.0
+
+            if _pair_has_role_hints(left_path, right_path):
+                score += 6.0
+
+            # Prefer shallower object pairs to field-level or deeply nested comparisons.
+            score += max(0.0, 3.0 - float(min(len(left_segments), len(right_segments)) - 1))
+            pair_scores.append((score, (left_path, right_path)))
+
+    if not pair_scores:
+        return []
+
+    pair_scores.sort(key=lambda item: (-item[0], item[1]))
+    best_score, best_pair = pair_scores[0]
+    second_score = pair_scores[1][0] if len(pair_scores) > 1 else None
+    if best_score < 12.0:
+        return []
+    if second_score is not None and (best_score - second_score) < 3.0:
+        return []
+    return sorted(best_pair, key=lambda path: (_compare_role_rank(path), path))
+
+
 def detect_lowcode_operation(task_text: str) -> dict[str, Any]:
     """Detect the dominant simple operation requested by the user."""
     tokens = _canonicalize_tokens(_extract_task_tokens(task_text))
@@ -891,6 +1033,8 @@ def infer_semantic_expectations(
         expectations.append("datetime_to_epoch")
     if ("total" in tokens or "sum" in tokens or "increment" in tokens) and selected_primary_type in {"array_object", "array_scalar"}:
         expectations.append("numeric_aggregation")
+    if "compare" in tokens:
+        expectations.append("compare_values")
 
     # If the task explicitly talks about arrays but the selected value is not clearly an array already,
     # preserve the expectation for downstream guards even when operation remains generic `llm`.
@@ -1004,10 +1148,12 @@ def compile_lowcode_request(
     inferred_explicit_paths = infer_explicit_paths_from_bare_field_names(merged_text, inventory)
     explicit_paths = list(dict.fromkeys([*explicit_paths_raw, *inferred_explicit_paths]))
     ranked_candidates = rank_workflow_paths(merged_text, inventory, operation, explicit_paths)
+    compare_paths = infer_comparison_paths(merged_text, inventory, explicit_paths)
 
     selected_primary_path = ""
     selected_save_path = ""
     selected_primary_type = ""
+    expected_workflow_paths: list[str] = []
     requested_item_keys: list[str] = []
     needs_clarification = False
     clarification_candidates = ranked_candidates[:3]
@@ -1016,15 +1162,27 @@ def compile_lowcode_request(
     inventory_paths = {entry["path"] for entry in inventory}
     explicit_exact_raw = [path for path in explicit_paths_raw if path in inventory_paths]
     explicit_exact = [path for path in explicit_paths if path in inventory_paths]
-    if len(explicit_exact_raw) == 1:
+    if len(compare_paths) == 2:
+        expected_workflow_paths = list(compare_paths)
+        selected_primary_path = compare_paths[0]
+        selected_primary_type = str(next(
+            (entry.get("type", "") for entry in inventory if entry.get("path") == selected_primary_path),
+            "",
+        ) or "")
+        confidence = 1.0
+    elif len(explicit_exact_raw) == 1:
         selected_primary_path = explicit_exact_raw[0]
+        expected_workflow_paths = [selected_primary_path]
         confidence = 1.0
     elif len(explicit_exact_raw) > 1:
+        expected_workflow_paths = list(explicit_exact_raw)
         needs_clarification = True
     elif len(explicit_exact) == 1:
         selected_primary_path = explicit_exact[0]
+        expected_workflow_paths = [selected_primary_path]
         confidence = 1.0
     elif len(explicit_exact) > 1:
+        expected_workflow_paths = list(explicit_exact)
         needs_clarification = True
     elif ranked_candidates:
         top = ranked_candidates[0]
@@ -1037,6 +1195,7 @@ def compile_lowcode_request(
         else:
             selected_primary_path = str(top["path"])
             selected_primary_type = str(top.get("type", "") or "")
+            expected_workflow_paths = [selected_primary_path]
 
     if selected_primary_path:
         selected_entry = next((entry for entry in inventory if entry.get("path") == selected_primary_path), None)
@@ -1065,13 +1224,22 @@ def compile_lowcode_request(
 
     clarifying_question = ""
     if needs_clarification:
-        option_text = ", ".join(candidate["path"] for candidate in clarification_candidates) or "wf.vars.<path>"
-        clarifying_question = (
-            "Уточни, с каким workflow-путём работать: "
-            f"{option_text}. Ответь, например: `используй {clarification_candidates[0]['path']}`."
-            if clarification_candidates
-            else "Уточни, с каким workflow-путём работать. Ответь явным путём вида `используй wf.vars.some.path`."
-        )
+        if _looks_like_comparison_task(merged_text) and expected_workflow_paths:
+            option_text = ", ".join(expected_workflow_paths)
+            clarifying_question = (
+                "Уточни, какие workflow-пути нужно сравнить: "
+                f"{option_text}. Ответь, например: `сравни {expected_workflow_paths[0]} и {expected_workflow_paths[1]}`."
+                if len(expected_workflow_paths) >= 2
+                else "Уточни, какие workflow-пути нужно сравнить. Ответь явными путями вида `сравни wf.vars.a и wf.vars.b`."
+            )
+        else:
+            option_text = ", ".join(candidate["path"] for candidate in clarification_candidates) or "wf.vars.<path>"
+            clarifying_question = (
+                "Уточни, с каким workflow-путём работать: "
+                f"{option_text}. Ответь, например: `используй {clarification_candidates[0]['path']}`."
+                if clarification_candidates
+                else "Уточни, с каким workflow-путём работать. Ответь явным путём вида `используй wf.vars.some.path`."
+            )
 
     return {
         "task_text": task_text.strip(),
@@ -1085,6 +1253,7 @@ def compile_lowcode_request(
         "operation_argument": operation_info.get("argument"),
         "selected_primary_path": selected_primary_path,
         "selected_primary_type": selected_primary_type,
+        "expected_workflow_paths": expected_workflow_paths,
         "selected_save_path": selected_save_path,
         "requested_item_keys": requested_item_keys,
         "candidate_paths_ranked": clarification_candidates,
