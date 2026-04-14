@@ -29,14 +29,14 @@ services:
       LUA_BIN: lua55
       OLLAMA_MAX_CONCURRENT_REQUESTS: "1"
       APP_DOCKER_BOOTSTRAP_OLLAMA: "1"
+      APP_RUNTIME_DIR: /runtime
       APP_WORKSPACE: /workspace
     ports:
       - "8765:8765"
     volumes:
-      - .:/app
       - ./workspace:/workspace
+      - ./runtime:/runtime
     command: ["sh", "/app/docker/app-entrypoint.sh"]
 
 volumes:
   ollama_data:
-

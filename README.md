@@ -86,7 +86,8 @@ python app.py --host 127.0.0.1 --port 8765 --workspace C:\Work\LuaProjects --mod
 - ждет готовности Ollama перед стартом UI;
 - проверяет, что все модели из `.env` уже есть в Ollama;
 - если какой-то модели нет, автоматически делает `pull`;
-- после этого запускает web UI на `http://127.0.0.1:8765`.
+- после этого запускает web UI на `http://127.0.0.1:8765`;
+- не монтирует весь исходный код в контейнер `app`, поэтому запуск не ломается из-за Windows `CRLF`.
 
 Подготовка:
 
@@ -109,6 +110,7 @@ docker compose down
 Замечания для Docker-режима:
 - внутри compose `OLLAMA_BASE_URL` автоматически переопределяется на `http://ollama:11434/v1`;
 - внутри compose `LUA_BIN` автоматически переопределяется на `lua55`, поэтому Windows-путь из локального `.env` контейнеру не мешает;
+- generated workspace-файлы пишутся в `./workspace`, runtime sqlite/logs — в `./runtime`;
 - для GPU-ускорения нужен Docker Desktop с включенной GPU/WSL integration и рабочий NVIDIA Container Toolkit.
 
 Переменные окружения (альтернатива CLI-аргументам):
