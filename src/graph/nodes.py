@@ -269,6 +269,75 @@ _TRAILING_JSON_CONTEXT_RE = re.compile(
 )
 _INLINE_LOWCODE_BLOCK_RE = re.compile(r"lua\{\s*[\s\S]*?\s*\}lua", re.IGNORECASE)
 _FENCED_CODE_BLOCK_RE = re.compile(r"```(?:lua)?\s*([\s\S]*?)```", re.IGNORECASE)
+_CHANGE_REQUEST_TERMS = (
+    "исправ",
+    "почини",
+    "улучш",
+    "доработ",
+    "измени",
+    "обнови",
+    "добав",
+    "убери",
+    "удали",
+    "очист",
+    "оберни",
+    "нормализ",
+    "fix",
+    "improve",
+    "refine",
+    "change",
+    "update",
+    "add",
+    "remove",
+    "wrap",
+    "normalize",
+)
+_INSPECT_REQUEST_TERMS = (
+    "что делает",
+    "что делает код",
+    "объясни",
+    "объяснение",
+    "поясни",
+    "разбери",
+    "review",
+    "inspect",
+    "explain",
+    "what does this code do",
+    "what does the code do",
+)
+_QUESTION_PREFIXES = (
+    "как ",
+    "что ",
+    "почему ",
+    "зачем ",
+    "можно ли",
+    "what ",
+    "how ",
+    "why ",
+    "when ",
+    "can ",
+    "is ",
+    "does ",
+)
+_CLARIFICATION_FOLLOWUP_PREFIXES = (
+    "используй",
+    "возьми",
+    "бери",
+    "только",
+    "все",
+    "верни",
+    "сохрани",
+    "запиши",
+    "да",
+    "нет",
+    "use ",
+    "only ",
+    "all ",
+    "return ",
+    "save ",
+    "yes",
+    "no",
+)
 _PROMPT_STYLE_RULES = """Hard rules:
 - Use the exact wf.vars / wf.initVariables paths from the task or provided workflow context.
 - Do not recreate the provided input as local demo tables like local data = {...}, local users = {...}, local emails = {...}.
@@ -305,6 +374,43 @@ def _generation_temperature(compiled_request: dict[str, Any]) -> float:
     if semantic_expectations:
         return 0.0
     return 0.1
+
+
+def _contains_any_token(text: str, tokens: tuple[str, ...]) -> bool:
+    lowered = str(text or "").lower()
+    return any(token in lowered for token in tokens)
+
+
+def _looks_like_inspect_request(text: str) -> bool:
+    lowered = " ".join(str(text or "").lower().split())
+    return _contains_any_token(lowered, _INSPECT_REQUEST_TERMS)
+
+
+def _looks_like_general_question(text: str) -> bool:
+    lowered = " ".join(str(text or "").lower().split())
+    if not lowered:
+        return False
+    if lowered.startswith(_QUESTION_PREFIXES):
+        return True
+    return "?" in lowered and not _contains_any_token(lowered, _CHANGE_REQUEST_TERMS)
+
+
+def _looks_like_change_request(text: str) -> bool:
+    return _contains_any_token(text, _CHANGE_REQUEST_TERMS)
+
+
+def _looks_like_clarification_followup_answer(text: str) -> bool:
+    normalized = " ".join(str(text or "").strip().split())
+    lowered = normalized.lower()
+    if not lowered:
+        return False
+    if lowered.startswith(_CLARIFICATION_FOLLOWUP_PREFIXES):
+        return True
+    if "wf.vars." in lowered or "wf.initvariables." in lowered:
+        return True
+    if len(normalized) <= 120 and "\n" not in normalized:
+        return True
+    return False
 
 
 def _target_context(state: PipelineState) -> str:
@@ -1212,6 +1318,12 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             for question in state.get("active_clarifying_questions", []) or []
             if str(question).strip()
         ]
+        planner_pending_questions = [
+            str(question).strip()
+            for question in state.get("planner_pending_questions", []) or []
+            if str(question).strip()
+        ]
+        clarification_questions_for_routing = active_clarifying_questions or planner_pending_questions
         message_code = _extract_message_code_block(state["user_input"]).strip()
         cleaned_message = _strip_message_code_blocks(state["user_input"]) if message_code else str(state["user_input"] or "").strip()
         effective_has_code = bool(has_code or message_code)
@@ -1225,13 +1337,50 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         llm_intent = ""
         confidence = 0.0
         intent_source = "llm"
+
+        deterministic_intent = ""
+        if clarification_questions_for_routing and not message_code:
+            if _looks_like_inspect_request(cleaned_message):
+                deterministic_intent = "inspect"
+                intent_source = "deterministic_clarification_inspect"
+            elif _looks_like_clarification_followup_answer(cleaned_message):
+                deterministic_intent = "change" if effective_has_code else "create"
+                intent_source = "deterministic_clarification_followup"
+
+        if not deterministic_intent:
+            if effective_has_code and _looks_like_inspect_request(cleaned_message):
+                deterministic_intent = "inspect"
+                intent_source = "deterministic_inspect"
+            elif not effective_has_code and _looks_like_general_question(cleaned_message):
+                deterministic_intent = "question"
+                intent_source = "deterministic_question"
+            elif not effective_has_code and _looks_like_change_request(cleaned_message):
+                deterministic_intent = "create"
+                intent_source = "deterministic_change_without_code"
+
+        if deterministic_intent:
+            intent = deterministic_intent
+            updates: dict[str, Any] = {"intent": intent}
+            if message_code and intent in {"change", "inspect", "retry"} and not has_code:
+                updates["current_code"] = message_code
+                if cleaned_message and not state.get("base_prompt", "").strip():
+                    updates["base_prompt"] = cleaned_message
+            logger.info(
+                f"[{_AGENT_ROUTE_INTENT}] completed",
+                intent=intent,
+                confidence=1.0,
+                source=intent_source,
+                llm_intent="skipped",
+            )
+            return updates
+
         prompt = _ROUTE_USER.format(
             has_code=str(has_code).lower(),
             has_message_code=str(bool(message_code)).lower(),
             effective_has_code=str(effective_has_code).lower(),
             active_clarifying_questions=(
-                "\n".join(f"- {question}" for question in active_clarifying_questions)
-                if active_clarifying_questions else "none"
+                "\n".join(f"- {question}" for question in clarification_questions_for_routing)
+                if clarification_questions_for_routing else "none"
             ),
             base_prompt=str(state.get("base_prompt", "") or "").strip() or "none",
             target_path=str(state.get("target_path", "") or "").strip() or "none",

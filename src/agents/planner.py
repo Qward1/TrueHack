@@ -472,6 +472,10 @@ def create_planner_node(llm: LLMProvider) -> Callable:
             updates["intent"] = "create"
             updates["base_prompt"] = ""
             updates["change_requests"] = []
+        elif awaiting and original_input:
+            # Clarification answers must stay on the code path even when the
+            # planner omits an explicit follow-up action.
+            updates["intent"] = "change" if current_code.strip() else "create"
         if awaiting and original_input:
             updates["user_input"] = effective_input
         return updates
