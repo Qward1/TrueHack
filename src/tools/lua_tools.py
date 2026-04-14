@@ -1978,6 +1978,7 @@ def validate_lowcode_llm_output(raw_response: str) -> dict[str, Any]:
     """Validate raw model output against the strict LowCode wrapper contract."""
     analysis = analyze_lua_response(raw_response)
     raw_cleaned = ZERO_WIDTH_PATTERN.sub("", str(raw_response or "")).replace("\r\n", "\n").replace("\r", "\n").strip()
+    normalized = str(analysis.get("normalized", "") or "").strip()
 
     if not raw_cleaned:
         analysis["valid"] = False
@@ -1985,6 +1986,11 @@ def validate_lowcode_llm_output(raw_response: str) -> dict[str, Any]:
         return analysis
 
     if raw_cleaned.startswith("```"):
+        if normalized.startswith(LOWCODE_JSONSTRING_OPEN) and normalized.endswith(LOWCODE_JSONSTRING_CLOSE):
+            analysis["valid"] = True
+            analysis["reason"] = ""
+            analysis["normalized"] = normalized
+            return analysis
         analysis["valid"] = False
         analysis["reason"] = "Response must start with lua{ and end with }lua without markdown code fences."
         return analysis
@@ -1993,6 +1999,11 @@ def validate_lowcode_llm_output(raw_response: str) -> dict[str, Any]:
         (raw_cleaned.startswith('"') and raw_cleaned.endswith('"'))
         or (raw_cleaned.startswith("'") and raw_cleaned.endswith("'"))
     ):
+        if normalized.startswith(LOWCODE_JSONSTRING_OPEN) and normalized.endswith(LOWCODE_JSONSTRING_CLOSE):
+            analysis["valid"] = True
+            analysis["reason"] = ""
+            analysis["normalized"] = normalized
+            return analysis
         analysis["valid"] = False
         analysis["reason"] = "Response must start with lua{ and end with }lua without surrounding quotes."
         return analysis

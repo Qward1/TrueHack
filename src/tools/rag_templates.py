@@ -24,8 +24,8 @@ from openai import AsyncOpenAI
 logger = structlog.get_logger(__name__)
 
 DEFAULT_TEMPLATE_KB_PATH = "lua_rag_templates_kb.jsonl"
-DEFAULT_TEMPLATE_TOP_K = 2
-DEFAULT_TEMPLATE_EMBED_MODEL = "nomic-embed-text"
+DEFAULT_TEMPLATE_TOP_K = 5
+DEFAULT_TEMPLATE_EMBED_MODEL = "qwen3-embedding:0.6b"
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1"
 
 _TOKEN_RE = re.compile(r"[A-Za-zА-Яа-я0-9_]+", re.UNICODE)
@@ -40,6 +40,7 @@ class TemplateMatch:
     task_type: str
     input_shape: str
     output_shape: str
+    retrieval_text: str
     llm_context: str
     score: float
 
@@ -155,23 +156,14 @@ def build_template_query(compiled_request: dict[str, Any]) -> str:
         for item in compiled_request.get("requested_item_keys", []) or []
         if str(item or "").strip()
     ]
-    identified_paths = [
-        str(item or "").strip()
-        for item in planner.get("identified_workflow_paths", []) or []
-        if str(item or "").strip()
-    ]
-
     query_parts = [
         str(compiled_request.get("task_text", "") or "").strip(),
         str(planner.get("reformulated_task", "") or "").strip(),
         str(compiled_request.get("selected_operation", "") or "").strip(),
         str(planner.get("target_operation", "") or "").strip(),
         str(compiled_request.get("selected_primary_type", "") or "").strip(),
-        str(compiled_request.get("selected_primary_path", "") or "").strip(),
-        str(planner.get("expected_result_action", "") or "").strip(),
         ", ".join(semantic_expectations),
         ", ".join(requested_item_keys),
-        ", ".join(identified_paths),
     ]
     return "\n".join(part for part in query_parts if part)
 
@@ -246,6 +238,7 @@ def _to_template_match(entry: dict[str, Any], score: float) -> TemplateMatch:
         task_type=str(entry.get("task_type", "") or "").strip(),
         input_shape=str(entry.get("input_shape", "") or "").strip(),
         output_shape=str(entry.get("output_shape", "") or "").strip(),
+        retrieval_text=str(entry.get("retrieval_text", "") or "").strip(),
         llm_context=str(entry.get("llm_context", "") or "").strip(),
         score=score,
     )
@@ -366,3 +359,50 @@ def render_template_prompt_block(matches: list[TemplateMatch]) -> str:
     for index, match in enumerate(usable, start=1):
         parts.append(f"Template {index}:\n{match.llm_context}")
     return "\n\n".join(parts)
+
+
+def render_template_selection_prompt(
+    compiled_request: dict[str, Any],
+    matches: list[TemplateMatch],
+) -> str:
+    usable = [match for match in matches if match.llm_context]
+    if not usable:
+        return ""
+
+    planner = compiled_request.get("planner_result") or {}
+    planner = planner if isinstance(planner, dict) else {}
+    requested_item_keys = [
+        str(item or "").strip()
+        for item in compiled_request.get("requested_item_keys", []) or []
+        if str(item or "").strip()
+    ]
+
+    task_parts = [
+        str(compiled_request.get("task_text", "") or "").strip(),
+        str(planner.get("reformulated_task", "") or "").strip(),
+        f"Operation: {str(compiled_request.get('selected_operation', '') or '').strip()}",
+        f"Primary type: {str(compiled_request.get('selected_primary_type', '') or '').strip()}",
+        (
+            "Requested item keys: " + ", ".join(requested_item_keys)
+            if requested_item_keys else ""
+        ),
+    ]
+    parts = [
+        "Current task:",
+        "\n".join(part for part in task_parts if part),
+        "",
+        "Top retrieved candidates:",
+    ]
+    for index, match in enumerate(usable, start=1):
+        candidate_parts = [
+            f"Candidate {index}:",
+            f"id: {match.id}",
+            f"title: {match.title}",
+            f"task_type: {match.task_type}",
+            f"input_shape: {match.input_shape}",
+            f"output_shape: {match.output_shape}",
+            f"retrieval_text: {match.retrieval_text}" if match.retrieval_text else "",
+            f"llm_context:\n{match.llm_context}",
+        ]
+        parts.append("\n".join(part for part in candidate_parts if part))
+    return "\n\n".join(part for part in parts if part.strip())

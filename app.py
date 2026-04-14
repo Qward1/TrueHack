@@ -39,6 +39,7 @@ AGENT_LABELS_RU = {
     "TaskPlanner": "Планировщик задачи",
     "IntentRouter": "Маршрутизатор интента",
     "CodeGenerator": "Генератор кода",
+    "TemplateSelector": "Выбор шаблона",
     "CodeRefiner": "Редактор кода",
     "CodeValidator": "Валидатор кода",
     "ValidationFixer": "Исправление валидации",
@@ -1981,6 +1982,10 @@ def main() -> int:
         log_dir=logging_meta["log_dir"],
         runtime_log=logging_meta["runtime_log_path"],
         llm_prompt_log=logging_meta["llm_prompt_log_path"],
+        startup_count=logging_meta.get("startup_count"),
+        cleanup_every_startups=logging_meta.get("cleanup_every_startups"),
+        logs_cleaned=logging_meta.get("logs_cleaned"),
+        removed_log_files=logging_meta.get("removed_log_files"),
     )
 
     runtime = AppRuntime(args)

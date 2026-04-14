@@ -10,6 +10,7 @@ from typing import Any, Callable
 import structlog
 
 from src.core.llm import LLMProvider
+from src.core.logging_runtime import write_runtime_audit
 from src.core.state import PipelineState
 from src.tools.lua_tools import (
     LOWCODE_CONTRACT_TEXT,
@@ -30,6 +31,7 @@ from src.tools.lua_tools import (
 )
 from src.tools.rag_templates import (
     render_template_prompt_block,
+    render_template_selection_prompt,
     retrieve_template_matches,
 )
 from src.tools.target_tools import (
@@ -44,6 +46,7 @@ logger = structlog.get_logger(__name__)
 _AGENT_RESOLVE_TARGET = "TargetResolver"
 _AGENT_ROUTE_INTENT = "IntentRouter"
 _AGENT_GENERATE_CODE = "CodeGenerator"
+_AGENT_TEMPLATE_SELECTOR = "TemplateSelector"
 _AGENT_REFINE_CODE = "CodeRefiner"
 _AGENT_VALIDATE_CODE = "CodeValidator"
 _AGENT_FIX_VALIDATION_CODE = "ValidationFixer"
@@ -133,6 +136,22 @@ Output format:
 - Output nothing else"""
 )
 
+_TEMPLATE_SELECTOR_SYSTEM = """
+You select the single best Lua template candidate for the code generator.
+
+Return strict JSON only with exactly these fields:
+- "selected_index": 1-based integer index of the best candidate
+- "selected_id": candidate id string copied exactly from the candidate list
+- "reason": short explanation
+
+Rules:
+1. Choose exactly one candidate from the provided list.
+2. Prefer the candidate whose operation and data shape most directly match the current task.
+3. Prefer the most specific structurally compatible template over a generic one.
+4. Do not invent ids or indexes.
+5. If uncertain, choose the safest candidate that least conflicts with the task.
+"""
+
 _REFINE_SYSTEM = (
     "You modify existing Lua workflow scripts according to the user's request. "
     "Return the complete updated script. "
@@ -195,6 +214,21 @@ _EXPLAIN_SYSTEM = (
     "Keep those arrays short. "
     "IMPORTANT: write all text values in the same language as the user_request field "
     "(if the request is in Russian — answer in Russian; if in English — answer in English)."
+)
+
+_RESPONSE_ASSEMBLER_SYSTEM = (
+    "You assemble the final user-facing response for a Lua workflow assistant. "
+    "Write all visible text in Russian. "
+    "Use concise, concrete wording. "
+    "Preserve the facts from the structured input exactly. "
+    "Do not invent checks, paths, errors, or improvements. "
+    "Do not include hidden reasoning. "
+    "Do not include the generated_code block: it will be appended separately by the application. "
+    "If there is no saved path, do not mention that the path is missing. "
+    "If there is a saved path, mention it. "
+    "Use these section headers when the corresponding data exists: "
+    "\"Что сделано:\", \"Что есть в коде:\", \"Как это работает:\", "
+    "\"Что можно улучшить:\", \"Уточняющие вопросы:\"."
 )
 
 _FENCED_BLOCK_RE = re.compile(r"```(?:[A-Za-z0-9_-]+)?\s*([\s\S]*?)```")
@@ -1050,6 +1084,73 @@ def _build_generation_prompt(
     return _join_prompt_sections(*sections)
 
 
+async def _select_best_template_match(
+    *,
+    llm: LLMProvider,
+    compiled_request: dict[str, Any],
+    matches: list[Any],
+) -> tuple[Any | None, dict[str, Any]]:
+    if not matches:
+        return None, {}
+    if len(matches) == 1:
+        return matches[0], {
+            "selected_index": 1,
+            "selected_id": matches[0].id,
+            "reason": "single_candidate",
+        }
+
+    selector_prompt = render_template_selection_prompt(compiled_request, matches)
+    if not selector_prompt.strip():
+        return matches[0], {
+            "selected_index": 1,
+            "selected_id": matches[0].id,
+            "reason": "selector_prompt_empty",
+        }
+
+    selection = await llm.generate_json(
+        prompt=selector_prompt,
+        system=_TEMPLATE_SELECTOR_SYSTEM,
+        temperature=0.0,
+        agent_name=_AGENT_TEMPLATE_SELECTOR,
+    )
+    if not isinstance(selection, dict):
+        return matches[0], {
+            "selected_index": 1,
+            "selected_id": matches[0].id,
+            "reason": "invalid_selector_response",
+        }
+
+    selected_index = selection.get("selected_index")
+    try:
+        selected_index = int(selected_index)
+    except (TypeError, ValueError):
+        selected_index = 0
+
+    selected_id = str(selection.get("selected_id", "") or "").strip()
+    if 1 <= selected_index <= len(matches):
+        candidate = matches[selected_index - 1]
+        if not selected_id or selected_id == candidate.id:
+            return candidate, {
+                "selected_index": selected_index,
+                "selected_id": candidate.id,
+                "reason": str(selection.get("reason", "") or "").strip(),
+            }
+
+    if selected_id:
+        for candidate in matches:
+            if candidate.id == selected_id:
+                return candidate, {
+                    "selected_index": matches.index(candidate) + 1,
+                    "selected_id": candidate.id,
+                    "reason": str(selection.get("reason", "") or "").strip(),
+                }
+    return matches[0], {
+        "selected_index": 1,
+        "selected_id": matches[0].id,
+        "reason": "selector_fallback_first_candidate",
+    }
+
+
 def _build_refine_prompt(
     *,
     function_list: str,
@@ -1484,12 +1585,36 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         )
 
         retrieved_templates = []
+        selected_template = None
+        selection_meta: dict[str, Any] = {}
         if isinstance(compiled_request, dict):
             retrieved_templates = await retrieve_template_matches(compiled_request)
             compiled_request["retrieved_template_ids"] = [match.id for match in retrieved_templates]
             compiled_request["retrieved_template_titles"] = [match.title for match in retrieved_templates]
+            selected_template, selection_meta = await _select_best_template_match(
+                llm=llm,
+                compiled_request=compiled_request,
+                matches=retrieved_templates,
+            )
+            if selected_template is not None:
+                compiled_request["selected_template_id"] = selected_template.id
+                compiled_request["selected_template_title"] = selected_template.title
+            write_runtime_audit(
+                "rag_template_selection",
+                selected_operation=str(compiled_request.get("selected_operation", "") or "").strip(),
+                selected_primary_type=str(compiled_request.get("selected_primary_type", "") or "").strip(),
+                top_k=len(retrieved_templates),
+                candidate_ids=[match.id for match in retrieved_templates],
+                candidate_titles=[match.title for match in retrieved_templates],
+                selected_template_id=(selected_template.id if selected_template is not None else ""),
+                selected_template_title=(selected_template.title if selected_template is not None else ""),
+                selector_reason=str(selection_meta.get("reason", "") or "").strip(),
+                selector_index=selection_meta.get("selected_index"),
+            )
 
-        retrieved_template_block = render_template_prompt_block(retrieved_templates)
+        retrieved_template_block = render_template_prompt_block(
+            [selected_template] if selected_template is not None else []
+        )
         prompt = _build_generation_prompt(
             compiled_request,
             retrieved_template_block=retrieved_template_block,
@@ -1503,6 +1628,7 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             temperature=generation_temperature,
             rag_templates=len(retrieved_templates),
             rag_template_ids=[match.id for match in retrieved_templates],
+            rag_selected_template_id=(selected_template.id if selected_template is not None else ""),
         )
         raw = await llm.generate(
             prompt=prompt,
@@ -2365,40 +2491,27 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             "response_type": "text",
         }
 
-    async def prepare_response(state: PipelineState) -> dict:
-        code = _normalize_runtime_candidate(state.get("generated_code", ""))
-        diagnostics = state.get("diagnostics", {})
-        verification = state.get("verification", {})
-        compiled_request = state.get("compiled_request", {})
-        saved_to = state.get("saved_to", "")
-        saved_jsonstring_to = state.get("saved_jsonstring_to", "")
-        save_skipped = state.get("save_skipped", False)
-        save_skip_reason = state.get("save_skip_reason", "")
-        save_error = state.get("save_error", "")
-        explanation = state.get("explanation", {})
-        suggested_changes = state.get("suggested_changes", [])
-        clarifying_questions = state.get("clarifying_questions", [])
-        failure_stage = state.get("failure_stage", "")
-        logger.info(
-            f"[{_AGENT_PREPARE_RESPONSE}] started",
-            code_len=len(code),
-            save_success=state.get("save_success", False),
-            failure_stage=failure_stage,
-            suggested_changes_count=len(suggested_changes),
-            clarifying_questions_count=len(clarifying_questions),
-        )
-
-        if not code.strip():
-            return {
-                "response": state.get("response", "Не удалось сгенерировать код."),
-                "response_type": state.get("response_type", "error"),
-            }
-
+    def _build_prepare_response_fallback(
+        *,
+        code: str,
+        diagnostics: dict[str, Any],
+        verification: dict[str, Any],
+        compiled_request: dict[str, Any],
+        saved_to: str,
+        saved_jsonstring_to: str,
+        save_error: str,
+        explanation: dict[str, Any],
+        suggested_changes: list[Any],
+        clarifying_questions: list[Any],
+        failure_stage: str,
+        validation_passed: bool,
+        verification_passed: bool,
+        save_success: bool,
+        target_path: str,
+    ) -> str:
         lines: list[str] = []
-        validation_passed = bool(state.get("validation_passed", False))
-        verification_passed = bool(state.get("verification_passed", False))
 
-        if state.get("save_success", False):
+        if save_success:
             if validation_passed and verification_passed:
                 lines.append("Код сгенерирован, прошел проверки и сохранен.\n")
             else:
@@ -2406,29 +2519,15 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 if failure_stage:
                     lines.append(f"Этап с проблемой: {failure_stage}\n")
                 lines.append("Проверки не пройдены полностью, но файл обновлен последней версией кода.\n")
-        elif save_skipped:
-            if validation_passed and verification_passed:
-                lines.append("Код сгенерирован и прошел проверки.\n")
-            else:
-                lines.append("Код подготовлен, но финальные условия сохранения не выполнены.\n")
-                if failure_stage:
-                    lines.append(f"Этап с проблемой: {failure_stage}\n")
-            lines.append(f"{save_skip_reason or 'Путь не указан, поэтому файл не сохранялся.'}\n")
+        elif validation_passed and verification_passed:
+            lines.append("Код сгенерирован и прошел проверки.\n")
         else:
             lines.append("Код подготовлен, но финальные условия сохранения не выполнены.\n")
             if failure_stage:
                 lines.append(f"Этап с проблемой: {failure_stage}\n")
 
-        if save_skipped and not (validation_passed and verification_passed):
-            if lines:
-                lines[0] = "Код подготовлен, но финальные условия сохранения не выполнены.\n"
-            if failure_stage:
-                stage_line = f"Этап с проблемой: {failure_stage}\n"
-                if stage_line not in lines:
-                    lines.insert(1 if lines else 0, stage_line)
-
         if diagnostics.get("run_error"):
-            lines.append(f"Runtime error: {diagnostics.get('run_error')}\n")
+            lines.append(f"Ошибка выполнения: {diagnostics.get('run_error')}\n")
 
         verification_summary = str(verification.get("summary", "")).strip()
         if verification_summary:
@@ -2443,13 +2542,13 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
 
         lines.append(
             "```json\n"
-            f"{format_lowcode_json_payload(code, compiled_request=compiled_request if isinstance(compiled_request, dict) else None, target_path=saved_to or state.get('target_path', ''))}\n"
+            f"{format_lowcode_json_payload(code, compiled_request=compiled_request if isinstance(compiled_request, dict) else None, target_path=saved_to or target_path)}\n"
             "```"
         )
 
         run_output = diagnostics.get("run_output", "").strip()
         if run_output:
-            lines.append(f"\nRuntime output:\n```\n{run_output}\n```")
+            lines.append(f"\nРезультат выполнения:\n```\n{run_output}\n```")
 
         if isinstance(explanation, dict):
             summary = str(explanation.get("summary", "")).strip()
@@ -2484,7 +2583,146 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 if question_text:
                     lines.append(f"{index}. {question_text}")
 
-        response_text = "\n".join(lines)
+        return "\n".join(lines)
+
+    def _build_prepare_response_prompt(
+        *,
+        diagnostics: dict[str, Any],
+        verification: dict[str, Any],
+        explanation: dict[str, Any],
+        suggested_changes: list[Any],
+        clarifying_questions: list[Any],
+        failure_stage: str,
+        validation_passed: bool,
+        verification_passed: bool,
+        save_success: bool,
+        saved_to: str,
+        saved_jsonstring_to: str,
+        save_error: str,
+    ) -> str:
+        payload = {
+            "status": {
+                "save_success": save_success,
+                "validation_passed": validation_passed,
+                "verification_passed": verification_passed,
+                "failure_stage": failure_stage,
+                "saved_to": saved_to,
+                "saved_jsonstring_to": saved_jsonstring_to,
+                "save_error": save_error,
+                "run_error": str(diagnostics.get("run_error", "") or "").strip(),
+                "verification_summary": str(verification.get("summary", "") or "").strip(),
+            },
+            "explanation": explanation if isinstance(explanation, dict) else {},
+            "suggested_changes": list(suggested_changes or []),
+            "clarifying_questions": list(clarifying_questions or []),
+        }
+        return (
+            "Собери итоговый ответ пользователю на русском языке.\n"
+            "Сохрани факты из входных данных. Не добавляй новых фактов.\n"
+            "Если путь сохранения отсутствует, не пиши, что путь не указан.\n"
+            "Если путь есть, укажи его.\n"
+            "Не добавляй блок generated_code: приложение добавит его само.\n"
+            "Верни только итоговый текст ответа в Markdown.\n\n"
+            f"Данные:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+        )
+
+    async def prepare_response(state: PipelineState) -> dict:
+        code = _normalize_runtime_candidate(state.get("generated_code", ""))
+        diagnostics = state.get("diagnostics", {})
+        verification = state.get("verification", {})
+        compiled_request = state.get("compiled_request", {})
+        saved_to = state.get("saved_to", "")
+        saved_jsonstring_to = state.get("saved_jsonstring_to", "")
+        save_skipped = state.get("save_skipped", False)
+        save_skip_reason = state.get("save_skip_reason", "")
+        save_error = state.get("save_error", "")
+        explanation = state.get("explanation", {})
+        suggested_changes = state.get("suggested_changes", [])
+        clarifying_questions = state.get("clarifying_questions", [])
+        failure_stage = state.get("failure_stage", "")
+        logger.info(
+            f"[{_AGENT_PREPARE_RESPONSE}] started",
+            code_len=len(code),
+            save_success=state.get("save_success", False),
+            failure_stage=failure_stage,
+            suggested_changes_count=len(suggested_changes),
+            clarifying_questions_count=len(clarifying_questions),
+        )
+
+        if not code.strip():
+            return {
+                "response": state.get("response", "Не удалось сгенерировать код."),
+                "response_type": state.get("response_type", "error"),
+            }
+
+        validation_passed = bool(state.get("validation_passed", False))
+        verification_passed = bool(state.get("verification_passed", False))
+        fallback_text = _build_prepare_response_fallback(
+            code=code,
+            diagnostics=diagnostics,
+            verification=verification,
+            compiled_request=compiled_request,
+            saved_to=saved_to,
+            saved_jsonstring_to=saved_jsonstring_to,
+            save_error=save_error,
+            explanation=explanation,
+            suggested_changes=suggested_changes,
+            clarifying_questions=clarifying_questions,
+            failure_stage=failure_stage,
+            validation_passed=validation_passed,
+            verification_passed=verification_passed,
+            save_success=bool(state.get("save_success", False)),
+            target_path=state.get("target_path", ""),
+        )
+
+        response_text = fallback_text
+        assembler_prompt = _build_prepare_response_prompt(
+            diagnostics=diagnostics,
+            verification=verification,
+            explanation=explanation,
+            suggested_changes=suggested_changes,
+            clarifying_questions=clarifying_questions,
+            failure_stage=failure_stage,
+            validation_passed=validation_passed,
+            verification_passed=verification_passed,
+            save_success=bool(state.get("save_success", False)),
+            saved_to=saved_to,
+            saved_jsonstring_to=saved_jsonstring_to,
+            save_error=save_error,
+        )
+        try:
+            logger.info(
+                f"[{_AGENT_PREPARE_RESPONSE}/llm.generate] calling",
+                prompt_len=len(assembler_prompt),
+            )
+            assembled_text = await llm.generate(
+                prompt=assembler_prompt,
+                system=_RESPONSE_ASSEMBLER_SYSTEM,
+                temperature=0.1,
+                agent_name=_AGENT_PREPARE_RESPONSE,
+            )
+            assembled_text = str(assembled_text or "").strip()
+            if assembled_text:
+                generated_code_block = (
+                    "```json\n"
+                    f"{format_lowcode_json_payload(code, compiled_request=compiled_request if isinstance(compiled_request, dict) else None, target_path=saved_to or state.get('target_path', ''))}\n"
+                    "```"
+                )
+                response_parts = [assembled_text, generated_code_block]
+                run_output = str(diagnostics.get("run_output", "") or "").strip()
+                if run_output:
+                    response_parts.append(f"Результат выполнения:\n```\n{run_output}\n```")
+                response_text = "\n\n".join(part for part in response_parts if str(part).strip())
+            logger.info(
+                f"[{_AGENT_PREPARE_RESPONSE}/llm.generate] done",
+                response_len=len(response_text),
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[{_AGENT_PREPARE_RESPONSE}/llm.generate] failed",
+                error=str(exc),
+            )
+            response_text = fallback_text
         logger.info(
             f"[{_AGENT_PREPARE_RESPONSE}] completed",
             response_len=len(response_text),
