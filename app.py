@@ -386,6 +386,11 @@ HTML_PAGE = """<!doctype html>
       gap: 10px;
       height: 100vh;
       height: 100dvh;
+      transition: grid-template-columns 0.22s ease;
+    }
+
+    .shell.sidebar-collapsed {
+      grid-template-columns: 68px minmax(0, 1fr);
     }
 
     .panel {
@@ -416,6 +421,50 @@ HTML_PAGE = """<!doctype html>
       height: 100%;
       overflow: auto;
       order: 1;
+      transition: padding 0.22s ease;
+    }
+
+    .side-panel-top {
+      display: flex;
+      justify-content: flex-end;
+      flex-shrink: 0;
+    }
+
+    .side-toggle {
+      min-width: 44px;
+      padding: 10px 12px;
+      border-radius: 14px;
+      background: rgba(181, 85, 45, 0.08);
+      color: var(--accent-dark);
+      font-weight: 700;
+    }
+
+    .side-panel-rail {
+      display: none;
+      flex-direction: column;
+      gap: 10px;
+      flex: 1;
+      min-height: 0;
+      align-items: stretch;
+    }
+
+    .rail-chip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 92px;
+      padding: 10px 8px;
+      border-radius: 16px;
+      border: 1px solid rgba(216, 199, 170, 0.92);
+      background: rgba(255, 255, 255, 0.55);
+      color: var(--accent-dark);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      writing-mode: vertical-rl;
+      transform: rotate(180deg);
+      user-select: none;
     }
 
     .hero {
@@ -709,6 +758,19 @@ HTML_PAGE = """<!doctype html>
       flex: 0 0 auto;
     }
 
+    .shell.sidebar-collapsed .side-panel {
+      padding: 12px 10px;
+      overflow: hidden;
+    }
+
+    .shell.sidebar-collapsed .side-card {
+      display: none;
+    }
+
+    .shell.sidebar-collapsed .side-panel-rail {
+      display: flex;
+    }
+
     .chat-row {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
@@ -892,6 +954,18 @@ HTML_PAGE = """<!doctype html>
         height: auto;
         overflow: visible;
       }
+
+      .shell.sidebar-collapsed {
+        grid-template-columns: 1fr;
+      }
+
+      .shell.sidebar-collapsed .side-card {
+        display: flex;
+      }
+
+      .shell.sidebar-collapsed .side-panel-rail {
+        display: none;
+      }
     }
   </style>
 </head>
@@ -936,6 +1010,13 @@ HTML_PAGE = """<!doctype html>
     </section>
 
     <aside class="panel side-panel">
+      <div class="side-panel-top">
+        <button type="button" class="side-toggle" id="toggleSidebarButton" aria-expanded="true" title="Свернуть боковую панель">⟨</button>
+      </div>
+      <div class="side-panel-rail" aria-hidden="true">
+        <div class="rail-chip">Чаты</div>
+        <div class="rail-chip">Код</div>
+      </div>
       <div class="side-card chat-list-card">
         <div class="chat-list-head">
           <h2>Чаты</h2>
@@ -964,10 +1045,37 @@ HTML_PAGE = """<!doctype html>
     const copyCodeButton = document.getElementById("copyCodeButton");
     const chatList = document.getElementById("chatList");
     const newChatButton = document.getElementById("newChatButton");
+    const shell = document.querySelector(".shell");
+    const toggleSidebarButton = document.getElementById("toggleSidebarButton");
     let activeChatId = null;
     let stopThinkingIndicator = null;
     let cancelRequested = false;
     let activeStatePollTimer = null;
+
+    function applySidebarCollapsedState(collapsed) {
+      if (!shell || !toggleSidebarButton) {
+        return;
+      }
+      shell.classList.toggle("sidebar-collapsed", collapsed);
+      toggleSidebarButton.textContent = collapsed ? "⟩" : "⟨";
+      toggleSidebarButton.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      toggleSidebarButton.title = collapsed ? "Развернуть боковую панель" : "Свернуть боковую панель";
+      try {
+        window.localStorage.setItem("localscriptlua:sidebar:collapsed", collapsed ? "1" : "0");
+      } catch (error) {
+        // Ignore storage failures.
+      }
+    }
+
+    function restoreSidebarCollapsedState() {
+      let collapsed = false;
+      try {
+        collapsed = window.localStorage.getItem("localscriptlua:sidebar:collapsed") === "1";
+      } catch (error) {
+        collapsed = false;
+      }
+      applySidebarCollapsedState(collapsed);
+    }
 
     function addMessage(kind, title, text) {
       const card = document.createElement("div");
@@ -1342,6 +1450,10 @@ HTML_PAGE = """<!doctype html>
       await copyLatestCode();
     });
 
+    toggleSidebarButton.addEventListener("click", () => {
+      applySidebarCollapsedState(!shell.classList.contains("sidebar-collapsed"));
+    });
+
     composer.addEventListener("submit", async (event) => {
       event.preventDefault();
       const text = input.value;
@@ -1396,6 +1508,8 @@ HTML_PAGE = """<!doctype html>
         setBusy(false);
       }
     });
+
+    restoreSidebarCollapsedState();
 
     refreshState(true).catch((error) => {
       addMessage("assistant", "Ошибка Инициализации", String(error));

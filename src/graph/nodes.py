@@ -108,6 +108,7 @@ LOWCODE_LUA_RULES = (
     "Allowed data types: nil, boolean, number, string, table, function, and array. "
     "When a new array is needed, create it with _utils.array.new(), populate items explicitly, "
     "then call _utils.array.markAsArray(arr). "
+    "Do not use _utils.array.append(...); append items by explicit array indexing such as arr[#arr + 1] = value. "
     "When an existing table must be treated as an array, use _utils.array.markAsArray(arr). "
 
     "Allowed control flow constructs: if/then/else, while/do/end, for/do/end, repeat/until."
@@ -137,6 +138,7 @@ Code rules:
 - Use return and/or explicit wf.vars updates only when requested.
 - For simple tasks, keep the code minimal and direct.
 - If a new array is needed, use _utils.array.new(), populate items explicitly, then call _utils.array.markAsArray(arr).
+- Do not use _utils.array.append(...); append items by explicit array indexing such as arr[#arr + 1] = value.
 - If an existing table must be treated as an array, use _utils.array.markAsArray(arr).
 
 Conditional rule:
@@ -285,6 +287,7 @@ _PROMPT_SYNTHESIS_GUIDANCE = """Generation guidance:
 - If the task is shape-sensitive, treat an array as a table with numeric keys 1..n without gaps. A table with string keys like `name` or `phone` is an object, not an array. Treat an empty table as an array.
 - If the task is shape-sensitive, explicitly distinguish object-like tables from array-like tables with numeric keys instead of relying only on `type(x) == "table"`, `next(x)`, or empty/non-empty tests.
 - If you need a new array, create it with `_utils.array.new()`, assign items explicitly, then call `_utils.array.markAsArray(arr)` before return/store.
+- Do not use `_utils.array.append(...)`; append items by explicit array indexing such as `arr[#arr + 1] = value`.
 - For numeric aggregation over workflow arrays, iterate the items explicitly and convert number-like string values with `tonumber(...)` or guard nils before arithmetic.
 - Keep simple tasks simple, but let complex tasks stay multi-step and explicit."""
 

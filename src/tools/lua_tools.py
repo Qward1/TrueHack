@@ -36,6 +36,7 @@ LOWCODE_CONTRACT_TEXT = (
     "- Never recreate the provided workflow input as demo tables like local data = {...} or local emails = {...}.\n"
     "- Output: use `return <value>` and/or explicit wf.vars updates; never print(), io.write(), io.read().\n"
     "- For new arrays: call `_utils.array.new()` with no inline arguments, populate items explicitly, then call `_utils.array.markAsArray(arr)` before return/store.\n"
+    "- `_utils.array.append(...)` is not available; append items with explicit array indexing like `arr[#arr + 1] = value`.\n"
     "- For shape-sensitive array tasks, an array is a table whose keys are exactly numeric 1..n without gaps. A table with string keys like `name` or `phone` is an object, not an array. Treat an empty table as an array.\n"
     "- When normalizing shape-sensitive data, distinguish scalar vs object-like table vs array-like table; do not rely only on `type(x) == 'table'`, `next(x)`, or emptiness-only tests.\n"
     "- Keep the script focused on the task and avoid unrelated wrappers, classes, or boilerplate.\n"
@@ -2013,7 +2014,27 @@ def validate_lowcode_llm_output(raw_response: str) -> dict[str, Any]:
         analysis["reason"] = "Response must start with lua{ and end with }lua without extra wrappers."
         return analysis
 
+    lowcode_array_error = _validate_lowcode_array_contract(normalized)
+    if lowcode_array_error:
+        analysis["valid"] = False
+        analysis["reason"] = lowcode_array_error
+        return analysis
+
     return analysis
+
+
+def _validate_lowcode_array_contract(normalized: str) -> str:
+    if "_utils.array.append" in normalized:
+        return (
+            "LowCode arrays do not support `_utils.array.append(...)`; "
+            "append items explicitly and keep `_utils.array.markAsArray(arr)` before return/store."
+        )
+    if "_utils.array.new()" in normalized and "_utils.array.markAsArray(" not in normalized:
+        return (
+            "Scripts that create arrays with `_utils.array.new()` must also call "
+            "`_utils.array.markAsArray(arr)` before return/store."
+        )
+    return ""
 
 
 def analyze_lua_response(text: str) -> dict[str, Any]:

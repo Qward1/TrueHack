@@ -248,6 +248,31 @@ return value
         self.assertFalse(analysis["valid"])
         self.assertIn("without surrounding quotes", analysis["reason"])
 
+    def test_validate_lowcode_llm_output_rejects_array_append_helper(self) -> None:
+        analysis = validate_lowcode_llm_output(
+            """lua{
+local arr = _utils.array.new()
+_utils.array.append(arr, wf.vars.contacts)
+_utils.array.markAsArray(arr)
+return arr
+}lua"""
+        )
+
+        self.assertFalse(analysis["valid"])
+        self.assertIn("_utils.array.append", analysis["reason"])
+
+    def test_validate_lowcode_llm_output_requires_mark_as_array_for_new_arrays(self) -> None:
+        analysis = validate_lowcode_llm_output(
+            """lua{
+local arr = _utils.array.new()
+arr[1] = wf.vars.contacts
+return arr
+}lua"""
+        )
+
+        self.assertFalse(analysis["valid"])
+        self.assertIn("_utils.array.markAsArray", analysis["reason"])
+
     def test_format_lowcode_json_payload_uses_workflow_leaf_name(self) -> None:
         payload = format_lowcode_json_payload(
             "return wf.initVariables.recallTime",
