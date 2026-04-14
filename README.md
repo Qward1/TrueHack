@@ -2,6 +2,8 @@
 
 Локальный web runtime для генерации, доработки, валидации и сохранения workflow/LUS Lua-скриптов.
 
+Архитектурная схема в нотации C4: [docs/C4.md](/mnt/c/Users/Admin/Desktop/3ABCD/TrueHack/docs/C4.md)
+
 ## Что делает проект
 - принимает задачу на естественном языке;
 - генерирует или дорабатывает LowCode workflow/LUS script на `Lua 5.5`;
