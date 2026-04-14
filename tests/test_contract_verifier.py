@@ -64,7 +64,7 @@ class TestNormalizeContractVerifierResult(unittest.TestCase):
 
 
 class TestContractVerifierPrompt(unittest.TestCase):
-    def test_prompt_contains_runtime_and_after_state(self) -> None:
+    def test_prompt_contains_whitelists_and_focused_evidence_only(self) -> None:
         prompt = _build_contract_verifier_prompt(
             {
                 "task": "Use wf.initVariables.recallTime and return unix time.",
@@ -73,14 +73,18 @@ class TestContractVerifierPrompt(unittest.TestCase):
                 "expected_result_action": "return",
                 "expected_return_path": "wf.initVariables.recallTime",
                 "expected_top_level_type": "scalar",
+                "before_state": {"wf": {"initVariables": {"recallTime": "2026-04-13T10:20:30"}}},
                 "runtime_result": "2026-04-13T10:20:30",
                 "after_state": {"wf": {"vars": {"time": "2026-04-13T10:20:30"}}},
             }
         )
+        self.assertIn("allowed_workflow_paths", prompt)
+        self.assertIn("available_code_variables", prompt)
+        self.assertIn("available_runtime_evidence", prompt)
         self.assertIn("runtime_result", prompt)
-        self.assertIn("after_state", prompt)
         self.assertIn("wf.initVariables.recallTime", prompt)
-        self.assertIn('"verifier_name": "ContractVerifier"', prompt)
+        self.assertIn("before_state value at wf.initVariables.recallTime", prompt)
+        self.assertNotIn("Parsed workflow context:", prompt)
 
 
 class TestContractVerifierAgent(unittest.TestCase):
@@ -227,8 +231,10 @@ class TestContractVerifierAgent(unittest.TestCase):
         self.assertEqual(llm.call_count, 1)
         self.assertEqual(llm.last_system, _SYSTEM_PROMPT)
         self.assertEqual(llm.last_agent_name, "ContractVerifier")
+        self.assertIn("allowed_workflow_paths", llm.last_prompt)
+        self.assertIn("available_code_variables", llm.last_prompt)
         self.assertIn("runtime_result", llm.last_prompt)
-        self.assertIn("after_state", llm.last_prompt)
+        self.assertNotIn("Parsed workflow context:", llm.last_prompt)
 
 
 class TestAggregateAdapter(unittest.TestCase):
@@ -271,11 +277,15 @@ class TestStateBridgeAndNode(unittest.TestCase):
         payload = build_contract_verifier_input_from_state(
             {
                 "user_input": "fallback text",
-                "generated_code": "wf.vars.iso_date = value\nreturn wf.vars.iso_date",
+                "generated_code": "local value = wf.initVariables.json.IDOC.ZCDF_HEAD.DATUM\nwf.vars.iso_date = value\nreturn wf.vars.iso_date",
                 "compiled_request": {
                     "verification_prompt": "Convert DATUM/TIME and save to wf.vars.iso_date.",
                     "selected_primary_path": "wf.vars.iso_date",
                     "expected_workflow_paths": ["wf.initVariables.json.IDOC.ZCDF_HEAD.DATUM"],
+                    "workflow_path_inventory": [
+                        {"path": "wf.initVariables.json.IDOC.ZCDF_HEAD.DATUM"},
+                        {"path": "wf.vars.iso_date"},
+                    ],
                     "has_parseable_context": True,
                     "parsed_context": {"wf": {"initVariables": {"json": {}}}},
                     "planner_result": {
@@ -295,6 +305,10 @@ class TestStateBridgeAndNode(unittest.TestCase):
         self.assertIn("wf.initVariables.json.IDOC.ZCDF_HEAD.DATUM", payload["expected_workflow_paths"])
         self.assertIsNotNone(payload["before_state"])
         self.assertIsNotNone(payload["after_state"])
+        self.assertIn("wf.vars.iso_date", payload["allowed_workflow_paths"])
+        self.assertIn("wf.initVariables.json.IDOC.ZCDF_HEAD.DATUM", payload["allowed_workflow_paths"])
+        self.assertIn("value", payload["available_code_variables"])
+        self.assertTrue(payload["available_runtime_evidence"]["after_state"])
 
     def test_node_bridges_result_to_aggregate_verification(self) -> None:
         llm = StubLLM(

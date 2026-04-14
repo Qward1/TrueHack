@@ -29,6 +29,11 @@ Check:
 - shape-sensitive logic that relies only on type(x) == "table"
 - _utils.array.markAsArray applied to the wrong level
 Use runtime_result and after_state as primary evidence when present.
+Use only the data explicitly provided in the input.
+Do not invent workflow paths, variables, fields, shapes, runtime evidence, or nested levels.
+Any path or variable not listed in allowed_workflow_paths, available_code_variables, or the focused evidence sections must be treated as unavailable.
+Fail only when you can point to exact evidence from the input.
+If exact evidence is missing, do not guess and do not fabricate a mismatch.
 Return JSON only.
 If passed=false, point to the exact field path, expected shape, actual shape, and a minimal patch."""
 
@@ -60,6 +65,9 @@ class ShapeTypeVerifierInput(TypedDict, total=False):
     runtime_result: object
     before_state: object
     after_state: object
+    allowed_workflow_paths: list[str]
+    available_code_variables: list[str]
+    available_runtime_evidence: dict[str, bool]
 
 
 class FixerBrief(TypedDict):
@@ -115,6 +123,35 @@ _OUTPUT_SHAPE_EXAMPLE: dict[str, Any] = {
     "confidence": 0.0,
 }
 
+_OUTPUT_SCHEMA_TEXT = """Return JSON only with these keys:
+{
+  "verifier_name": "ShapeTypeVerifier",
+  "passed": true,
+  "error_family": null,
+  "error_code": null,
+  "severity": "low|medium|high|critical",
+  "summary": "string",
+  "field_path": null,
+  "evidence": [],
+  "expected": {},
+  "actual": {},
+  "fixer_brief": {
+    "goal": "string",
+    "must_change": [],
+    "must_preserve": [],
+    "forbidden_fixes": [],
+    "suggested_patch": "string",
+    "patch_scope": "none|local|function_level|multi_block|rewrite"
+  },
+  "confidence": 0.0
+}
+
+Output rules:
+- Keep expected, actual, evidence, and fixer_brief minimal.
+- field_path must be null or an exact path proven by the input.
+- expected.shape and actual.shape must stay minimal and concrete.
+- Do not add any path or variable that is not explicitly available."""
+
 
 def _ensure_string_list(value: object) -> list[str]:
     if not isinstance(value, list):
@@ -138,6 +175,42 @@ def _extract_workflow_paths(text: str) -> list[str]:
     if not text:
         return []
     return _unique_strings(_WORKFLOW_PATH_RE.findall(text))
+
+
+def _extract_inventory_paths(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    paths: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path", "") or "").strip()
+        if path:
+            paths.append(path)
+    return _unique_strings(paths)
+
+
+def _extract_code_variables(code: str) -> list[str]:
+    patterns = (
+        re.compile(r"(?im)^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+        re.compile(r"(?im)^\s*local\s+function\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+        re.compile(r"(?im)^\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+        re.compile(r"(?im)\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s+in\b"),
+        re.compile(r"(?im)\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b"),
+    )
+    reserved = {
+        "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if",
+        "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until",
+        "while", "wf", "vars", "initVariables",
+    }
+    found: list[str] = []
+    for pattern in patterns:
+        for match in pattern.finditer(code or ""):
+            for group in match.groups():
+                name = str(group or "").strip()
+                if name and name not in reserved:
+                    found.append(name)
+    return _unique_strings(found)
 
 
 def _ensure_object(value: object) -> dict[str, Any]:
@@ -165,6 +238,21 @@ def _compact_json(value: object, limit: int = 2500) -> str:
     if len(rendered) <= limit:
         return rendered
     return rendered[: limit - 3].rstrip() + "..."
+
+
+def _format_named_list(title: str, items: list[str]) -> str:
+    normalized = _unique_strings([str(item).strip() for item in items if str(item).strip()])
+    if not normalized:
+        return f"{title}:\n[]"
+    return title + ":\n" + "\n".join(f"- {item}" for item in normalized)
+
+
+def _render_presence_map(title: str, value: object) -> str:
+    data = value if isinstance(value, dict) else {}
+    lines = [f"{title}:"]
+    for key in sorted(data.keys()):
+        lines.append(f"- {key}: {'present' if bool(data[key]) else 'missing'}")
+    return "\n".join(lines)
 
 
 def _build_prompt_sections(*sections: str) -> str:
@@ -677,6 +765,19 @@ def _build_shape_type_verifier_prompt(payload: ShapeTypeVerifierInput) -> str:
     code = str(payload.get("code", "") or "").strip()
     target_field_path = _derive_target_field_path(payload)
     expected_shape = _derive_expected_shape(payload)
+    allowed_workflow_paths = _unique_strings(
+        _ensure_string_list(payload.get("allowed_workflow_paths")) or _ensure_string_list(payload.get("expected_workflow_paths"))
+    )
+    available_code_variables = _unique_strings(
+        _ensure_string_list(payload.get("available_code_variables")) or _extract_code_variables(code)
+    )
+    available_runtime_evidence = payload.get("available_runtime_evidence")
+    if not isinstance(available_runtime_evidence, dict):
+        available_runtime_evidence = {
+            "runtime_result": payload.get("runtime_result") is not None,
+            "before_state": payload.get("before_state") is not None,
+            "after_state": payload.get("after_state") is not None,
+        }
     selected_primary_type = str(payload.get("selected_primary_type", "") or "").strip()
     semantic_expectations = _ensure_string_list(payload.get("semantic_expectations"))
 
@@ -704,31 +805,24 @@ def _build_shape_type_verifier_prompt(payload: ShapeTypeVerifierInput) -> str:
     sections = [
         f"Task:\n{task}" if task else "",
         "Scope:\nCheck only shape/type mismatches. Ignore contract-only issues and full business logic.",
+        "Strict rules:\n"
+        "- Use only explicit input data.\n"
+        "- Never invent workflow paths, variables, or missing nested levels.\n"
+        "- You may reference only names from allowed_workflow_paths, available_code_variables, or focused evidence sections.\n"
+        "- Do not fail on suspicion alone. Cite exact evidence or keep the verdict conservative.",
         "Expected shape contract:\n" + "\n".join(expected_lines) if expected_lines else "",
-        (
-            "Parsed workflow context:\n" + _compact_json(payload.get("parsed_context"))
-            if payload.get("parsed_context") is not None
-            else ""
-        ),
+        _format_named_list("allowed_workflow_paths", allowed_workflow_paths),
+        _format_named_list("available_code_variables", available_code_variables),
+        _render_presence_map("available_runtime_evidence", available_runtime_evidence),
         (
             "runtime_result:\n" + _compact_json(payload.get("runtime_result"))
             if payload.get("runtime_result") is not None
             else ""
         ),
-        (
-            "before_state:\n" + _compact_json(payload.get("before_state"))
-            if payload.get("before_state") is not None
-            else ""
-        ),
-        (
-            "after_state:\n" + _compact_json(payload.get("after_state"))
-            if payload.get("after_state") is not None
-            else ""
-        ),
         before_value_section,
         after_value_section,
         f"Lua solution under review:\n```lua\n{code}\n```",
-        "Return strict JSON in this exact shape:\n" + json.dumps(_OUTPUT_SHAPE_EXAMPLE, ensure_ascii=False, indent=2),
+        _OUTPUT_SCHEMA_TEXT,
     ]
     return _build_prompt_sections(*sections)
 
@@ -748,11 +842,19 @@ def build_shape_type_verifier_input_from_state(state: dict[str, Any]) -> ShapeTy
         or str(compiled_request.get("original_task", "") or "").strip()
         or str(state.get("user_input", "") or "").strip()
     )
+    code = str(state.get("generated_code", "") or state.get("current_code", "") or "")
     selected_primary_path = str(compiled_request.get("selected_primary_path", "") or "").strip()
     expected_workflow_paths = _unique_strings(
         _ensure_string_list(compiled_request.get("expected_workflow_paths"))
         + ([selected_primary_path] if selected_primary_path else [])
         + _extract_workflow_paths(task)
+    )
+    allowed_workflow_paths = _unique_strings(
+        _extract_inventory_paths(compiled_request.get("workflow_path_inventory"))
+        + _extract_workflow_paths(code)
+        + ([selected_primary_path] if selected_primary_path else [])
+        + ([str(compiled_request.get("selected_save_path", "") or "").strip()] if str(compiled_request.get("selected_save_path", "") or "").strip() else [])
+        + expected_workflow_paths
     )
 
     runtime_result: object = diagnostics.get("result_value")
@@ -766,7 +868,7 @@ def build_shape_type_verifier_input_from_state(state: dict[str, Any]) -> ShapeTy
 
     return {
         "task": task,
-        "code": str(state.get("generated_code", "") or state.get("current_code", "") or ""),
+        "code": code,
         "target_field_path": selected_primary_path or None,
         "expected_workflow_paths": expected_workflow_paths,
         "selected_primary_type": _normalize_nullable_string(compiled_request.get("selected_primary_type")),
@@ -778,6 +880,13 @@ def build_shape_type_verifier_input_from_state(state: dict[str, Any]) -> ShapeTy
         "runtime_result": runtime_result,
         "before_state": before_state,
         "after_state": diagnostics.get("workflow_state"),
+        "allowed_workflow_paths": allowed_workflow_paths,
+        "available_code_variables": _extract_code_variables(code),
+        "available_runtime_evidence": {
+            "runtime_result": runtime_result is not None,
+            "before_state": before_state is not None,
+            "after_state": diagnostics.get("workflow_state") is not None,
+        },
     }
 
 

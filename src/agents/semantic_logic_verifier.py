@@ -26,6 +26,11 @@ Check:
 - wrong aggregation
 - wrong computed values
 Use runtime_result and state differences as primary evidence when present.
+Use only the data explicitly provided in the input.
+Do not invent workflow paths, variables, fields, results, runtime evidence, state changes, or counterexamples.
+Any path or variable not listed in allowed_workflow_paths, available_code_variables, or the focused evidence sections must be treated as unavailable.
+Fail only when you can point to exact evidence from the input.
+If exact evidence is missing, do not guess and do not fabricate a mismatch.
 Return JSON only.
 If passed=false, give one concrete counterexample, expected behavior, actual behavior, and a minimal patch."""
 
@@ -75,6 +80,9 @@ class SemanticLogicVerifierInput(TypedDict, total=False):
     runtime_result: object
     before_state: object
     after_state: object
+    allowed_workflow_paths: list[str]
+    available_code_variables: list[str]
+    available_runtime_evidence: dict[str, bool]
 
 
 class FixerBrief(TypedDict):
@@ -125,40 +133,34 @@ class _FilterSpec(TypedDict, total=False):
     clauses: list[_FilterClause]
 
 
-_OUTPUT_SHAPE_EXAMPLE: dict[str, Any] = {
-    "verifier_name": _AGENT_NAME,
-    "passed": False,
-    "error_family": "semantic_logic",
-    "error_code": "extra_items_included",
-    "severity": "high",
-    "summary": "Runtime result includes `id=2` even though `email` is empty.",
-    "field_path": "wf.vars.users",
-    "evidence": [
-        "Primary evidence source: runtime_result.",
-        "Counterexample item `id=2` has empty `email` but was still included.",
-    ],
-    "expected": {
-        "expected_behavior": "Keep only items where `email` is non-empty.",
-        "counterexample": {"id": 2, "email": ""},
-        "field_path": "wf.vars.users",
-        "operation": "filter",
-    },
-    "actual": {
-        "actual_behavior": "Included `id=2` even though it does not satisfy the requested filter.",
-        "counterexample_result": {"id": 2, "email": ""},
-        "field_path": "wf.vars.users",
-        "operation": "filter",
-    },
-    "fixer_brief": {
-        "goal": "Fix the semantic logic only.",
-        "must_change": ["Exclude items where `email` is empty."],
-        "must_preserve": ["Keep the current workflow contract and output shape."],
-        "forbidden_fixes": ["Do not hardcode the counterexample item.", "Do not change unrelated contract logic."],
-        "suggested_patch": "Change the filter predicate so it keeps only items with non-empty `email`.",
-        "patch_scope": "function_level",
-    },
-    "confidence": 1.0,
+_OUTPUT_SCHEMA_TEXT = """Return JSON only with these keys:
+{
+  "verifier_name": "SemanticLogicVerifier",
+  "passed": true,
+  "error_family": null,
+  "error_code": null,
+  "severity": "low|medium|high|critical",
+  "summary": "string",
+  "field_path": null,
+  "evidence": [],
+  "expected": {},
+  "actual": {},
+  "fixer_brief": {
+    "goal": "string",
+    "must_change": [],
+    "must_preserve": [],
+    "forbidden_fixes": [],
+    "suggested_patch": "string",
+    "patch_scope": "none|local|function_level|multi_block|rewrite"
+  },
+  "confidence": 0.0
 }
+
+Output rules:
+- Keep expected, actual, evidence, and fixer_brief minimal.
+- field_path must be null or an exact path proven by the input.
+- expected_behavior and actual_behavior must stay short and concrete.
+- Do not add any path, variable, item, or counterexample that is not explicitly available."""
 
 
 def _ensure_string_list(value: object) -> list[str]:
@@ -214,6 +216,57 @@ def _extract_workflow_paths(text: str) -> list[str]:
     if not text:
         return []
     return _unique_strings(_WORKFLOW_PATH_RE.findall(text))
+
+
+def _extract_inventory_paths(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    paths: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path", "") or "").strip()
+        if path:
+            paths.append(path)
+    return _unique_strings(paths)
+
+
+def _extract_code_variables(code: str) -> list[str]:
+    patterns = (
+        re.compile(r"(?im)^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+        re.compile(r"(?im)^\s*local\s+function\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+        re.compile(r"(?im)^\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+        re.compile(r"(?im)\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s+in\b"),
+        re.compile(r"(?im)\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b"),
+    )
+    reserved = {
+        "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if",
+        "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until",
+        "while", "wf", "vars", "initVariables",
+    }
+    found: list[str] = []
+    for pattern in patterns:
+        for match in pattern.finditer(code or ""):
+            for group in match.groups():
+                name = str(group or "").strip()
+                if name and name not in reserved:
+                    found.append(name)
+    return _unique_strings(found)
+
+
+def _format_named_list(title: str, items: list[str]) -> str:
+    normalized = _unique_strings([str(item).strip() for item in items if str(item).strip()])
+    if not normalized:
+        return f"{title}:\n[]"
+    return title + ":\n" + "\n".join(f"- {item}" for item in normalized)
+
+
+def _render_presence_map(title: str, value: object) -> str:
+    data = value if isinstance(value, dict) else {}
+    lines = [f"{title}:"]
+    for key in sorted(data.keys()):
+        lines.append(f"- {key}: {'present' if bool(data[key]) else 'missing'}")
+    return "\n".join(lines)
 
 
 def _normalize_fixer_brief(raw: object, *, passed: bool) -> FixerBrief:
@@ -1240,6 +1293,19 @@ def _build_semantic_logic_verifier_prompt(payload: SemanticLogicVerifierInput) -
     source_path = _derive_source_field_path(payload)
     output_path = _derive_output_field_path(payload)
     operation = _derive_selected_operation(payload)
+    allowed_workflow_paths = _unique_strings(
+        _ensure_string_list(payload.get("allowed_workflow_paths")) or _ensure_string_list(payload.get("expected_workflow_paths"))
+    )
+    available_code_variables = _unique_strings(
+        _ensure_string_list(payload.get("available_code_variables")) or _extract_code_variables(code)
+    )
+    available_runtime_evidence = payload.get("available_runtime_evidence")
+    if not isinstance(available_runtime_evidence, dict):
+        available_runtime_evidence = {
+            "runtime_result": payload.get("runtime_result") is not None,
+            "before_state": payload.get("before_state") is not None,
+            "after_state": payload.get("after_state") is not None,
+        }
     semantic_expectations = _ensure_string_list(payload.get("semantic_expectations"))
     requested_item_keys = _ensure_string_list(payload.get("requested_item_keys"))
 
@@ -1270,22 +1336,15 @@ def _build_semantic_logic_verifier_prompt(payload: SemanticLogicVerifierInput) -
     sections = [
         f"Task:\n{task}" if task else "",
         "Scope:\nCheck only semantic logic mismatches. Ignore workflow contract issues and shape-only issues.",
+        "Strict rules:\n"
+        "- Use only explicit input data.\n"
+        "- Never invent workflow paths, variables, missing fields, or counterexamples.\n"
+        "- You may reference only names from allowed_workflow_paths, available_code_variables, or focused evidence sections.\n"
+        "- Do not fail on suspicion alone. Cite exact evidence or keep the verdict conservative.",
         "Semantic expectations:\n" + "\n".join(expectation_lines) if expectation_lines else "",
-        (
-            "Parsed workflow context:\n" + _compact_json(payload.get("parsed_context"))
-            if payload.get("parsed_context") is not None
-            else ""
-        ),
-        (
-            "before_state:\n" + _compact_json(payload.get("before_state"))
-            if payload.get("before_state") is not None
-            else ""
-        ),
-        (
-            "after_state:\n" + _compact_json(payload.get("after_state"))
-            if payload.get("after_state") is not None
-            else ""
-        ),
+        _format_named_list("allowed_workflow_paths", allowed_workflow_paths),
+        _format_named_list("available_code_variables", available_code_variables),
+        _render_presence_map("available_runtime_evidence", available_runtime_evidence),
         (
             "runtime_result:\n" + _compact_json(payload.get("runtime_result"))
             if payload.get("runtime_result") is not None
@@ -1294,7 +1353,7 @@ def _build_semantic_logic_verifier_prompt(payload: SemanticLogicVerifierInput) -
         source_value_section,
         observed_value_section,
         f"Lua solution under review:\n```lua\n{code}\n```",
-        "Return strict JSON in this exact shape:\n" + json.dumps(_OUTPUT_SHAPE_EXAMPLE, ensure_ascii=False, indent=2),
+        _OUTPUT_SCHEMA_TEXT,
     ]
     return _build_prompt_sections(*sections)
 
@@ -1329,6 +1388,14 @@ def build_semantic_logic_verifier_input_from_state(state: dict[str, Any]) -> Sem
         + ([output_field_path] if output_field_path else [])
         + _extract_workflow_paths(task)
     )
+    code = str(state.get("generated_code", "") or state.get("current_code", "") or "")
+    allowed_workflow_paths = _unique_strings(
+        _extract_inventory_paths(compiled_request.get("workflow_path_inventory"))
+        + _extract_workflow_paths(code)
+        + ([source_field_path] if source_field_path else [])
+        + ([output_field_path] if output_field_path else [])
+        + expected_workflow_paths
+    )
 
     runtime_result: object = diagnostics.get("result_value")
     if runtime_result is None:
@@ -1341,7 +1408,7 @@ def build_semantic_logic_verifier_input_from_state(state: dict[str, Any]) -> Sem
 
     return {
         "task": task,
-        "code": str(state.get("generated_code", "") or state.get("current_code", "") or ""),
+        "code": code,
         "source_field_path": source_field_path or None,
         "output_field_path": output_field_path or None,
         "expected_workflow_paths": expected_workflow_paths,
@@ -1353,6 +1420,13 @@ def build_semantic_logic_verifier_input_from_state(state: dict[str, Any]) -> Sem
         "runtime_result": runtime_result,
         "before_state": before_state,
         "after_state": diagnostics.get("workflow_state"),
+        "allowed_workflow_paths": allowed_workflow_paths,
+        "available_code_variables": _extract_code_variables(code),
+        "available_runtime_evidence": {
+            "runtime_result": runtime_result is not None,
+            "before_state": before_state is not None,
+            "after_state": diagnostics.get("workflow_state") is not None,
+        },
     }
 
 

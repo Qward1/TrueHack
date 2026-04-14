@@ -14,7 +14,7 @@ from src.graph.nodes import _build_generation_prompt, _format_planner_section
 
 
 # System prompt prefixes used by various agents in the pipeline.
-PLANNER_SYSTEM_PREFIX = "You are a task analyst for a Lua workflow script generator."
+PLANNER_SYSTEM_PREFIX = "You are TaskPlanner for a Lua workflow script generator."
 ROUTE_SYSTEM_PREFIX = "You are an intent classifier"
 EXPLAIN_SYSTEM_PREFIX = "You explain generated Lua code"
 VERIFY_SYSTEM_PREFIX = "You review whether a Lua solution fully satisfies the user's request."

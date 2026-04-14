@@ -27,6 +27,11 @@ Your job:
 - keep working parts unchanged
 - apply the smallest valid patch when possible
 - obey must_change, must_preserve, forbidden_fixes
+Use only the data explicitly provided in the input.
+Do not invent workflow paths, variables, fields, helpers, runtime evidence, or state changes.
+You may use only names from allowed_workflow_paths, available_code_variables, verifier_result, current_lua_code, or focused evidence sections.
+Patch only the reported problem.
+Do not introduce new helper functions, workflow paths, or variables unless they already exist in the current code or are explicitly required by verifier_result.
 Do not ignore the verifier diagnosis.
 Do not return the same code unless no valid patch is possible.
 Return JSON only.
@@ -55,6 +60,7 @@ _VALID_PATCH_SCOPES = {"none", "local", "function_level", "multi_block", "rewrit
 _ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200d\ufeff]")
 _FENCED_RE = re.compile(r"^```(?:[A-Za-z0-9_-]+)?\s*([\s\S]*?)```$", re.IGNORECASE)
 _LOWCODE_WRAPPER_RE = re.compile(r"^lua\{\s*([\s\S]*?)\s*\}lua$", re.IGNORECASE)
+_WORKFLOW_PATH_RE = re.compile(r"wf\.(?:vars|initVariables)(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
 
 
 class FixerBrief(TypedDict):
@@ -90,6 +96,9 @@ class UniversalVerificationFixerInput(TypedDict, total=False):
     runtime_result: object
     verifier_result: object
     previous_fix_attempts: list[object]
+    allowed_workflow_paths: list[str]
+    available_code_variables: list[str]
+    available_runtime_evidence: dict[str, bool]
 
 
 class UniversalVerificationFixerResult(TypedDict):
@@ -155,6 +164,18 @@ def _ensure_string_list(value: object) -> list[str]:
     return normalized
 
 
+def _unique_strings(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in items:
+        normalized = str(item).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
 def _ensure_object(value: object) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
@@ -192,6 +213,83 @@ def _compact_json(value: object) -> str:
         return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
     except TypeError:
         return json.dumps(str(value), ensure_ascii=False)
+
+
+def _extract_workflow_paths(text: str) -> list[str]:
+    if not text:
+        return []
+    return _unique_strings(_WORKFLOW_PATH_RE.findall(text))
+
+
+def _extract_inventory_paths(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    paths: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path", "") or "").strip()
+        if path:
+            paths.append(path)
+    return _unique_strings(paths)
+
+
+def _extract_code_variables(code: str) -> list[str]:
+    patterns = (
+        re.compile(r"(?im)^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+        re.compile(r"(?im)^\s*local\s+function\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+        re.compile(r"(?im)^\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+        re.compile(r"(?im)\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s+in\b"),
+        re.compile(r"(?im)\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b"),
+    )
+    reserved = {
+        "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if",
+        "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until",
+        "while", "wf", "vars", "initVariables",
+    }
+    found: list[str] = []
+    for pattern in patterns:
+        for match in pattern.finditer(code or ""):
+            for group in match.groups():
+                name = str(group or "").strip()
+                if name and name not in reserved:
+                    found.append(name)
+    return _unique_strings(found)
+
+
+def _split_workflow_path(path: str) -> list[str]:
+    normalized = str(path or "").strip()
+    if not normalized.startswith("wf."):
+        return []
+    return [token for token in normalized.split(".") if token]
+
+
+def _resolve_workflow_path_value(root: object, path: str) -> tuple[bool, object]:
+    tokens = _split_workflow_path(path)
+    if not tokens:
+        return False, None
+    current = root
+    for token in tokens:
+        if isinstance(current, dict) and token in current:
+            current = current[token]
+            continue
+        return False, None
+    return True, current
+
+
+def _format_named_list(title: str, items: list[str]) -> str:
+    normalized = _unique_strings([str(item).strip() for item in items if str(item).strip()])
+    if not normalized:
+        return f"{title}:\n[]"
+    return title + ":\n" + "\n".join(f"- {item}" for item in normalized)
+
+
+def _render_presence_map(title: str, value: object) -> str:
+    data = value if isinstance(value, dict) else {}
+    lines = [f"{title}:"]
+    for key in sorted(data.keys()):
+        lines.append(f"- {key}: {'present' if bool(data[key]) else 'missing'}")
+    return "\n".join(lines)
 
 
 def _strip_markdown_fence(text: str) -> str:
@@ -267,6 +365,41 @@ def _normalize_verifier_result(raw: object) -> NormalizedVerifierResult:
         "fixer_brief": _normalize_fixer_brief(data.get("fixer_brief")),
         "confidence": _clamp_confidence(data.get("confidence")),
     }
+
+
+def _collect_verifier_related_paths(raw: object) -> list[str]:
+    if not isinstance(raw, dict):
+        return []
+    fragments: list[str] = []
+    field_path = _normalize_nullable_string(raw.get("field_path"))
+    if field_path:
+        fragments.append(field_path)
+    for key in ("expected", "actual", "fixer_brief"):
+        value = raw.get(key)
+        if value is None:
+            continue
+        fragments.append(_compact_json(value))
+    fragments.append(str(raw.get("summary", "") or ""))
+    return _unique_strings(_extract_workflow_paths("\n".join(fragments)))
+
+
+def _build_verifier_diagnosis_section(verifier_result: NormalizedVerifierResult) -> str:
+    lines = [
+        f"- verifier_name: {verifier_result['verifier_name']}",
+        f"- passed: {str(verifier_result['passed']).lower()}",
+        f"- error_family: {verifier_result['error_family'] or ''}",
+        f"- error_code: {verifier_result['error_code'] or ''}",
+        f"- severity: {verifier_result['severity']}",
+        f"- summary: {verifier_result['summary']}",
+        f"- field_path: {verifier_result['field_path'] or ''}",
+    ]
+    sections = [
+        "Verifier diagnosis:\n" + "\n".join(lines),
+        "Verifier evidence:\n" + _compact_json(verifier_result["evidence"][:5]),
+        "Verifier expected:\n" + _compact_json(verifier_result["expected"]),
+        "Verifier actual:\n" + _compact_json(verifier_result["actual"]),
+    ]
+    return "\n\n".join(section for section in sections if section.strip())
 
 
 def _normalize_previous_fix_attempts(value: object) -> list[dict[str, Any]]:
@@ -408,11 +541,47 @@ def _build_universal_verification_fixer_prompt(payload: UniversalVerificationFix
     code = _normalize_code_for_storage(str(payload.get("code", "") or ""))
     verifier_result = _normalize_verifier_result(payload.get("verifier_result"))
     previous_attempts = _normalize_previous_fix_attempts(payload.get("previous_fix_attempts"))
+    allowed_workflow_paths = _unique_strings(
+        _ensure_string_list(payload.get("allowed_workflow_paths"))
+        or _collect_verifier_related_paths(payload.get("verifier_result"))
+        or _extract_workflow_paths(code)
+    )
+    available_code_variables = _unique_strings(
+        _ensure_string_list(payload.get("available_code_variables")) or _extract_code_variables(code)
+    )
+    available_runtime_evidence = payload.get("available_runtime_evidence")
+    if not isinstance(available_runtime_evidence, dict):
+        available_runtime_evidence = {
+            "workflow_context": payload.get("workflow_context") is not None,
+            "before_state": payload.get("before_state") is not None,
+            "after_state": payload.get("after_state") is not None,
+            "runtime_result": payload.get("runtime_result") is not None,
+            "previous_fix_attempts": bool(previous_attempts),
+        }
+    focused_sections: list[str] = []
+    focused_path = verifier_result["field_path"]
+    if focused_path:
+        for label, root in (
+            ("workflow_context", payload.get("workflow_context")),
+            ("before_state", payload.get("before_state")),
+            ("after_state", payload.get("after_state")),
+        ):
+            if root is None:
+                continue
+            found, value = _resolve_workflow_path_value(root, focused_path)
+            if found:
+                focused_sections.append(f"{label} value at {focused_path}:\n{_compact_json(value)}")
 
     sections = [
         f"Task:\n{task}" if task else "",
         "Current broken Lua code:\n" + _wrap_lua_code(code),
-        "Verifier result (source of truth):\n" + _compact_json(verifier_result),
+        "Strict rules:\n"
+        "- Use only explicit input data.\n"
+        "- Never invent workflow paths, variables, fields, helpers, or runtime evidence.\n"
+        "- You may reference only names from allowed_workflow_paths, available_code_variables, verifier_result, the current Lua code, or focused evidence sections.\n"
+        "- Patch only the reported problem and keep unrelated code unchanged.\n"
+        "- If no real patch is possible, keep the code unchanged and return changed=false.",
+        _build_verifier_diagnosis_section(verifier_result),
         "Fix strategy:\n"
         + "\n".join(
             [
@@ -424,26 +593,15 @@ def _build_universal_verification_fixer_prompt(payload: UniversalVerificationFix
                 f"- suggested_patch: {verifier_result['fixer_brief']['suggested_patch']}",
             ]
         ),
-        (
-            "Workflow context:\n" + _compact_json(payload.get("workflow_context"))
-            if payload.get("workflow_context") is not None
-            else ""
-        ),
-        (
-            "before_state:\n" + _compact_json(payload.get("before_state"))
-            if payload.get("before_state") is not None
-            else ""
-        ),
-        (
-            "after_state:\n" + _compact_json(payload.get("after_state"))
-            if payload.get("after_state") is not None
-            else ""
-        ),
+        _format_named_list("allowed_workflow_paths", allowed_workflow_paths),
+        _format_named_list("available_code_variables", available_code_variables),
+        _render_presence_map("available_runtime_evidence", available_runtime_evidence),
         (
             "runtime_result:\n" + _compact_json(payload.get("runtime_result"))
             if payload.get("runtime_result") is not None
             else ""
         ),
+        *focused_sections,
         "previous_fix_attempts:\n" + _render_attempts(previous_attempts),
         (
             "Return JSON only with fields fixed, changed, applied_error_family, applied_error_code, "
@@ -489,6 +647,7 @@ def build_universal_verification_fixer_input_from_state(state: dict[str, Any]) -
     if not task:
         task = str(state.get("user_input", "") or "").strip()
 
+    verifier_result = _select_verifier_result_from_state(state)
     runtime_result = diagnostics.get("result_value")
     if runtime_result is None:
         preview = diagnostics.get("result_preview")
@@ -499,16 +658,38 @@ def build_universal_verification_fixer_input_from_state(state: dict[str, Any]) -
     before_state = diagnostics.get("before_state")
     if before_state is None and compiled_request.get("has_parseable_context"):
         before_state = parsed_context
+    code = str(state.get("generated_code", "") or state.get("current_code", "") or "")
+    selected_primary_path = _normalize_string(compiled_request.get("selected_primary_path"))
+    selected_save_path = _normalize_string(compiled_request.get("selected_save_path"))
+    expected_workflow_paths = _ensure_string_list(compiled_request.get("expected_workflow_paths"))
+    allowed_workflow_paths = _unique_strings(
+        _extract_inventory_paths(compiled_request.get("workflow_path_inventory"))
+        + _extract_workflow_paths(code)
+        + ([selected_primary_path] if selected_primary_path else [])
+        + ([selected_save_path] if selected_save_path else [])
+        + expected_workflow_paths
+        + _collect_verifier_related_paths(verifier_result)
+    )
+    previous_fix_attempts = _ensure_list(state.get("previous_fix_attempts"))
 
     return {
         "task": task,
-        "code": str(state.get("generated_code", "") or state.get("current_code", "") or ""),
+        "code": code,
         "workflow_context": parsed_context,
         "before_state": before_state,
         "after_state": diagnostics.get("workflow_state"),
         "runtime_result": runtime_result,
-        "verifier_result": _select_verifier_result_from_state(state),
-        "previous_fix_attempts": _ensure_list(state.get("previous_fix_attempts")),
+        "verifier_result": verifier_result,
+        "previous_fix_attempts": previous_fix_attempts,
+        "allowed_workflow_paths": allowed_workflow_paths,
+        "available_code_variables": _extract_code_variables(code),
+        "available_runtime_evidence": {
+            "workflow_context": parsed_context is not None,
+            "before_state": before_state is not None,
+            "after_state": diagnostics.get("workflow_state") is not None,
+            "runtime_result": runtime_result is not None,
+            "previous_fix_attempts": bool(previous_fix_attempts),
+        },
     }
 
 

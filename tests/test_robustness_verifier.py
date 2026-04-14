@@ -63,19 +63,21 @@ class TestNormalizeRobustnessVerifierResult(unittest.TestCase):
 
 
 class TestRobustnessVerifierPrompt(unittest.TestCase):
-    def test_prompt_contains_runtime_error_and_source_context(self) -> None:
+    def test_prompt_contains_runtime_error_whitelists_and_source_context(self) -> None:
         prompt = _build_robustness_verifier_prompt(
             {
                 "task": "Return prefix from wf.vars.phone.",
-                "code": "return string.sub(wf.vars.phone, 1, 3)",
+                "code": "local phone = wf.vars.phone\nreturn string.sub(phone, 1, 3)",
                 "source_field_path": "wf.vars.phone",
                 "before_state": {"wf": {"vars": {"phone": "123"}}},
                 "run_error": "attempt to index a nil value",
             }
         )
+        self.assertIn("allowed_workflow_paths", prompt)
+        self.assertIn("available_code_variables", prompt)
         self.assertIn("run_error", prompt)
         self.assertIn("Resolved source value at wf.vars.phone", prompt)
-        self.assertIn('"verifier_name": "RobustnessVerifier"', prompt)
+        self.assertNotIn("Parsed workflow context:", prompt)
 
 
 class TestRobustnessVerifierAgent(unittest.TestCase):
@@ -258,7 +260,7 @@ class TestStateBridgeAndNode(unittest.TestCase):
     def test_build_input_from_state_uses_current_pipeline_fields(self) -> None:
         payload = build_robustness_verifier_input_from_state(
             {
-                "generated_code": "return string.sub(wf.vars.phone, 1, 3)",
+                "generated_code": "local phone = wf.vars.phone\nreturn string.sub(phone, 1, 3)",
                 "compiled_request": {
                     "verification_prompt": "Return phone prefix.",
                     "selected_primary_path": "wf.vars.phone",
@@ -266,6 +268,7 @@ class TestStateBridgeAndNode(unittest.TestCase):
                     "selected_save_path": "",
                     "semantic_expectations": [],
                     "expected_workflow_paths": ["wf.vars.phone"],
+                    "workflow_path_inventory": [{"path": "wf.vars.phone"}],
                     "has_parseable_context": True,
                     "parsed_context": {"wf": {"vars": {"phone": "123"}}},
                 },
@@ -282,6 +285,9 @@ class TestStateBridgeAndNode(unittest.TestCase):
         self.assertEqual(payload["selected_operation"], "return")
         self.assertEqual(payload["run_error"], "attempt to index a nil value")
         self.assertEqual(payload["failure_kind"], "runtime")
+        self.assertEqual(payload["allowed_workflow_paths"], ["wf.vars.phone"])
+        self.assertIn("phone", payload["available_code_variables"])
+        self.assertTrue(payload["available_runtime_evidence"]["run_error"])
 
     def test_node_bridges_result_to_aggregate_verification(self) -> None:
         llm = StubLLM(

@@ -67,11 +67,11 @@ class TestNormalizeSemanticLogicVerifierResult(unittest.TestCase):
 
 
 class TestSemanticLogicVerifierPrompt(unittest.TestCase):
-    def test_prompt_contains_paths_and_runtime_sections(self) -> None:
+    def test_prompt_contains_whitelists_and_focused_evidence(self) -> None:
         prompt = _build_semantic_logic_verifier_prompt(
             {
                 "task": "Return only users with non-empty email.",
-                "code": "return wf.vars.users",
+                "code": "local users = wf.vars.users\nreturn users",
                 "source_field_path": "wf.vars.users",
                 "output_field_path": "wf.vars.filtered_users",
                 "selected_operation": "filter",
@@ -82,8 +82,11 @@ class TestSemanticLogicVerifierPrompt(unittest.TestCase):
         )
         self.assertIn("source field path", prompt)
         self.assertIn("output field path", prompt)
+        self.assertIn("allowed_workflow_paths", prompt)
+        self.assertIn("available_code_variables", prompt)
         self.assertIn("runtime_result", prompt)
-        self.assertIn('"verifier_name": "SemanticLogicVerifier"', prompt)
+        self.assertIn("Original source value at wf.vars.users", prompt)
+        self.assertNotIn("Parsed workflow context:", prompt)
 
 
 class TestSemanticLogicVerifierAgent(unittest.TestCase):
@@ -277,7 +280,7 @@ class TestStateBridgeAndNode(unittest.TestCase):
     def test_build_input_from_state_uses_current_pipeline_fields(self) -> None:
         payload = build_semantic_logic_verifier_input_from_state(
             {
-                "generated_code": "return { count = 3 }",
+                "generated_code": "local total = 3\nreturn { count = total }",
                 "compiled_request": {
                     "verification_prompt": "Count items in wf.vars.cart.items.",
                     "selected_primary_path": "wf.vars.cart.items",
@@ -287,6 +290,10 @@ class TestStateBridgeAndNode(unittest.TestCase):
                     "semantic_expectations": ["numeric_aggregation"],
                     "requested_item_keys": ["sku"],
                     "expected_workflow_paths": ["wf.vars.cart.items"],
+                    "workflow_path_inventory": [
+                        {"path": "wf.vars.cart.items"},
+                        {"path": "wf.vars.cart_count"},
+                    ],
                     "has_parseable_context": True,
                     "parsed_context": {"wf": {"vars": {"cart": {"items": [{"sku": "A"}, {"sku": "B"}]}}}},
                 },
@@ -301,6 +308,10 @@ class TestStateBridgeAndNode(unittest.TestCase):
         self.assertEqual(payload["selected_operation"], "count")
         self.assertEqual(payload["semantic_expectations"], ["numeric_aggregation"])
         self.assertEqual(payload["requested_item_keys"], ["sku"])
+        self.assertIn("wf.vars.cart.items", payload["allowed_workflow_paths"])
+        self.assertIn("wf.vars.cart_count", payload["allowed_workflow_paths"])
+        self.assertIn("total", payload["available_code_variables"])
+        self.assertTrue(payload["available_runtime_evidence"]["runtime_result"])
 
     def test_node_bridges_result_to_aggregate_verification(self) -> None:
         llm = StubLLM(

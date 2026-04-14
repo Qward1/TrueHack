@@ -67,22 +67,26 @@ class TestNormalizeShapeTypeVerifierResult(unittest.TestCase):
 
 
 class TestShapeTypeVerifierPrompt(unittest.TestCase):
-    def test_prompt_contains_target_shape_and_after_state(self) -> None:
+    def test_prompt_contains_target_shape_whitelists_and_focused_evidence(self) -> None:
         prompt = _build_shape_type_verifier_prompt(
             {
                 "task": "If contacts is not an array, wrap it into an array.",
-                "code": "return wf.vars.contacts",
+                "code": "local contacts = wf.vars.contacts\nreturn contacts",
                 "target_field_path": "wf.vars.contacts",
                 "selected_primary_type": "object",
                 "semantic_expectations": ["array_normalization"],
+                "before_state": {"wf": {"vars": {"contacts": {"name": "Ivan"}}}},
                 "runtime_result": {"name": "Ivan"},
                 "after_state": {"wf": {"vars": {"contacts": {"name": "Ivan"}}}},
             }
         )
         self.assertIn("target field path", prompt)
         self.assertIn("expected shape", prompt)
+        self.assertIn("allowed_workflow_paths", prompt)
+        self.assertIn("available_code_variables", prompt)
         self.assertIn("after_state value at wf.vars.contacts", prompt)
-        self.assertIn('"verifier_name": "ShapeTypeVerifier"', prompt)
+        self.assertIn("before_state value at wf.vars.contacts", prompt)
+        self.assertNotIn("Parsed workflow context:", prompt)
 
 
 class TestShapeTypeVerifierAgent(unittest.TestCase):
@@ -253,13 +257,13 @@ class TestStateBridgeAndNode(unittest.TestCase):
     def test_build_input_from_state_uses_current_pipeline_fields(self) -> None:
         payload = build_shape_type_verifier_input_from_state(
             {
-                "user_input": "fallback text",
-                "generated_code": "return wf.vars.contacts",
+                "generated_code": "local contacts = wf.vars.contacts\nreturn contacts",
                 "compiled_request": {
                     "verification_prompt": "If contacts is not an array, wrap it into an array.",
                     "selected_primary_path": "wf.vars.contacts",
                     "selected_primary_type": "object",
                     "expected_workflow_paths": ["wf.vars.contacts"],
+                    "workflow_path_inventory": [{"path": "wf.vars.contacts"}],
                     "semantic_expectations": ["array_normalization"],
                     "has_parseable_context": True,
                     "parsed_context": {"wf": {"vars": {"contacts": {"name": "Ivan"}}}},
@@ -276,6 +280,9 @@ class TestStateBridgeAndNode(unittest.TestCase):
         self.assertEqual(payload["semantic_expectations"], ["array_normalization"])
         self.assertIsNotNone(payload["before_state"])
         self.assertIsNotNone(payload["after_state"])
+        self.assertEqual(payload["allowed_workflow_paths"], ["wf.vars.contacts"])
+        self.assertIn("contacts", payload["available_code_variables"])
+        self.assertTrue(payload["available_runtime_evidence"]["after_state"])
 
     def test_node_bridges_result_to_aggregate_verification(self) -> None:
         llm = StubLLM(

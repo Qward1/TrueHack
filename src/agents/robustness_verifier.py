@@ -25,6 +25,11 @@ Check:
 - unsafe operations like ipairs(nil), string.sub(nil, ...), tonumber(nil)
 - code that works only for the perfect sample
 Prefer concrete evidence when present, otherwise use cautious heuristics.
+Use only the data explicitly provided in the input.
+Do not invent workflow paths, variables, fields, runtime evidence, or edge cases that are not grounded in the input.
+Any path or variable not listed in allowed_workflow_paths, available_code_variables, or the focused evidence sections must be treated as unavailable.
+Fail only when you can point to exact evidence from the input.
+If exact evidence is missing, do not guess and do not fabricate a mismatch.
 Return JSON only.
 If passed=false, describe the risky edge case and a minimal safe patch."""
 
@@ -70,6 +75,9 @@ class RobustnessVerifierInput(TypedDict, total=False):
     run_output: str
     run_error: str
     failure_kind: str
+    allowed_workflow_paths: list[str]
+    available_code_variables: list[str]
+    available_runtime_evidence: dict[str, bool]
 
 
 class FixerBrief(TypedDict):
@@ -103,33 +111,34 @@ class RobustnessVerifierNodeOutput(TypedDict, total=False):
     failure_stage: str
 
 
-_OUTPUT_SHAPE_EXAMPLE: dict[str, Any] = {
-    "verifier_name": _AGENT_NAME,
-    "passed": False,
-    "error_family": "robustness",
-    "error_code": "unsafe_ipairs",
-    "severity": "high",
-    "summary": "`wf.vars.items` may be nil, but the code calls `ipairs` on it without a guard.",
-    "field_path": "wf.vars.items",
-    "evidence": ["No concrete success evidence was provided.", "Detected `ipairs(wf.vars.items)` without a nil-safe fallback."],
-    "expected": {
-        "edge_case": "`wf.vars.items` is missing or nil.",
-        "expected_behavior": "Handle a missing collection safely and return an empty result or another safe fallback.",
-    },
-    "actual": {
-        "risky_operation": "ipairs(wf.vars.items)",
-        "behavior": "The code assumes the collection always exists.",
-    },
-    "fixer_brief": {
-        "goal": "Make the code safe for missing or empty input.",
-        "must_change": ["Guard `wf.vars.items` before iterating with `ipairs`."],
-        "must_preserve": ["Keep the intended business behavior for valid input."],
-        "forbidden_fixes": ["Do not hardcode a perfect sample."],
-        "suggested_patch": "Default the collection to `{}` or return early when it is nil.",
-        "patch_scope": "local",
-    },
-    "confidence": 1.0,
+_OUTPUT_SCHEMA_TEXT = """Return JSON only with these keys:
+{
+  "verifier_name": "RobustnessVerifier",
+  "passed": true,
+  "error_family": null,
+  "error_code": null,
+  "severity": "low|medium|high|critical",
+  "summary": "string",
+  "field_path": null,
+  "evidence": [],
+  "expected": {},
+  "actual": {},
+  "fixer_brief": {
+    "goal": "string",
+    "must_change": [],
+    "must_preserve": [],
+    "forbidden_fixes": [],
+    "suggested_patch": "string",
+    "patch_scope": "none|local|function_level|multi_block|rewrite"
+  },
+  "confidence": 0.0
 }
+
+Output rules:
+- Keep expected, actual, evidence, and fixer_brief minimal.
+- field_path must be null or an exact path proven by the input.
+- expected.edge_case and actual.behavior must stay short and concrete.
+- Do not add any path, variable, or edge case that is not explicitly available."""
 
 
 def _ensure_string_list(value: object) -> list[str]:
@@ -185,6 +194,57 @@ def _extract_workflow_paths(text: str) -> list[str]:
     if not text:
         return []
     return _unique_strings(_WORKFLOW_PATH_RE.findall(text))
+
+
+def _extract_inventory_paths(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    paths: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path", "") or "").strip()
+        if path:
+            paths.append(path)
+    return _unique_strings(paths)
+
+
+def _extract_code_variables(code: str) -> list[str]:
+    patterns = (
+        re.compile(r"(?im)^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+        re.compile(r"(?im)^\s*local\s+function\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+        re.compile(r"(?im)^\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+        re.compile(r"(?im)\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s+in\b"),
+        re.compile(r"(?im)\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b"),
+    )
+    reserved = {
+        "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if",
+        "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until",
+        "while", "wf", "vars", "initVariables",
+    }
+    found: list[str] = []
+    for pattern in patterns:
+        for match in pattern.finditer(code or ""):
+            for group in match.groups():
+                name = str(group or "").strip()
+                if name and name not in reserved:
+                    found.append(name)
+    return _unique_strings(found)
+
+
+def _format_named_list(title: str, items: list[str]) -> str:
+    normalized = _unique_strings([str(item).strip() for item in items if str(item).strip()])
+    if not normalized:
+        return f"{title}:\n[]"
+    return title + ":\n" + "\n".join(f"- {item}" for item in normalized)
+
+
+def _render_presence_map(title: str, value: object) -> str:
+    data = value if isinstance(value, dict) else {}
+    lines = [f"{title}:"]
+    for key in sorted(data.keys()):
+        lines.append(f"- {key}: {'present' if bool(data[key]) else 'missing'}")
+    return "\n".join(lines)
 
 
 def _normalize_fixer_brief(raw: object, *, passed: bool) -> FixerBrief:
@@ -851,26 +911,33 @@ def _build_robustness_verifier_prompt(payload: RobustnessVerifierInput) -> str:
     code = str(payload.get("code", "") or "").strip()
     context_lines = _build_robustness_context_lines(payload)
     source_path, source_value = _resolve_source_value(payload)
+    allowed_workflow_paths = _unique_strings(
+        _ensure_string_list(payload.get("allowed_workflow_paths")) or _ensure_string_list(payload.get("expected_workflow_paths"))
+    )
+    available_code_variables = _unique_strings(
+        _ensure_string_list(payload.get("available_code_variables")) or _extract_code_variables(code)
+    )
+    available_runtime_evidence = payload.get("available_runtime_evidence")
+    if not isinstance(available_runtime_evidence, dict):
+        available_runtime_evidence = {
+            "runtime_result": payload.get("runtime_result") is not None,
+            "before_state": payload.get("before_state") is not None,
+            "after_state": payload.get("after_state") is not None,
+            "run_error": bool(str(payload.get("run_error", "") or "").strip()),
+        }
 
     sections = [
         f"Task:\n{task}" if task else "",
         "Scope:\nCheck only robustness and edge-case issues. Ignore full business-logic and workflow-contract judgments.",
+        "Strict rules:\n"
+        "- Use only explicit input data.\n"
+        "- Never invent workflow paths, variables, runtime evidence, or synthetic edge cases.\n"
+        "- You may reference only names from allowed_workflow_paths, available_code_variables, or focused evidence sections.\n"
+        "- Do not fail on suspicion alone. Cite exact evidence or keep the verdict conservative.",
         "Execution context:\n" + "\n".join(context_lines) if context_lines else "",
-        (
-            "Parsed workflow context:\n" + _compact_json(payload.get("parsed_context"))
-            if payload.get("parsed_context") is not None
-            else ""
-        ),
-        (
-            "before_state:\n" + _compact_json(payload.get("before_state"))
-            if payload.get("before_state") is not None
-            else ""
-        ),
-        (
-            "after_state:\n" + _compact_json(payload.get("after_state"))
-            if payload.get("after_state") is not None
-            else ""
-        ),
+        _format_named_list("allowed_workflow_paths", allowed_workflow_paths),
+        _format_named_list("available_code_variables", available_code_variables),
+        _render_presence_map("available_runtime_evidence", available_runtime_evidence),
         (
             "runtime_result:\n" + _compact_json(payload.get("runtime_result"))
             if payload.get("runtime_result") is not None
@@ -892,7 +959,7 @@ def _build_robustness_verifier_prompt(payload: RobustnessVerifierInput) -> str:
             else ""
         ),
         f"Lua solution under review:\n```lua\n{code}\n```",
-        "Return strict JSON in this exact shape:\n" + json.dumps(_OUTPUT_SHAPE_EXAMPLE, ensure_ascii=False, indent=2),
+        _OUTPUT_SCHEMA_TEXT,
     ]
     return _build_prompt_sections(*sections)
 
@@ -927,6 +994,14 @@ def build_robustness_verifier_input_from_state(state: dict[str, Any]) -> Robustn
         + ([output_field_path] if output_field_path else [])
         + _extract_workflow_paths(task)
     )
+    code = str(state.get("generated_code", "") or state.get("current_code", "") or "")
+    allowed_workflow_paths = _unique_strings(
+        _extract_inventory_paths(compiled_request.get("workflow_path_inventory"))
+        + _extract_workflow_paths(code)
+        + ([source_field_path] if source_field_path else [])
+        + ([output_field_path] if output_field_path else [])
+        + expected_workflow_paths
+    )
 
     runtime_result: object = diagnostics.get("result_value")
     if runtime_result is None:
@@ -939,7 +1014,7 @@ def build_robustness_verifier_input_from_state(state: dict[str, Any]) -> Robustn
 
     return {
         "task": task,
-        "code": str(state.get("generated_code", "") or state.get("current_code", "") or ""),
+        "code": code,
         "source_field_path": source_field_path or None,
         "output_field_path": output_field_path or None,
         "expected_workflow_paths": expected_workflow_paths,
@@ -952,6 +1027,14 @@ def build_robustness_verifier_input_from_state(state: dict[str, Any]) -> Robustn
         "run_output": str(diagnostics.get("run_output", "") or ""),
         "run_error": str(diagnostics.get("run_error", "") or ""),
         "failure_kind": str(diagnostics.get("failure_kind", "") or ""),
+        "allowed_workflow_paths": allowed_workflow_paths,
+        "available_code_variables": _extract_code_variables(code),
+        "available_runtime_evidence": {
+            "runtime_result": runtime_result is not None,
+            "before_state": before_state is not None,
+            "after_state": diagnostics.get("workflow_state") is not None,
+            "run_error": bool(str(diagnostics.get("run_error", "") or "").strip()),
+        },
     }
 
 

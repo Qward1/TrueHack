@@ -119,12 +119,14 @@ class TestNormalizeUniversalVerificationFixerResult(unittest.TestCase):
 
 
 class TestUniversalVerificationFixerPrompt(unittest.TestCase):
-    def test_prompt_contains_verifier_constraints_and_context(self) -> None:
+    def test_prompt_contains_verifier_constraints_whitelists_and_focused_evidence(self) -> None:
         prompt = _build_universal_verification_fixer_prompt(
             {
                 "task": "Convert recall time.",
                 "code": "return wf.vars.time",
                 "workflow_context": {"wf": {"initVariables": {"recallTime": "2026-04-13T10:20:30"}}},
+                "before_state": {"wf": {"initVariables": {"recallTime": "2026-04-13T10:20:30"}}},
+                "after_state": {"wf": {"vars": {"time": "1681374030"}}},
                 "runtime_result": "1681374030",
                 "verifier_result": {
                     "verifier_name": "ContractVerifier",
@@ -146,11 +148,15 @@ class TestUniversalVerificationFixerPrompt(unittest.TestCase):
                 "previous_fix_attempts": [{"strategy": "unchanged", "changed": False}],
             }
         )
-        self.assertIn("Verifier result (source of truth)", prompt)
+        self.assertIn("Verifier diagnosis:", prompt)
         self.assertIn("must_change", prompt)
         self.assertIn("must_preserve", prompt)
         self.assertIn("forbidden_fixes", prompt)
+        self.assertIn("allowed_workflow_paths", prompt)
+        self.assertIn("available_code_variables", prompt)
+        self.assertIn("after_state value at wf.vars.time", prompt)
         self.assertIn("previous_fix_attempts", prompt)
+        self.assertNotIn("Workflow context:\n", prompt)
 
 
 class TestUniversalVerificationFixerAgent(unittest.TestCase):
@@ -315,6 +321,7 @@ class TestStateBridgeAndNode(unittest.TestCase):
                 "generated_code": "return wf.vars.time",
                 "compiled_request": {
                     "verification_prompt": "Convert recall time.",
+                    "workflow_path_inventory": [{"path": "wf.initVariables.recallTime"}],
                     "parsed_context": {"wf": {"initVariables": {"recallTime": "2026-04-13T10:20:30"}}},
                     "has_parseable_context": True,
                 },
@@ -336,6 +343,10 @@ class TestStateBridgeAndNode(unittest.TestCase):
         self.assertEqual(payload["runtime_result"], "1681374030")
         self.assertEqual(payload["verifier_result"]["verifier_name"], "ContractVerifier")
         self.assertEqual(payload["previous_fix_attempts"], [{"strategy": "unchanged", "changed": False}])
+        self.assertIn("wf.initVariables.recallTime", payload["allowed_workflow_paths"])
+        self.assertIn("wf.vars.time", payload["allowed_workflow_paths"])
+        self.assertEqual(payload["available_code_variables"], [])
+        self.assertTrue(payload["available_runtime_evidence"]["workflow_context"])
 
     def test_node_bridges_result_to_generated_code_and_attempts(self) -> None:
         llm = StubLLM(

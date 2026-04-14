@@ -63,11 +63,11 @@ class TestNormalizeRuntimeStateVerifierResult(unittest.TestCase):
 
 
 class TestRuntimeStateVerifierPrompt(unittest.TestCase):
-    def test_prompt_contains_diff_and_runtime_sections(self) -> None:
+    def test_prompt_contains_diff_whitelists_and_focused_evidence(self) -> None:
         prompt = _build_runtime_state_verifier_prompt(
             {
                 "task": "Save count to wf.vars.cart_count.",
-                "code": "wf.vars.cart_count = 2",
+                "code": "local total = 2\nwf.vars.cart_count = total",
                 "source_field_path": "wf.vars.cart.items",
                 "output_field_path": "wf.vars.cart_count",
                 "selected_operation": "count",
@@ -78,8 +78,12 @@ class TestRuntimeStateVerifierPrompt(unittest.TestCase):
         )
         self.assertIn("Observed changed paths", prompt)
         self.assertIn("Relevant diff for wf.vars.cart_count", prompt)
+        self.assertIn("allowed_workflow_paths", prompt)
+        self.assertIn("available_code_variables", prompt)
         self.assertIn("runtime_result", prompt)
-        self.assertIn('"verifier_name": "RuntimeStateVerifier"', prompt)
+        self.assertIn("before_state value at wf.vars.cart_count", prompt)
+        self.assertIn("after_state value at wf.vars.cart_count", prompt)
+        self.assertNotIn("Parsed workflow context:", prompt)
 
 
 class TestRuntimeStateVerifierAgent(unittest.TestCase):
@@ -272,7 +276,7 @@ class TestStateBridgeAndNode(unittest.TestCase):
     def test_build_input_from_state_uses_current_pipeline_fields(self) -> None:
         payload = build_runtime_state_verifier_input_from_state(
             {
-                "generated_code": "wf.vars.cart_count = 2",
+                "generated_code": "local total = 2\nwf.vars.cart_count = total",
                 "compiled_request": {
                     "verification_prompt": "Save count to wf.vars.cart_count.",
                     "selected_primary_path": "wf.vars.cart.items",
@@ -281,6 +285,10 @@ class TestStateBridgeAndNode(unittest.TestCase):
                     "operation_argument": None,
                     "semantic_expectations": ["numeric_aggregation"],
                     "expected_workflow_paths": ["wf.vars.cart.items"],
+                    "workflow_path_inventory": [
+                        {"path": "wf.vars.cart.items"},
+                        {"path": "wf.vars.cart_count"},
+                    ],
                     "has_parseable_context": True,
                     "parsed_context": {"wf": {"vars": {"cart": {"items": [{"sku": "A"}, {"sku": "B"}]}, "cart_count": 0}}},
                 },
@@ -294,6 +302,10 @@ class TestStateBridgeAndNode(unittest.TestCase):
         self.assertEqual(payload["output_field_path"], "wf.vars.cart_count")
         self.assertEqual(payload["selected_operation"], "count")
         self.assertEqual(payload["semantic_expectations"], ["numeric_aggregation"])
+        self.assertIn("wf.vars.cart.items", payload["allowed_workflow_paths"])
+        self.assertIn("wf.vars.cart_count", payload["allowed_workflow_paths"])
+        self.assertIn("total", payload["available_code_variables"])
+        self.assertTrue(payload["available_runtime_evidence"]["after_state"])
 
     def test_node_bridges_result_to_aggregate_verification(self) -> None:
         llm = StubLLM(

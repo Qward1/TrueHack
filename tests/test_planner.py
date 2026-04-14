@@ -8,6 +8,7 @@ from unittest.mock import patch
 from src.agents.planner import (
     PlannerAgent,
     PlannerOutput,
+    _PLANNER_SYSTEM,
     _build_clarification_response,
     _extract_workflow_paths_from_text,
     _is_planner_enabled,
@@ -165,6 +166,27 @@ class TestPlannerAgentDisabled(unittest.TestCase):
 
 
 class TestPlannerAgentPlan(unittest.TestCase):
+    def test_prompt_forbids_invented_paths(self) -> None:
+        llm = StubLLM(response={
+            "reformulated_task": "Верни wf.vars.emails",
+            "identified_workflow_paths": ["wf.vars.emails"],
+            "key_entities": ["emails"],
+            "expected_result_action": "return",
+            "needs_clarification": False,
+            "clarification_questions": [],
+            "confidence": 0.9,
+        })
+        agent = PlannerAgent(llm, enabled=True)
+        asyncio.run(agent.plan(
+            user_input="Верни email",
+            has_context=True,
+            workflow_paths=["wf.vars.emails"],
+        ))
+        self.assertEqual(llm.last_system, _PLANNER_SYSTEM)
+        self.assertIn("Explicit workflow paths found in request", llm.last_prompt)
+        self.assertIn("Do not introduce new wf.vars.* or wf.initVariables.* paths", llm.last_prompt)
+        self.assertIn("needs_clarification=true", llm.last_prompt)
+
     def test_reformulates_task_with_context(self) -> None:
         llm = StubLLM(response={
             "reformulated_task": "Получить последний элемент массива wf.vars.emails",
@@ -336,7 +358,8 @@ class TestPlannerAgentPlan(unittest.TestCase):
         self.assertIn("Get last email", llm.last_prompt)
         self.assertIn("wf.vars.emails", llm.last_prompt)
         self.assertIn("true", llm.last_prompt)  # has_context
-        self.assertIn("task analyst", llm.last_system)
+        self.assertIn("TaskPlanner", llm.last_system)
+        self.assertIn("Do not invent workflow paths", llm.last_system)
 
 
 class TestEnvToggle(unittest.TestCase):
