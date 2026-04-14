@@ -59,6 +59,7 @@ _IDENTITY_KEYS = ("id", "ID", "sku", "SKU", "email", "name", "key", "uuid", "cod
 class RuntimeStateVerifierInput(TypedDict, total=False):
     task: str
     code: str
+    expected_result_action: str | None
     source_field_path: str | None
     output_field_path: str | None
     expected_workflow_paths: list[str]
@@ -349,6 +350,16 @@ def _resolve_workflow_path_value(root: object, path: str) -> tuple[bool, object]
     return True, current
 
 
+def _normalize_workflow_snapshot(snapshot: object) -> object:
+    if not isinstance(snapshot, dict):
+        return snapshot
+    if isinstance(snapshot.get("wf"), dict):
+        return snapshot
+    if "vars" in snapshot or "initVariables" in snapshot:
+        return {"wf": dict(snapshot)}
+    return snapshot
+
+
 def _derive_source_field_path(payload: RuntimeStateVerifierInput) -> str | None:
     explicit = _normalize_nullable_string(payload.get("source_field_path"))
     if explicit:
@@ -398,13 +409,27 @@ def _task_expects_state_update(task: str) -> bool:
     return any(marker in lowered for marker in _SAVE_MARKERS)
 
 
-def _derive_expected_update_path(payload: RuntimeStateVerifierInput) -> str | None:
+def _derive_expected_result_action(payload: RuntimeStateVerifierInput) -> str:
+    explicit = _normalize_nullable_string(payload.get("expected_result_action"))
+    if explicit in {"return", "save_to_wf_vars"}:
+        return explicit
     output_path = _derive_output_field_path(payload)
     if output_path:
-        return output_path
+        return "save_to_wf_vars"
     source_path = _derive_source_field_path(payload)
     if source_path and _task_expects_state_update(str(payload.get("task", "") or "")):
-        return source_path
+        return "save_to_wf_vars"
+    return "return"
+
+
+def _derive_expected_update_path(payload: RuntimeStateVerifierInput) -> str | None:
+    expected_result_action = _derive_expected_result_action(payload)
+    output_path = _derive_output_field_path(payload)
+    source_path = _derive_source_field_path(payload)
+    if expected_result_action == "save_to_wf_vars":
+        return output_path or source_path
+    if output_path and output_path != source_path:
+        return output_path
     return None
 
 
@@ -471,6 +496,21 @@ def _paths_related(target: str, candidate: str) -> bool:
         or target.startswith(candidate + ".")
         or target.startswith(candidate + "[")
     )
+
+
+def _is_empty_container_like(value: object) -> bool:
+    return value in (None, [], {})
+
+
+def _is_ignorable_root_artifact(change: _StateChange) -> bool:
+    path = str(change["path"] or "")
+    if path not in {"wf.vars", "wf.initVariables"}:
+        return False
+    return _is_empty_container_like(change["before"]) and _is_empty_container_like(change["after"])
+
+
+def _filter_ignorable_root_artifacts(changes: list[_StateChange]) -> list[_StateChange]:
+    return [change for change in changes if not _is_ignorable_root_artifact(change)]
 
 
 def _related_changes(changes: list[_StateChange], target: str | None) -> list[_StateChange]:
@@ -758,6 +798,7 @@ def _evaluate_state_path_mismatch(payload: RuntimeStateVerifierInput) -> Runtime
         return None
 
     changes = _collect_state_changes(before_state, after_state)
+    changes = _filter_ignorable_root_artifacts(changes)
     expected_update_path = _derive_expected_update_path(payload)
 
     if expected_update_path:
@@ -814,7 +855,7 @@ def _evaluate_state_path_mismatch(payload: RuntimeStateVerifierInput) -> Runtime
 
         return None
 
-    if not _task_expects_state_update(str(payload.get("task", "") or "")) and changes:
+    if _derive_expected_result_action(payload) != "save_to_wf_vars" and changes:
         wrong_path = changes[0]["path"]
         result = _build_path_mismatch_result(
             error_code="extra_unintended_state_change",
@@ -915,6 +956,7 @@ def _build_positive_execution_result(payload: RuntimeStateVerifierInput) -> Runt
 
     if before_state is not None and after_state is not None:
         changes = _collect_state_changes(before_state, after_state)
+        changes = _filter_ignorable_root_artifacts(changes)
         if expected_update_path:
             before_found, before_value = _resolve_workflow_path_value(before_state, expected_update_path)
             after_found, after_value = _resolve_workflow_path_value(after_state, expected_update_path)
@@ -985,8 +1027,11 @@ def _normalize_runtime_state_verifier_result(raw: object) -> RuntimeStateVerifie
 def _build_semantic_context_lines(payload: RuntimeStateVerifierInput) -> list[str]:
     lines: list[str] = []
     operation = _derive_selected_operation(payload)
+    expected_result_action = _derive_expected_result_action(payload)
     if operation:
         lines.append("- selected operation: " + operation)
+    if expected_result_action:
+        lines.append("- expected result action: " + expected_result_action)
     source_path = _derive_source_field_path(payload)
     if source_path:
         lines.append("- source field path: " + source_path)
@@ -1089,6 +1134,10 @@ def build_runtime_state_verifier_input_from_state(state: dict[str, Any]) -> Runt
     if not isinstance(compiled_request, dict):
         compiled_request = {}
 
+    planner_result = compiled_request.get("planner_result")
+    if not isinstance(planner_result, dict):
+        planner_result = {}
+
     diagnostics = state.get("diagnostics")
     if not isinstance(diagnostics, dict):
         diagnostics = {}
@@ -1107,6 +1156,18 @@ def build_runtime_state_verifier_input_from_state(state: dict[str, Any]) -> Runt
         or compiled_request.get("selected_save_path")
         or ""
     ).strip()
+    expected_result_action = (
+        str(state.get("expected_result_action", "") or "").strip()
+        or str(planner_result.get("expected_result_action", "") or "").strip()
+        or str(compiled_request.get("expected_result_action", "") or "").strip()
+    )
+    if not expected_result_action:
+        if output_field_path:
+            expected_result_action = "save_to_wf_vars"
+        elif source_field_path and _task_expects_state_update(task):
+            expected_result_action = "save_to_wf_vars"
+        else:
+            expected_result_action = "return"
 
     expected_workflow_paths = _unique_strings(
         _ensure_string_list(compiled_request.get("expected_workflow_paths"))
@@ -1130,11 +1191,17 @@ def build_runtime_state_verifier_input_from_state(state: dict[str, Any]) -> Runt
             runtime_result = preview
 
     parsed_context = compiled_request.get("parsed_context")
-    before_state = parsed_context if compiled_request.get("has_parseable_context") else None
+    before_state = (
+        _normalize_workflow_snapshot(parsed_context)
+        if compiled_request.get("has_parseable_context")
+        else None
+    )
+    after_state = _normalize_workflow_snapshot(diagnostics.get("workflow_state"))
 
     return {
         "task": task,
         "code": code,
+        "expected_result_action": expected_result_action or None,
         "source_field_path": source_field_path or None,
         "output_field_path": output_field_path or None,
         "expected_workflow_paths": expected_workflow_paths,
@@ -1144,13 +1211,13 @@ def build_runtime_state_verifier_input_from_state(state: dict[str, Any]) -> Runt
         "parsed_context": parsed_context,
         "runtime_result": runtime_result,
         "before_state": before_state,
-        "after_state": diagnostics.get("workflow_state"),
+        "after_state": after_state,
         "allowed_workflow_paths": allowed_workflow_paths,
         "available_code_variables": _extract_code_variables(code),
         "available_runtime_evidence": {
             "runtime_result": runtime_result is not None,
             "before_state": before_state is not None,
-            "after_state": diagnostics.get("workflow_state") is not None,
+            "after_state": after_state is not None,
         },
     }
 
@@ -1189,6 +1256,9 @@ class RuntimeStateVerifierAgent:
         return _AGENT_NAME
 
     async def verify(self, payload: RuntimeStateVerifierInput) -> RuntimeStateVerifierResult:
+        payload = dict(payload)
+        payload["before_state"] = _normalize_workflow_snapshot(payload.get("before_state"))
+        payload["after_state"] = _normalize_workflow_snapshot(payload.get("after_state"))
         code = str(payload.get("code", "") or "")
         operation = _derive_selected_operation(payload)
         expected_update_path = _derive_expected_update_path(payload)

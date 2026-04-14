@@ -88,6 +88,36 @@ class TestContractVerifierPrompt(unittest.TestCase):
 
 
 class TestContractVerifierAgent(unittest.TestCase):
+    def test_evidence_first_pass_normalizes_rootless_after_state_for_save_tasks(self) -> None:
+        llm = StubLLM(response={"passed": False, "summary": "Should never be used."})
+        agent = ContractVerifierAgent(llm)
+        result = asyncio.run(
+            agent.verify(
+                {
+                    "task": "Remove ID, ENTITY_ID and CALL from wf.vars.RESTbody.result.",
+                    "code": "local result = wf.vars.RESTbody.result\nreturn result",
+                    "expected_result_action": "save_to_wf_vars",
+                    "expected_update_path": "wf.vars.RESTbody.result",
+                    "before_state": {
+                        "wf": {
+                            "vars": {
+                                "RESTbody": {
+                                    "result": [{"ID": 1, "CALL": "x", "OTHER": "ok"}]
+                                }
+                            }
+                        }
+                    },
+                    "after_state": {
+                        "vars": {"RESTbody": {"result": [{"OTHER": "ok"}]}},
+                        "initVariables": [],
+                    },
+                }
+            )
+        )
+        self.assertTrue(result["passed"])
+        self.assertEqual(llm.call_count, 0)
+        self.assertIn("workflow target", result["summary"].lower())
+
     def test_evidence_first_pass_skips_llm_when_runtime_matches_expected_return_path(self) -> None:
         llm = StubLLM(response={"passed": False, "summary": "Should never be used."})
         agent = ContractVerifierAgent(llm)
@@ -280,7 +310,8 @@ class TestStateBridgeAndNode(unittest.TestCase):
                 "generated_code": "local value = wf.initVariables.json.IDOC.ZCDF_HEAD.DATUM\nwf.vars.iso_date = value\nreturn wf.vars.iso_date",
                 "compiled_request": {
                     "verification_prompt": "Convert DATUM/TIME and save to wf.vars.iso_date.",
-                    "selected_primary_path": "wf.vars.iso_date",
+                    "selected_primary_path": "wf.initVariables.json.IDOC.ZCDF_HEAD.DATUM",
+                    "selected_save_path": "wf.vars.iso_date",
                     "expected_workflow_paths": ["wf.initVariables.json.IDOC.ZCDF_HEAD.DATUM"],
                     "workflow_path_inventory": [
                         {"path": "wf.initVariables.json.IDOC.ZCDF_HEAD.DATUM"},
@@ -295,7 +326,7 @@ class TestStateBridgeAndNode(unittest.TestCase):
                 },
                 "diagnostics": {
                     "result_preview": "",
-                    "workflow_state": {"wf": {"vars": {"iso_date": "2026-04-13"}}},
+                    "workflow_state": {"vars": {"iso_date": "2026-04-13"}, "initVariables": []},
                 },
             }
         )
@@ -305,6 +336,7 @@ class TestStateBridgeAndNode(unittest.TestCase):
         self.assertIn("wf.initVariables.json.IDOC.ZCDF_HEAD.DATUM", payload["expected_workflow_paths"])
         self.assertIsNotNone(payload["before_state"])
         self.assertIsNotNone(payload["after_state"])
+        self.assertIn("wf", payload["after_state"])
         self.assertIn("wf.vars.iso_date", payload["allowed_workflow_paths"])
         self.assertIn("wf.initVariables.json.IDOC.ZCDF_HEAD.DATUM", payload["allowed_workflow_paths"])
         self.assertIn("value", payload["available_code_variables"])

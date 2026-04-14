@@ -54,7 +54,7 @@ class TestNormalizeUniversalVerificationFixerResult(unittest.TestCase):
                 "applied_strategy": "replace_wrong_path",
                 "preserved_constraints": ["Keep conversion logic."],
                 "remaining_risks": [],
-                "fixed_lua_code": "return wf.initVariables.recallTime",
+                "fixed_lua_body": "return wf.initVariables.recallTime",
             },
             original_code="return wf.vars.time",
             verifier_result={
@@ -156,6 +156,7 @@ class TestUniversalVerificationFixerPrompt(unittest.TestCase):
         self.assertIn("available_code_variables", prompt)
         self.assertIn("after_state value at wf.vars.time", prompt)
         self.assertIn("previous_fix_attempts", prompt)
+        self.assertIn("fixed_lua_body", prompt)
         self.assertNotIn("Workflow context:\n", prompt)
 
 
@@ -191,7 +192,7 @@ class TestUniversalVerificationFixerAgent(unittest.TestCase):
                 "applied_strategy": "replace_wrong_path",
                 "preserved_constraints": ["Keep unix conversion logic."],
                 "remaining_risks": [],
-                "fixed_lua_code": "lua{return wf.initVariables.recallTime}lua",
+                "fixed_lua_body": "return wf.initVariables.recallTime",
             }
         )
         agent = UniversalVerificationFixerAgent(llm)
@@ -236,7 +237,7 @@ class TestUniversalVerificationFixerAgent(unittest.TestCase):
                     "applied_error_family": "contract",
                     "applied_error_code": "wrong_read_path",
                     "applied_strategy": "first_try_same",
-                    "fixed_lua_code": "lua{return wf.vars.time}lua",
+                    "fixed_lua_body": "return wf.vars.time",
                 },
                 {
                     "fixed": True,
@@ -244,7 +245,7 @@ class TestUniversalVerificationFixerAgent(unittest.TestCase):
                     "applied_error_family": "contract",
                     "applied_error_code": "wrong_read_path",
                     "applied_strategy": "second_try_patch",
-                    "fixed_lua_code": "lua{return wf.initVariables.recallTime}lua",
+                    "fixed_lua_body": "return wf.initVariables.recallTime",
                 },
             ]
         )
@@ -279,13 +280,13 @@ class TestUniversalVerificationFixerAgent(unittest.TestCase):
                     "fixed": True,
                     "changed": True,
                     "applied_strategy": "first_try_same",
-                    "fixed_lua_code": "lua{return wf.vars.time}lua",
+                    "fixed_lua_body": "return wf.vars.time",
                 },
                 {
                     "fixed": True,
                     "changed": True,
                     "applied_strategy": "still_same",
-                    "fixed_lua_code": "lua{return wf.vars.time}lua",
+                    "fixed_lua_body": "return wf.vars.time",
                 },
             ]
         )
@@ -327,7 +328,7 @@ class TestStateBridgeAndNode(unittest.TestCase):
                 },
                 "diagnostics": {
                     "result_value": "1681374030",
-                    "workflow_state": {"wf": {"vars": {"time": "1681374030"}}},
+                    "workflow_state": {"vars": {"time": "1681374030"}, "initVariables": []},
                 },
                 "verification": {
                     "verifier_name": "ContractVerifier",
@@ -346,6 +347,7 @@ class TestStateBridgeAndNode(unittest.TestCase):
         self.assertIn("wf.initVariables.recallTime", payload["allowed_workflow_paths"])
         self.assertIn("wf.vars.time", payload["allowed_workflow_paths"])
         self.assertEqual(payload["available_code_variables"], [])
+        self.assertIn("wf", payload["after_state"])
         self.assertTrue(payload["available_runtime_evidence"]["workflow_context"])
 
     def test_node_bridges_result_to_generated_code_and_attempts(self) -> None:
@@ -358,7 +360,7 @@ class TestStateBridgeAndNode(unittest.TestCase):
                 "applied_strategy": "replace_wrong_path",
                 "preserved_constraints": ["Keep unix conversion logic."],
                 "remaining_risks": [],
-                "fixed_lua_code": "lua{return wf.initVariables.recallTime}lua",
+                "fixed_lua_body": "return wf.initVariables.recallTime",
             }
         )
         node = create_universal_verification_fixer_node(llm)
@@ -429,7 +431,7 @@ class TestStateBridgeAndNode(unittest.TestCase):
                 "fixed": True,
                 "changed": True,
                 "applied_strategy": "minimal_patch_from_verifier_brief",
-                "fixed_lua_code": "lua{return wf.vars.users or {}}lua",
+                "fixed_lua_body": "return wf.vars.users or {}",
             }
         )
         node = create_universal_verification_fixer_node(llm)
@@ -448,6 +450,39 @@ class TestStateBridgeAndNode(unittest.TestCase):
         self.assertTrue(result["universal_verification_fixer_result"]["changed"])
         self.assertEqual(result["previous_fix_attempts"][-1]["verifier_name"], "RobustnessVerifier")
         self.assertEqual(result["verification_chain_stage_fix_counts"]["RobustnessVerifier"], 1)
+
+    def test_normalizer_accepts_body_only_response(self) -> None:
+        result = _normalize_universal_verification_fixer_result(
+            {
+                "fixed": True,
+                "changed": True,
+                "fixed_lua_body": "return wf.initVariables.recallTime",
+            },
+            original_code="return wf.vars.time",
+            verifier_result={
+                "verifier_name": "ContractVerifier",
+                "passed": False,
+                "error_family": "contract",
+                "error_code": "wrong_read_path",
+                "severity": "high",
+                "summary": "Wrong workflow path.",
+                "field_path": "wf.vars.time",
+                "evidence": [],
+                "expected": {},
+                "actual": {},
+                "fixer_brief": {
+                    "goal": "Use the correct path.",
+                    "must_change": ["Replace wf.vars.time."],
+                    "must_preserve": [],
+                    "forbidden_fixes": [],
+                    "suggested_patch": "",
+                    "patch_scope": "local",
+                },
+                "confidence": 0.9,
+            },
+        )
+        self.assertTrue(result["changed"])
+        self.assertIn("wf.initVariables.recallTime", result["fixed_lua_code"])
 
 
 class TestVerificationChainRegistry(unittest.TestCase):

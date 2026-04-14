@@ -46,12 +46,12 @@ def _is_planner_enabled() -> bool:
 # ---------------------------------------------------------------------------
 
 _PLANNER_SYSTEM = (
-    "You are TaskPlanner for a Lua workflow script generator. "
-    "Analyze the user request and reformulate it only when the request already contains enough explicit information. "
-    "Use only data explicitly present in the user request and in the provided explicit workflow path list. "
-    "Do not invent workflow paths, variables, fields, result targets, or hidden requirements. "
-    "If an exact workflow path or result action is missing, ambiguous, or not explicit enough, ask for clarification instead of guessing. "
-    "identified_workflow_paths may contain only exact workflow paths from the provided explicit list. "
+    "You are a task analyst for a Lua workflow script generator. "
+    "Your job is to analyze the user's request and reformulate it into a clear, "
+    "unambiguous task description that a code generator can follow precisely. "
+    "The target platform is LowCode with Lua 5.5 workflow scripts using wf.vars "
+    "and wf.initVariables. "
+    "If the request is unclear or ambiguous, identify what needs clarification. "
     "Always respond in the same language as the user's request. "
     "Return JSON only."
 )
@@ -60,19 +60,11 @@ _PLANNER_USER = """Analyze this task request for Lua workflow code generation.
 
 User request: {user_input}
 Workflow context provided: {has_context}
-Explicit workflow paths found in request: {workflow_paths}
+Workflow paths found in request: {workflow_paths}
 Has existing code to modify: {has_code}
 
-Strict rules:
-- Use only the user request and the explicit workflow paths listed above.
-- Do not introduce new wf.vars.* or wf.initVariables.* paths that are not listed above.
-- If no exact workflow path is explicit, keep identified_workflow_paths empty.
-- Set expected_result_action to "save_to_wf_vars" only when the request explicitly asks to save, update, write, assign, or store into wf.vars.
-- If the request is missing an exact path or exact target action, set needs_clarification=true instead of guessing.
-- Do not rewrite the task with invented variables, fields, or result destinations.
-
 Analyze and return JSON with these fields:
-- "reformulated_task": rewrite the task as a clear, specific instruction for the code generator. Use only explicit workflow paths from the list above. If the task is ambiguous, keep the reformulation conservative and do not add invented details.
+- "reformulated_task": rewrite the task as a clear, specific instruction for the code generator. Include exact workflow paths (wf.vars.X / wf.initVariables.X), the operation to perform, and how to return/store the result. If the task is already clear, keep it close to the original but add any implicit details.
 - "identified_workflow_paths": list of wf.vars.* / wf.initVariables.* paths relevant to this task
 - "key_entities": important field names, operations, or concepts from the request
 - "expected_result_action": "return" or "save_to_wf_vars"

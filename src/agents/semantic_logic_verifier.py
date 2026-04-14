@@ -437,6 +437,16 @@ def _resolve_workflow_path_value(root: object, path: str) -> tuple[bool, object]
     return True, current
 
 
+def _normalize_workflow_snapshot(snapshot: object) -> object:
+    if not isinstance(snapshot, dict):
+        return snapshot
+    if isinstance(snapshot.get("wf"), dict):
+        return snapshot
+    if "vars" in snapshot or "initVariables" in snapshot:
+        return {"wf": dict(snapshot)}
+    return snapshot
+
+
 def _derive_source_field_path(payload: SemanticLogicVerifierInput) -> str | None:
     explicit = _normalize_nullable_string(payload.get("source_field_path"))
     if explicit:
@@ -1404,7 +1414,12 @@ def build_semantic_logic_verifier_input_from_state(state: dict[str, Any]) -> Sem
             runtime_result = preview
 
     parsed_context = compiled_request.get("parsed_context")
-    before_state = parsed_context if compiled_request.get("has_parseable_context") else None
+    before_state = (
+        _normalize_workflow_snapshot(parsed_context)
+        if compiled_request.get("has_parseable_context")
+        else None
+    )
+    after_state = _normalize_workflow_snapshot(diagnostics.get("workflow_state"))
 
     return {
         "task": task,
@@ -1419,13 +1434,13 @@ def build_semantic_logic_verifier_input_from_state(state: dict[str, Any]) -> Sem
         "parsed_context": parsed_context,
         "runtime_result": runtime_result,
         "before_state": before_state,
-        "after_state": diagnostics.get("workflow_state"),
+        "after_state": after_state,
         "allowed_workflow_paths": allowed_workflow_paths,
         "available_code_variables": _extract_code_variables(code),
         "available_runtime_evidence": {
             "runtime_result": runtime_result is not None,
             "before_state": before_state is not None,
-            "after_state": diagnostics.get("workflow_state") is not None,
+            "after_state": after_state is not None,
         },
     }
 

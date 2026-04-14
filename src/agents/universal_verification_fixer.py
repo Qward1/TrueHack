@@ -45,11 +45,11 @@ Output schema:
   "applied_strategy": "string",
   "preserved_constraints": [],
   "remaining_risks": [],
-  "fixed_lua_code": "lua{...}lua"
+  "fixed_lua_body": "plain lua code string without lua{ }lua wrapper"
 }
 
 Rules:
-- fixed_lua_code must always be valid lua{...}lua
+- fixed_lua_body must be a JSON string with Lua code only, without markdown fences and without lua{ }lua
 - if verifier_result.passed=true, keep code unchanged
 - if verifier_result.passed=false, patch exactly that reported error
 - preserve the stated working parts
@@ -277,6 +277,16 @@ def _resolve_workflow_path_value(root: object, path: str) -> tuple[bool, object]
     return True, current
 
 
+def _normalize_workflow_snapshot(snapshot: object) -> object:
+    if not isinstance(snapshot, dict):
+        return snapshot
+    if isinstance(snapshot.get("wf"), dict):
+        return snapshot
+    if "vars" in snapshot or "initVariables" in snapshot:
+        return {"wf": dict(snapshot)}
+    return snapshot
+
+
 def _format_named_list(title: str, items: list[str]) -> str:
     normalized = _unique_strings([str(item).strip() for item in items if str(item).strip()])
     if not normalized:
@@ -498,7 +508,10 @@ def _normalize_universal_verification_fixer_result(
     verifier_result: NormalizedVerifierResult,
 ) -> UniversalVerificationFixerResult:
     data = raw if isinstance(raw, dict) else {}
-    fixed_lua_code = _wrap_lua_code(str(data.get("fixed_lua_code", "") or original_code))
+    fixed_lua_body = str(data.get("fixed_lua_body", "") or "").strip()
+    fixed_lua_code = _wrap_lua_code(
+        fixed_lua_body or str(data.get("fixed_lua_code", "") or original_code)
+    )
     changed = _code_signature(fixed_lua_code) != _code_signature(original_code)
     fixed = bool(data.get("fixed", False))
 
@@ -539,6 +552,9 @@ def _render_attempts(attempts: list[dict[str, Any]]) -> str:
 def _build_universal_verification_fixer_prompt(payload: UniversalVerificationFixerInput) -> str:
     task = str(payload.get("task", "") or "").strip()
     code = _normalize_code_for_storage(str(payload.get("code", "") or ""))
+    workflow_context = _normalize_workflow_snapshot(payload.get("workflow_context"))
+    before_state = _normalize_workflow_snapshot(payload.get("before_state"))
+    after_state = _normalize_workflow_snapshot(payload.get("after_state"))
     verifier_result = _normalize_verifier_result(payload.get("verifier_result"))
     previous_attempts = _normalize_previous_fix_attempts(payload.get("previous_fix_attempts"))
     allowed_workflow_paths = _unique_strings(
@@ -552,9 +568,9 @@ def _build_universal_verification_fixer_prompt(payload: UniversalVerificationFix
     available_runtime_evidence = payload.get("available_runtime_evidence")
     if not isinstance(available_runtime_evidence, dict):
         available_runtime_evidence = {
-            "workflow_context": payload.get("workflow_context") is not None,
-            "before_state": payload.get("before_state") is not None,
-            "after_state": payload.get("after_state") is not None,
+            "workflow_context": workflow_context is not None,
+            "before_state": before_state is not None,
+            "after_state": after_state is not None,
             "runtime_result": payload.get("runtime_result") is not None,
             "previous_fix_attempts": bool(previous_attempts),
         }
@@ -562,9 +578,9 @@ def _build_universal_verification_fixer_prompt(payload: UniversalVerificationFix
     focused_path = verifier_result["field_path"]
     if focused_path:
         for label, root in (
-            ("workflow_context", payload.get("workflow_context")),
-            ("before_state", payload.get("before_state")),
-            ("after_state", payload.get("after_state")),
+            ("workflow_context", workflow_context),
+            ("before_state", before_state),
+            ("after_state", after_state),
         ):
             if root is None:
                 continue
@@ -603,9 +619,13 @@ def _build_universal_verification_fixer_prompt(payload: UniversalVerificationFix
         ),
         *focused_sections,
         "previous_fix_attempts:\n" + _render_attempts(previous_attempts),
+        "Output rules:\n"
+        "- fixed_lua_body must be a JSON string containing only the Lua code body.\n"
+        "- Do not include lua{ }lua inside fixed_lua_body.\n"
+        "- Do not include markdown fences anywhere in the JSON.",
         (
             "Return JSON only with fields fixed, changed, applied_error_family, applied_error_code, "
-            "applied_strategy, preserved_constraints, remaining_risks, fixed_lua_code."
+            "applied_strategy, preserved_constraints, remaining_risks, fixed_lua_body."
         ),
     ]
     return "\n\n".join(section for section in sections if section)
@@ -658,6 +678,8 @@ def build_universal_verification_fixer_input_from_state(state: dict[str, Any]) -
     before_state = diagnostics.get("before_state")
     if before_state is None and compiled_request.get("has_parseable_context"):
         before_state = parsed_context
+    before_state = _normalize_workflow_snapshot(before_state)
+    after_state = _normalize_workflow_snapshot(diagnostics.get("workflow_state"))
     code = str(state.get("generated_code", "") or state.get("current_code", "") or "")
     selected_primary_path = _normalize_string(compiled_request.get("selected_primary_path"))
     selected_save_path = _normalize_string(compiled_request.get("selected_save_path"))
@@ -677,7 +699,7 @@ def build_universal_verification_fixer_input_from_state(state: dict[str, Any]) -
         "code": code,
         "workflow_context": parsed_context,
         "before_state": before_state,
-        "after_state": diagnostics.get("workflow_state"),
+        "after_state": after_state,
         "runtime_result": runtime_result,
         "verifier_result": verifier_result,
         "previous_fix_attempts": previous_fix_attempts,
@@ -686,7 +708,7 @@ def build_universal_verification_fixer_input_from_state(state: dict[str, Any]) -
         "available_runtime_evidence": {
             "workflow_context": parsed_context is not None,
             "before_state": before_state is not None,
-            "after_state": diagnostics.get("workflow_state") is not None,
+            "after_state": after_state is not None,
             "runtime_result": runtime_result is not None,
             "previous_fix_attempts": bool(previous_fix_attempts),
         },
@@ -818,6 +840,7 @@ def create_universal_verification_fixer_node(llm: LLMProvider) -> Callable:
         history = _normalize_history_entries(state.get("verification_chain_history"))
 
         result = await agent.fix(payload)
+        original_code = _normalize_code_for_storage(str(state.get("generated_code", "") or state.get("current_code", "") or ""))
         fixed_code = _normalize_code_for_storage(result["fixed_lua_code"])
 
         verifier_passed = bool(verifier_result["passed"])
@@ -865,8 +888,10 @@ def create_universal_verification_fixer_node(llm: LLMProvider) -> Callable:
             }
         )
 
+        accepted_code = fixed_code if changed else original_code
+
         return {
-            "generated_code": fixed_code,
+            "generated_code": accepted_code,
             "universal_verification_fixer_result": result,
             "fix_verification_iterations": next_fix_iter,
             "failure_stage": "" if verifier_passed else current_failure_stage,

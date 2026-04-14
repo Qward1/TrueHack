@@ -440,7 +440,7 @@ class PipelineLowcodeGenerationTests(unittest.TestCase):
                     "applied_strategy": "replace_wrong_path",
                     "preserved_constraints": ["Keep the direct return behavior."],
                     "remaining_risks": [],
-                    "fixed_lua_code": "lua{return wf.initVariables.recallTime}lua",
+                    "fixed_lua_body": "return wf.initVariables.recallTime",
                 },
             },
         )

@@ -183,9 +183,9 @@ class TestPlannerAgentPlan(unittest.TestCase):
             workflow_paths=["wf.vars.emails"],
         ))
         self.assertEqual(llm.last_system, _PLANNER_SYSTEM)
-        self.assertIn("Explicit workflow paths found in request", llm.last_prompt)
-        self.assertIn("Do not introduce new wf.vars.* or wf.initVariables.* paths", llm.last_prompt)
-        self.assertIn("needs_clarification=true", llm.last_prompt)
+        self.assertIn("Workflow paths found in request", llm.last_prompt)
+        self.assertIn("reformulated_task", llm.last_prompt)
+        self.assertIn("expected_result_action", llm.last_prompt)
 
     def test_reformulates_task_with_context(self) -> None:
         llm = StubLLM(response={
@@ -358,8 +358,7 @@ class TestPlannerAgentPlan(unittest.TestCase):
         self.assertIn("Get last email", llm.last_prompt)
         self.assertIn("wf.vars.emails", llm.last_prompt)
         self.assertIn("true", llm.last_prompt)  # has_context
-        self.assertIn("TaskPlanner", llm.last_system)
-        self.assertIn("Do not invent workflow paths", llm.last_system)
+        self.assertIn("task analyst", llm.last_system)
 
 
 class TestEnvToggle(unittest.TestCase):

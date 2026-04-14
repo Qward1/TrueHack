@@ -112,7 +112,7 @@ class TestVerificationChainIntegration(unittest.TestCase):
                     "applied_strategy": "replace_wrong_path",
                     "preserved_constraints": ["Keep the existing return logic."],
                     "remaining_risks": [],
-                    "fixed_lua_code": "lua{return wf.initVariables.recallTime}lua",
+                    "fixed_lua_body": "return wf.initVariables.recallTime",
                 },
                 "ShapeTypeVerifier": {
                     "passed": True,

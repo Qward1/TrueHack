@@ -78,6 +78,7 @@ class TestRuntimeStateVerifierPrompt(unittest.TestCase):
         )
         self.assertIn("Observed changed paths", prompt)
         self.assertIn("Relevant diff for wf.vars.cart_count", prompt)
+        self.assertIn("expected result action", prompt)
         self.assertIn("allowed_workflow_paths", prompt)
         self.assertIn("available_code_variables", prompt)
         self.assertIn("runtime_result", prompt)
@@ -87,6 +88,45 @@ class TestRuntimeStateVerifierPrompt(unittest.TestCase):
 
 
 class TestRuntimeStateVerifierAgent(unittest.TestCase):
+    def test_expected_save_action_with_rootless_after_state_passes_without_llm(self) -> None:
+        llm = StubLLM(response={"passed": False, "summary": "Should not be used."})
+        agent = RuntimeStateVerifierAgent(llm)
+        result = asyncio.run(
+            agent.verify(
+                {
+                    "task": "For each item in RESTbody.result, remove ID, ENTITY_ID, and CALL from workflow variables.",
+                    "expected_result_action": "save_to_wf_vars",
+                    "source_field_path": "wf.vars.RESTbody.result",
+                    "before_state": {
+                        "wf": {
+                            "vars": {
+                                "RESTbody": {
+                                    "result": [
+                                        {"ID": 123, "ENTITY_ID": 456, "CALL": "x", "OTHER_KEY": "value"}
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                    "after_state": {
+                        "vars": {
+                            "RESTbody": {
+                                "result": [
+                                    {"OTHER_KEY": "value"}
+                                ]
+                            }
+                        },
+                        "initVariables": [],
+                    },
+                    "runtime_result": [{"OTHER_KEY": "value"}],
+                    "code": "local result = wf.vars.RESTbody.result\nreturn result",
+                }
+            )
+        )
+        self.assertTrue(result["passed"])
+        self.assertEqual(llm.call_count, 0)
+        self.assertIn("expected path", result["summary"])
+
     def test_wrong_path_updated_skips_llm(self) -> None:
         llm = StubLLM(response={"passed": True, "summary": "Should not be used."})
         agent = RuntimeStateVerifierAgent(llm)
@@ -305,6 +345,43 @@ class TestStateBridgeAndNode(unittest.TestCase):
         self.assertIn("wf.vars.cart.items", payload["allowed_workflow_paths"])
         self.assertIn("wf.vars.cart_count", payload["allowed_workflow_paths"])
         self.assertIn("total", payload["available_code_variables"])
+        self.assertTrue(payload["available_runtime_evidence"]["after_state"])
+
+    def test_build_input_uses_planner_expected_action_and_normalizes_rootless_after_state(self) -> None:
+        payload = build_runtime_state_verifier_input_from_state(
+            {
+                "generated_code": "local result = wf.vars.RESTbody.result\nreturn result",
+                "compiled_request": {
+                    "verification_prompt": "Remove ID, ENTITY_ID and CALL from wf.vars.RESTbody.result.",
+                    "selected_primary_path": "wf.vars.RESTbody.result",
+                    "selected_operation": "remove_keys",
+                    "selected_save_path": "",
+                    "semantic_expectations": ["remove_keys"],
+                    "expected_workflow_paths": ["wf.vars.RESTbody.result"],
+                    "workflow_path_inventory": [{"path": "wf.vars.RESTbody.result"}],
+                    "has_parseable_context": True,
+                    "parsed_context": {
+                        "wf": {
+                            "vars": {
+                                "RESTbody": {
+                                    "result": [{"ID": 1, "CALL": "x", "OTHER": "ok"}]
+                                }
+                            }
+                        }
+                    },
+                    "planner_result": {"expected_result_action": "save_to_wf_vars"},
+                },
+                "diagnostics": {
+                    "result_value": [{"OTHER": "ok"}],
+                    "workflow_state": {
+                        "vars": {"RESTbody": {"result": [{"OTHER": "ok"}]}},
+                        "initVariables": [],
+                    },
+                },
+            }
+        )
+        self.assertEqual(payload["expected_result_action"], "save_to_wf_vars")
+        self.assertIn("wf", payload["after_state"])
         self.assertTrue(payload["available_runtime_evidence"]["after_state"])
 
     def test_node_bridges_result_to_aggregate_verification(self) -> None:

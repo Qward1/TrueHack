@@ -61,6 +61,23 @@ _FORBIDDEN_CALL_PATTERNS = (
 
 _VALID_SEVERITIES = frozenset({"low", "medium", "high", "critical"})
 _VALID_PATCH_SCOPES = frozenset({"none", "local", "function_level", "multi_block", "rewrite"})
+_SAVE_MARKERS = (
+    "save",
+    "update",
+    "set",
+    "assign",
+    "store",
+    "write",
+    "replace",
+    "change",
+    "сохрани",
+    "запиши",
+    "обнови",
+    "установи",
+    "присвой",
+    "измени",
+    "замени",
+)
 
 
 class ContractVerifierInput(TypedDict, total=False):
@@ -446,6 +463,48 @@ def _resolve_workflow_path_value(root: object, path: str) -> tuple[bool, object]
     return True, current
 
 
+def _normalize_workflow_snapshot(snapshot: object) -> object:
+    if not isinstance(snapshot, dict):
+        return snapshot
+    if isinstance(snapshot.get("wf"), dict):
+        return snapshot
+    if "vars" in snapshot or "initVariables" in snapshot:
+        return {"wf": dict(snapshot)}
+    return snapshot
+
+
+def _task_expects_state_update(task: str) -> bool:
+    lowered = str(task or "").lower()
+    return any(marker in lowered for marker in _SAVE_MARKERS)
+
+
+def _paths_related(target: str, candidate: str) -> bool:
+    if not target or not candidate:
+        return False
+    return (
+        candidate == target
+        or candidate.startswith(target + ".")
+        or candidate.startswith(target + "[")
+        or target.startswith(candidate + ".")
+        or target.startswith(candidate + "[")
+    )
+
+
+def _is_empty_container_like(value: object) -> bool:
+    return value in (None, [], {})
+
+
+def _is_ignorable_root_artifact(change: dict[str, Any]) -> bool:
+    path = str(change.get("path", "") or "")
+    if path not in {"wf.vars", "wf.initVariables"}:
+        return False
+    return _is_empty_container_like(change.get("before")) and _is_empty_container_like(change.get("after"))
+
+
+def _filter_ignorable_root_artifacts(changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [change for change in changes if not _is_ignorable_root_artifact(change)]
+
+
 def _collect_state_changes(before: object, after: object, prefix: str = "") -> list[dict[str, Any]]:
     if _jsonish_equal(before, after):
         return []
@@ -483,9 +542,13 @@ def _evaluate_contract_evidence(payload: ContractVerifierInput) -> ContractVerif
 
     if expected_result_action == "save_to_wf_vars" and expected_update_path and before_state is not None and after_state is not None:
         changes = _collect_state_changes(before_state, after_state, "")
+        changes = _filter_ignorable_root_artifacts(changes)
         changed_paths = [change["path"] for change in changes]
-        target_change = next((change for change in changes if change["path"] == expected_update_path), None)
-        if target_change is None:
+        before_found, before_value = _resolve_workflow_path_value(before_state, expected_update_path)
+        after_found, after_value = _resolve_workflow_path_value(after_state, expected_update_path)
+        target_changed = before_found != after_found or not _jsonish_equal(before_value, after_value)
+        related_changes = [change for change in changes if _paths_related(expected_update_path, str(change["path"]))]
+        if not target_changed:
             wrong_change = next((change for change in changes if change["path"].startswith("wf.")), None)
             if wrong_change is not None:
                 return _build_failed_result(
@@ -535,7 +598,7 @@ def _evaluate_contract_evidence(payload: ContractVerifierInput) -> ContractVerif
                 },
                 confidence=1.0,
             )
-        actual_type = _classify_top_level_type(target_change["after"])
+        actual_type = _classify_top_level_type(after_value)
         if expected_top_level_type and actual_type != expected_top_level_type:
             return _build_failed_result(
                 error_family="result_shape",
@@ -551,7 +614,7 @@ def _evaluate_contract_evidence(payload: ContractVerifierInput) -> ContractVerif
                     f"Observed `{expected_update_path}` as `{actual_type}` after execution.",
                 ],
                 expected={"top_level_type": expected_top_level_type, "update_path": expected_update_path},
-                actual={"top_level_type": actual_type, "value": target_change["after"]},
+                actual={"top_level_type": actual_type, "value": after_value},
                 fixer_brief={
                     "goal": "Preserve the update target but fix the top-level result shape only.",
                     "must_change": [f"Normalize the final value at `{expected_update_path}` to `{expected_top_level_type}`."],
@@ -569,7 +632,12 @@ def _evaluate_contract_evidence(payload: ContractVerifierInput) -> ContractVerif
                 f"`{expected_update_path}` changed after execution.",
             ],
             expected={"update_path": expected_update_path, "top_level_type": expected_top_level_type},
-            actual={"update_path": expected_update_path, "top_level_type": actual_type},
+            actual={
+                "update_path": expected_update_path,
+                "top_level_type": actual_type,
+                "changed_paths": changed_paths,
+                "relevant_diff": related_changes[:5],
+            },
             confidence=0.96,
         )
 
@@ -868,9 +936,11 @@ def build_contract_verifier_input_from_state(state: dict[str, Any]) -> ContractV
     )
 
     selected_primary_path = str(compiled_request.get("selected_primary_path", "") or "").strip()
+    selected_save_path = str(compiled_request.get("selected_save_path", "") or "").strip()
     expected_paths = _unique_strings(
         _ensure_string_list(compiled_request.get("expected_workflow_paths"))
         + ([selected_primary_path] if selected_primary_path else [])
+        + ([selected_save_path] if selected_save_path else [])
         + _ensure_string_list(planner_result.get("identified_workflow_paths"))
         + _extract_workflow_paths(task)
     )
@@ -879,7 +949,7 @@ def build_contract_verifier_input_from_state(state: dict[str, Any]) -> ContractV
         _extract_inventory_paths(compiled_request.get("workflow_path_inventory"))
         + _extract_workflow_paths(code)
         + ([selected_primary_path] if selected_primary_path else [])
-        + ([str(compiled_request.get("selected_save_path", "") or "").strip()] if str(compiled_request.get("selected_save_path", "") or "").strip() else [])
+        + ([selected_save_path] if selected_save_path else [])
         + expected_paths
     )
 
@@ -888,13 +958,20 @@ def build_contract_verifier_input_from_state(state: dict[str, Any]) -> ContractV
         or str(planner_result.get("expected_result_action", "") or "").strip()
         or str(compiled_request.get("expected_result_action", "") or "").strip()
     )
+    if not expected_result_action:
+        if selected_save_path:
+            expected_result_action = "save_to_wf_vars"
+        elif selected_primary_path and _task_expects_state_update(task):
+            expected_result_action = "save_to_wf_vars"
+        else:
+            expected_result_action = "return"
 
     expected_return_path: str | None = None
     expected_update_path: str | None = None
     if expected_result_action == "return" and selected_primary_path:
         expected_return_path = selected_primary_path
-    if expected_result_action == "save_to_wf_vars" and selected_primary_path:
-        expected_update_path = selected_primary_path
+    if expected_result_action == "save_to_wf_vars":
+        expected_update_path = selected_save_path or selected_primary_path
 
     runtime_result: object = diagnostics.get("result_value")
     if runtime_result is None:
@@ -903,7 +980,12 @@ def build_contract_verifier_input_from_state(state: dict[str, Any]) -> ContractV
             runtime_result = preview
 
     parsed_context = compiled_request.get("parsed_context")
-    before_state = parsed_context if compiled_request.get("has_parseable_context") else None
+    before_state = (
+        _normalize_workflow_snapshot(parsed_context)
+        if compiled_request.get("has_parseable_context")
+        else None
+    )
+    after_state = _normalize_workflow_snapshot(diagnostics.get("workflow_state"))
 
     return {
         "task": task,
@@ -919,13 +1001,13 @@ def build_contract_verifier_input_from_state(state: dict[str, Any]) -> ContractV
         "parsed_context": parsed_context,
         "runtime_result": runtime_result,
         "before_state": before_state,
-        "after_state": diagnostics.get("workflow_state"),
+        "after_state": after_state,
         "allowed_workflow_paths": allowed_workflow_paths,
         "available_code_variables": _extract_code_variables(code),
         "available_runtime_evidence": {
             "runtime_result": runtime_result is not None,
             "before_state": before_state is not None,
-            "after_state": diagnostics.get("workflow_state") is not None,
+            "after_state": after_state is not None,
         },
     }
 
@@ -965,6 +1047,9 @@ class ContractVerifierAgent:
         return _AGENT_NAME
 
     async def verify(self, payload: ContractVerifierInput) -> ContractVerifierResult:
+        payload = dict(payload)
+        payload["before_state"] = _normalize_workflow_snapshot(payload.get("before_state"))
+        payload["after_state"] = _normalize_workflow_snapshot(payload.get("after_state"))
         code = str(payload.get("code", "") or "")
         expected_paths = _unique_strings(_ensure_string_list(payload.get("expected_workflow_paths")))
 
