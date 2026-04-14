@@ -227,6 +227,7 @@ class ChatStore:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
     def _init_db(self) -> None:
@@ -313,6 +314,9 @@ class ChatStore:
             )
 
     def add_message(self, chat_id: int, role: str, title: str, content: str) -> None:
+        current = self.get_chat(chat_id)
+        if not current:
+            raise KeyError(f"Chat {chat_id} not found.")
         with closing(self._connect()) as connection, connection:
             connection.execute(
                 "INSERT INTO chat_messages (chat_id, role, title, content, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -1531,13 +1535,24 @@ class AppRuntime:
         }
 
     def _save_current_chat(self, title: str | None = None) -> None:
+        self._ensure_current_chat_exists()
         effective_title = title or _derive_title(
             self.state_dict.get("base_prompt", ""),
             self.state_dict.get("target_path", ""),
         )
         self.store.save_chat_state(self.current_chat_id, self.state_dict, effective_title)
 
+    def _ensure_current_chat_exists(self) -> None:
+        if self.current_chat_id and self.store.get_chat(self.current_chat_id):
+            return
+        effective_title = _derive_title(
+            self.state_dict.get("base_prompt", ""),
+            self.state_dict.get("target_path", ""),
+        )
+        self.current_chat_id = self.store.create_chat(self.state_dict, effective_title)
+
     def build_messages_payload(self) -> list[dict]:
+        self._ensure_current_chat_exists()
         return self.store.load_messages(self.current_chat_id)
 
     def build_state_payload(self) -> dict:
@@ -1566,6 +1581,7 @@ class AppRuntime:
         }
 
     def build_full_payload(self) -> dict:
+        self._ensure_current_chat_exists()
         return {
             "active_chat_id": self.current_chat_id,
             "state": self.build_state_payload(),
@@ -1609,6 +1625,7 @@ class AppRuntime:
             return self.build_full_payload()
 
         with self.lock:
+            self._ensure_current_chat_exists()
             write_runtime_audit(
                 "chat_user_message_received",
                 chat_id=self.current_chat_id,
@@ -1617,7 +1634,11 @@ class AppRuntime:
                 message=text,
             )
             # Save user message
-            self.store.add_message(self.current_chat_id, "user", "Пользователь", text)
+            try:
+                self.store.add_message(self.current_chat_id, "user", "Пользователь", text)
+            except KeyError:
+                self._ensure_current_chat_exists()
+                self.store.add_message(self.current_chat_id, "user", "Пользователь", text)
 
             if text.startswith("/"):
                 response_text = self._handle_command(text)
