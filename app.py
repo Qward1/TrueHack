@@ -10,6 +10,7 @@ import re
 import sqlite3
 import threading
 import webbrowser
+from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import closing
 from http import HTTPStatus
@@ -34,6 +35,25 @@ DEFAULT_REQUEST_TIMEOUT = 600.0
 
 CHAT_DB_NAME = ".lua_console_chats.db"
 MAX_CHAT_TITLE_LENGTH = 72
+AGENT_LABELS_RU = {
+    "TaskPlanner": "Планировщик задачи",
+    "IntentRouter": "Маршрутизатор интента",
+    "CodeGenerator": "Генератор кода",
+    "CodeRefiner": "Редактор кода",
+    "CodeValidator": "Валидатор кода",
+    "ValidationFixer": "Исправление валидации",
+    "VerificationFixer": "Исправление требований",
+    "RequirementsVerifier": "Проверка требований",
+    "SolutionExplainer": "Объяснение решения",
+    "QuestionAnswerer": "Ответ на вопрос",
+    "TargetResolver": "Определение пути",
+    "CodeSaver": "Сохранение файла",
+    "ResponseAssembler": "Сборка ответа",
+}
+
+
+class PipelineCancelledError(RuntimeError):
+    """Raised when the active pipeline turn is cancelled by the user."""
 
 
 def utc_now_iso() -> str:
@@ -397,6 +417,7 @@ HTML_PAGE = """<!doctype html>
       gap: 12px;
       padding-bottom: 10px;
       border-bottom: 1px solid rgba(216, 199, 170, 0.7);
+      flex-shrink: 0;
     }
 
     .hero h1 {
@@ -430,6 +451,7 @@ HTML_PAGE = """<!doctype html>
       flex-wrap: wrap;
       gap: 8px;
       padding: 10px 0 8px;
+      flex-shrink: 0;
     }
 
     button {
@@ -465,6 +487,7 @@ HTML_PAGE = """<!doctype html>
       overflow: auto;
       min-height: 0;
       padding-right: 6px;
+      padding-bottom: 10px;
       display: flex;
       flex-direction: column;
       gap: 14px;
@@ -505,6 +528,9 @@ HTML_PAGE = """<!doctype html>
       border-color: rgba(181, 85, 45, 0.42);
       background:
         linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(255, 250, 240, 0.9));
+      align-self: flex-start;
+      max-width: min(92%, 920px);
+      flex-shrink: 0;
     }
 
     .message.thinking::after {
@@ -587,6 +613,8 @@ HTML_PAGE = """<!doctype html>
       padding-top: 8px;
       margin-top: 6px;
       border-top: 1px solid rgba(216, 199, 170, 0.7);
+      flex-shrink: 0;
+      background: rgba(255, 250, 240, 0.96);
     }
 
     textarea {
@@ -705,6 +733,26 @@ HTML_PAGE = """<!doctype html>
       font-size: 15px;
       text-transform: uppercase;
       letter-spacing: 0.08em;
+      color: var(--accent-dark);
+    }
+
+    .side-card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .side-card-head h2 {
+      margin: 0;
+    }
+
+    .ghost-button {
+      min-width: 88px;
+      padding: 8px 12px;
+      border-radius: 12px;
+      background: rgba(181, 85, 45, 0.08);
       color: var(--accent-dark);
     }
 
@@ -850,6 +898,7 @@ HTML_PAGE = """<!doctype html>
         </div>
         <div class="send-box">
           <button class="primary" id="sendButton" type="submit">Отправить</button>
+          <button type="button" id="stopButton" disabled>Стоп</button>
         </div>
       </form>
     </section>
@@ -864,7 +913,10 @@ HTML_PAGE = """<!doctype html>
       </div>
 
       <div class="side-card">
-        <h2>Последний Код</h2>
+        <div class="side-card-head">
+          <h2>Последний Код</h2>
+          <button type="button" class="ghost-button" id="copyCodeButton">Копировать</button>
+        </div>
         <div class="code-box" id="codeBox"><span class="ghost">Код появится после первой генерации или команды “Показать Код”.</span></div>
       </div>
     </aside>
@@ -875,12 +927,16 @@ HTML_PAGE = """<!doctype html>
     const composer = document.getElementById("composer");
     const input = document.getElementById("messageInput");
     const sendButton = document.getElementById("sendButton");
+    const stopButton = document.getElementById("stopButton");
     const codeBox = document.getElementById("codeBox");
+    const copyCodeButton = document.getElementById("copyCodeButton");
     const statusBadge = document.getElementById("statusBadge");
     const chatList = document.getElementById("chatList");
     const newChatButton = document.getElementById("newChatButton");
     let activeChatId = null;
     let stopThinkingIndicator = null;
+    let cancelRequested = false;
+    let activeStatePollTimer = null;
 
     function addMessage(kind, title, text) {
       const card = document.createElement("div");
@@ -903,6 +959,10 @@ HTML_PAGE = """<!doctype html>
       if (stopThinkingIndicator) {
         stopThinkingIndicator();
         stopThinkingIndicator = null;
+      }
+      if (activeStatePollTimer) {
+        window.clearInterval(activeStatePollTimer);
+        activeStatePollTimer = null;
       }
     }
 
@@ -1018,7 +1078,7 @@ HTML_PAGE = """<!doctype html>
 
       const hint = document.createElement("div");
       hint.className = "thinking-hint";
-      hint.textContent = "Показываются этапы работы, а не скрытые внутренние рассуждения.";
+      hint.textContent = "";
 
       body.append(line, hint);
       card.append(meta, body);
@@ -1038,8 +1098,24 @@ HTML_PAGE = """<!doctype html>
 
       render();
       const timer = window.setInterval(render, 900);
+      const updateAgentHint = async () => {
+        try {
+          const response = await fetch("/api/state");
+          const data = await response.json();
+          const label = data && data.state ? (data.state.active_agent_label || "") : "";
+          hint.textContent = label ? `Сейчас работает: ${label}.` : "";
+        } catch (error) {
+          // Ignore polling errors while the request is in-flight.
+        }
+      };
+      updateAgentHint();
+      activeStatePollTimer = window.setInterval(updateAgentHint, 1000);
       stopThinkingIndicator = () => {
         window.clearInterval(timer);
+        if (activeStatePollTimer) {
+          window.clearInterval(activeStatePollTimer);
+          activeStatePollTimer = null;
+        }
         if (card.isConnected) {
           card.remove();
         }
@@ -1064,6 +1140,7 @@ HTML_PAGE = """<!doctype html>
 
     function setBusy(isBusy) {
       sendButton.disabled = isBusy;
+      stopButton.disabled = !isBusy || cancelRequested;
       newChatButton.disabled = isBusy;
       document.querySelectorAll("[data-action]").forEach((button) => {
         button.disabled = isBusy;
@@ -1078,9 +1155,32 @@ HTML_PAGE = """<!doctype html>
       if (state.current_code && state.current_code.trim()) {
         codeBox.textContent = state.current_code;
         codeBox.dataset.filled = "yes";
+        copyCodeButton.disabled = false;
       } else {
         delete codeBox.dataset.filled;
         codeBox.innerHTML = '<span class="ghost">Код появится после первой генерации или команды “Показать Код”.</span>';
+        copyCodeButton.disabled = true;
+      }
+    }
+
+    async function copyLatestCode() {
+      const code = codeBox.textContent || "";
+      if (!codeBox.dataset.filled || !code.trim()) {
+        return;
+      }
+
+      const originalLabel = copyCodeButton.textContent;
+      try {
+        await navigator.clipboard.writeText(code);
+        copyCodeButton.textContent = "Скопировано";
+        window.setTimeout(() => {
+          copyCodeButton.textContent = originalLabel;
+        }, 1400);
+      } catch (error) {
+        copyCodeButton.textContent = "Ошибка";
+        window.setTimeout(() => {
+          copyCodeButton.textContent = originalLabel;
+        }, 1400);
       }
     }
 
@@ -1174,6 +1274,7 @@ HTML_PAGE = """<!doctype html>
         return;
       }
 
+      cancelRequested = false;
       addMessage("user", title, text.trim());
       showThinkingIndicator(text);
       setBusy(true);
@@ -1191,6 +1292,26 @@ HTML_PAGE = """<!doctype html>
         setBusy(false);
       }
     }
+
+    stopButton.addEventListener("click", async () => {
+      if (stopButton.disabled) {
+        return;
+      }
+      cancelRequested = true;
+      stopButton.disabled = true;
+      statusBadge.textContent = "Останавливается";
+      try {
+        await callApi("/api/cancel", {});
+      } catch (error) {
+        cancelRequested = false;
+        setBusy(true);
+        addMessage("assistant", "Ошибка Остановки", String(error));
+      }
+    });
+
+    copyCodeButton.addEventListener("click", async () => {
+      await copyLatestCode();
+    });
 
     composer.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -1304,6 +1425,12 @@ class AppRuntime:
         self.lock = threading.Lock()
         self.default_workspace = os.path.abspath(getattr(args, "workspace", os.getcwd()) or os.getcwd())
         self.store = ChatStore(os.path.join(os.getcwd(), CHAT_DB_NAME))
+        self._active_future_lock = threading.Lock()
+        self._active_pipeline_future = None
+        self._active_pipeline_chat_id = 0
+        self._active_pipeline_turn_id = ""
+        self._active_agent_name = ""
+        self._active_agent_label = ""
 
         # Create the async event loop for the engine
         self._loop = asyncio.new_event_loop()
@@ -1315,6 +1442,7 @@ class AppRuntime:
             base_url=getattr(args, "url", DEFAULT_URL),
             model=getattr(args, "model", DEFAULT_MODEL),
             timeout=getattr(args, "request_timeout", DEFAULT_REQUEST_TIMEOUT),
+            status_callback=self._handle_llm_status,
         )
         self.engine = PipelineEngine(
             llm=llm,
@@ -1333,14 +1461,74 @@ class AppRuntime:
         else:
             self.current_chat_id = self.store.create_chat(self.state_dict, "Новый чат")
 
-    def _run_async(self, coro) -> any:
+    def _set_active_pipeline(self, future, *, chat_id: int, turn_id: str) -> None:
+        with self._active_future_lock:
+            self._active_pipeline_future = future
+            self._active_pipeline_chat_id = chat_id
+            self._active_pipeline_turn_id = turn_id
+            self._active_agent_name = ""
+            self._active_agent_label = ""
+
+    def _clear_active_pipeline(self, future) -> None:
+        with self._active_future_lock:
+            if self._active_pipeline_future is future:
+                self._active_pipeline_future = None
+                self._active_pipeline_chat_id = 0
+                self._active_pipeline_turn_id = ""
+                self._active_agent_name = ""
+                self._active_agent_label = ""
+
+    def _handle_llm_status(self, *, event: str, agent_name: str = "", model: str = "", call_kind: str = "") -> None:
+        with self._active_future_lock:
+            if event == "start":
+                self._active_agent_name = str(agent_name or "").strip()
+                self._active_agent_label = AGENT_LABELS_RU.get(
+                    self._active_agent_name,
+                    self._active_agent_name or "LLM-агент",
+                )
+            elif event == "finish" and self._active_agent_name == str(agent_name or "").strip():
+                self._active_agent_name = ""
+                self._active_agent_label = ""
+
+    def _run_async(self, coro, *, track_pipeline: bool = False, chat_id: int = 0, turn_id: str = "") -> any:
         """Run an async coroutine from sync context via the background event loop."""
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        if track_pipeline:
+            self._set_active_pipeline(future, chat_id=chat_id, turn_id=turn_id)
         try:
             return future.result(timeout=660)  # generous timeout
+        except FutureCancelledError as exc:
+            raise PipelineCancelledError("Генерация остановлена пользователем.") from exc
         except FutureTimeoutError as exc:
             future.cancel()
             raise TimeoutError("Pipeline timed out after 660 seconds") from exc
+        finally:
+            if track_pipeline:
+                self._clear_active_pipeline(future)
+
+    def cancel_active_pipeline(self) -> dict:
+        with self._active_future_lock:
+            future = self._active_pipeline_future
+            chat_id = self._active_pipeline_chat_id
+            turn_id = self._active_pipeline_turn_id
+
+        if future is None or future.done():
+            return {
+                "cancel_requested": False,
+                "message": "Нет активной генерации.",
+            }
+
+        cancelled = future.cancel()
+        write_runtime_audit(
+            "chat_pipeline_cancel_requested",
+            chat_id=chat_id,
+            turn_id=turn_id,
+            cancel_requested=cancelled,
+        )
+        return {
+            "cancel_requested": cancelled,
+            "message": "Остановка запрошена." if cancelled else "Не удалось остановить генерацию.",
+        }
 
     def _save_current_chat(self, title: str | None = None) -> None:
         effective_title = title or _derive_title(
@@ -1372,6 +1560,9 @@ class AppRuntime:
             "change_requests_count": len(sd.get("change_requests", [])),
             "suggested_changes": sd.get("last_suggested_changes", []),
             "clarifying_questions": sd.get("last_clarifying_questions", []),
+            "pipeline_running": self._active_pipeline_future is not None and not self._active_pipeline_future.done(),
+            "active_agent_name": self._active_agent_name,
+            "active_agent_label": self._active_agent_label,
         }
 
     def build_full_payload(self) -> dict:
@@ -1489,8 +1680,23 @@ class AppRuntime:
                     planner_original_input=sd.get("planner_original_input", ""),
                     planner_clarification_attempts=sd.get("planner_clarification_attempts", 0),
                     active_clarifying_questions=sd.get("last_clarifying_questions", []),
-                )
+                ),
+                track_pipeline=True,
+                chat_id=self.current_chat_id,
+                turn_id=turn_id,
             )
+        except PipelineCancelledError:
+            write_runtime_audit(
+                "chat_pipeline_cancelled",
+                chat_id=self.current_chat_id,
+                turn_id=turn_id,
+            )
+            logger.info(
+                "pipeline_cancelled",
+                chat_id=self.current_chat_id,
+                turn_id=turn_id,
+            )
+            return "Генерация остановлена пользователем."
         except Exception as exc:
             error_text = str(exc) or repr(exc) or type(exc).__name__
             write_runtime_audit(
@@ -1683,6 +1889,10 @@ def make_handler(runtime: AppRuntime):
                 message = str(payload.get("message", ""))
                 response = runtime.handle_message(message)
                 self.respond_json(response)
+                return
+
+            if self.path == "/api/cancel":
+                self.respond_json(runtime.cancel_active_pipeline())
                 return
 
             if self.path == "/api/chats/new":

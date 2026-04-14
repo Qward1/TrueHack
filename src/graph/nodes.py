@@ -2155,8 +2155,6 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
         code = _normalize_runtime_candidate(state.get("generated_code", ""))
         target_path = state.get("target_path", "")
         compiled_request = state.get("compiled_request", {})
-        validation_passed = bool(state.get("validation_passed", False))
-        verification_passed = bool(state.get("verification_passed", False))
 
         logger.info(
             f"[{_AGENT_SAVE_CODE}] started",
@@ -2171,28 +2169,6 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
                 "save_skipped": False,
                 "save_skip_reason": "",
                 "save_error": "Empty code cannot be saved.",
-                "saved_to": "",
-                "saved_jsonstring_to": "",
-            }
-        if not validation_passed:
-            logger.warning(f"[{_AGENT_SAVE_CODE}] validation failed — skipping save")
-            return {
-                "current_code": code,
-                "save_success": False,
-                "save_skipped": True,
-                "save_skip_reason": "Код показан в ответе, но не сохранен в файл, потому что не прошел валидацию.",
-                "save_error": "",
-                "saved_to": "",
-                "saved_jsonstring_to": "",
-            }
-        if not verification_passed:
-            logger.warning(f"[{_AGENT_SAVE_CODE}] verification failed — skipping save")
-            return {
-                "current_code": code,
-                "save_success": False,
-                "save_skipped": True,
-                "save_skip_reason": "Код показан в ответе, но не сохранен в файл, потому что не прошел проверку требований.",
-                "save_error": "",
                 "saved_to": "",
                 "saved_jsonstring_to": "",
             }
@@ -2419,17 +2395,31 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             }
 
         lines: list[str] = []
+        validation_passed = bool(state.get("validation_passed", False))
+        verification_passed = bool(state.get("verification_passed", False))
+
         if state.get("save_success", False):
-            lines.append("Код сгенерирован, прошел проверки и сохранен.\n")
+            if validation_passed and verification_passed:
+                lines.append("Код сгенерирован, прошел проверки и сохранен.\n")
+            else:
+                lines.append("Последняя версия решения из чата сохранена в файл.\n")
+                if failure_stage:
+                    lines.append(f"Этап с проблемой: {failure_stage}\n")
+                lines.append("Проверки не пройдены полностью, но файл обновлен последней версией кода.\n")
         elif save_skipped:
-            lines.append("Код сгенерирован и прошел проверки.\n")
+            if validation_passed and verification_passed:
+                lines.append("Код сгенерирован и прошел проверки.\n")
+            else:
+                lines.append("Код подготовлен, но финальные условия сохранения не выполнены.\n")
+                if failure_stage:
+                    lines.append(f"Этап с проблемой: {failure_stage}\n")
             lines.append(f"{save_skip_reason or 'Путь не указан, поэтому файл не сохранялся.'}\n")
         else:
             lines.append("Код подготовлен, но финальные условия сохранения не выполнены.\n")
             if failure_stage:
                 lines.append(f"Этап с проблемой: {failure_stage}\n")
 
-        if save_skipped and not (state.get("validation_passed") and state.get("verification_passed")):
+        if save_skipped and not (validation_passed and verification_passed):
             if lines:
                 lines[0] = "Код подготовлен, но финальные условия сохранения не выполнены.\n"
             if failure_stage:

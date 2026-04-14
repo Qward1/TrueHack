@@ -92,12 +92,48 @@ def _list_installed_models(root_url: str) -> set[str]:
 
 def _pull_model(root_url: str, model_name: str) -> None:
     print(f"[bootstrap] Pulling missing Ollama model: {model_name}", flush=True)
-    _read_json(
+    request = urllib.request.Request(
         f"{root_url}/api/pull",
+        data=json.dumps({"name": model_name, "stream": True}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
         method="POST",
-        payload={"name": model_name, "stream": False},
-        timeout=3600.0,
     )
+
+    last_percent = -1
+    last_status = ""
+    with urllib.request.urlopen(request, timeout=3600.0) as response:
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            status = str(payload.get("status", "") or "").strip()
+            completed = payload.get("completed")
+            total = payload.get("total")
+
+            if isinstance(completed, int) and isinstance(total, int) and total > 0:
+                percent = int((completed / total) * 100)
+                if percent != last_percent:
+                    print(
+                        f"[bootstrap] Pulling {model_name}: {percent}% ({completed}/{total})",
+                        flush=True,
+                    )
+                    last_percent = percent
+                last_status = status or last_status
+                continue
+
+            if status and status != last_status:
+                print(f"[bootstrap] Pulling {model_name}: {status}", flush=True)
+                last_status = status
+
+            if payload.get("error"):
+                raise RuntimeError(str(payload["error"]))
+
+    print(f"[bootstrap] Model ready: {model_name}", flush=True)
 
 
 def main() -> int:

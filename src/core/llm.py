@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 import re
-from typing import Any
+from typing import Any, Callable
 
 import structlog
 from openai import AsyncOpenAI
@@ -126,6 +126,7 @@ class LLMProvider:
         base_url: str | None = None,
         model: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
+        status_callback: Callable[..., None] | None = None,
     ) -> None:
         resolved_base_url = str(base_url or os.getenv("OLLAMA_BASE_URL", DEFAULT_URL)).strip() or DEFAULT_URL
         resolved_model = str(model or os.getenv("OLLAMA_MODEL", DEFAULT_MODEL)).strip() or DEFAULT_MODEL
@@ -135,6 +136,7 @@ class LLMProvider:
             timeout=timeout,
         )
         self._model = resolved_model
+        self._status_callback = status_callback
 
     def resolve_model(self, agent_name: str = "") -> str:
         return _resolve_agent_model(agent_name, self._model)
@@ -240,8 +242,31 @@ class LLMProvider:
             messages=message_payload,
         )
 
+        if self._status_callback:
+            try:
+                self._status_callback(
+                    event="start",
+                    agent_name=agent_name,
+                    model=effective_model,
+                    call_kind=call_kind,
+                )
+            except Exception:
+                pass
+
         async with _LLM_REQUEST_SEMAPHORE:
-            response = await self._client.chat.completions.create(**kwargs)
+            try:
+                response = await self._client.chat.completions.create(**kwargs)
+            finally:
+                if self._status_callback:
+                    try:
+                        self._status_callback(
+                            event="finish",
+                            agent_name=agent_name,
+                            model=effective_model,
+                            call_kind=call_kind,
+                        )
+                    except Exception:
+                        pass
         content = response.choices[0].message.content or ""
         cleaned = content.strip()
         write_llm_prompt_audit(
