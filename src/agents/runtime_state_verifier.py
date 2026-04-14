@@ -30,10 +30,17 @@ Do not invent workflow paths, variables, fields, results, runtime evidence, or s
 Any path or variable not listed in allowed_workflow_paths, available_code_variables, or the focused evidence sections must be treated as unavailable.
 Fail only when you can point to exact evidence from the input.
 If exact evidence is missing, do not guess and do not fabricate a mismatch.
+If the structured schema shows placeholder text such as "low|medium|high|critical" or "string", replace it with a literal valid value instead of copying the placeholder.
 Return JSON only.
 If passed=false, report the exact mismatch at the exact field path and a minimal patch target."""
 
 _WORKFLOW_PATH_RE = re.compile(r"wf\.(?:vars|initVariables)(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
+_DIRECT_WORKFLOW_ALIAS_RE = re.compile(
+    r"(?im)^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(wf\.(?:vars|initVariables)(?:\.[A-Za-z_][A-Za-z0-9_]*)+)"
+)
+_INDEXED_ALIAS_RE = re.compile(
+    r"(?im)^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*[^]]+\s*\]"
+)
 _VALID_SEVERITIES = frozenset({"low", "medium", "high", "critical"})
 _VALID_PATCH_SCOPES = frozenset({"none", "local", "function_level", "multi_block", "rewrite"})
 _SAVE_MARKERS = (
@@ -64,6 +71,7 @@ class RuntimeStateVerifierInput(TypedDict, total=False):
     output_field_path: str | None
     expected_workflow_paths: list[str]
     selected_operation: str | None
+    planner_target_operation: str | None
     operation_argument: object
     semantic_expectations: list[str]
     parsed_context: object
@@ -72,6 +80,7 @@ class RuntimeStateVerifierInput(TypedDict, total=False):
     after_state: object
     allowed_workflow_paths: list[str]
     available_code_variables: list[str]
+    workflow_aliases: dict[str, str]
     available_runtime_evidence: dict[str, bool]
 
 
@@ -147,6 +156,7 @@ Output rules:
 - Keep expected, actual, evidence, and fixer_brief minimal.
 - field_path must be null or an exact path proven by the input.
 - changed_paths and relevant_diff must include only observed evidence.
+- Use a literal severity value such as "low" or "high"; never copy enum placeholders from the schema.
 - Do not add any path or variable that is not explicitly available."""
 
 
@@ -241,11 +251,41 @@ def _extract_code_variables(code: str) -> list[str]:
     return _unique_strings(found)
 
 
+def _extract_workflow_aliases(code: str) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for match in _DIRECT_WORKFLOW_ALIAS_RE.finditer(code or ""):
+        alias = str(match.group(1) or "").strip()
+        workflow_path = str(match.group(2) or "").strip()
+        if alias and workflow_path:
+            aliases[alias] = workflow_path
+    for match in _INDEXED_ALIAS_RE.finditer(code or ""):
+        alias = str(match.group(1) or "").strip()
+        base_alias = str(match.group(2) or "").strip()
+        base_path = aliases.get(base_alias)
+        if alias and base_path:
+            aliases[alias] = base_path + "[*]"
+    return aliases
+
+
 def _format_named_list(title: str, items: list[str]) -> str:
     normalized = _unique_strings([str(item).strip() for item in items if str(item).strip()])
     if not normalized:
         return f"{title}:\n[]"
     return title + ":\n" + "\n".join(f"- {item}" for item in normalized)
+
+
+def _format_alias_map(title: str, aliases: dict[str, str]) -> str:
+    if not isinstance(aliases, dict) or not aliases:
+        return f"{title}:\n[]"
+    lines = [f"{title}:"]
+    for name in sorted(aliases.keys()):
+        alias_name = str(name).strip()
+        alias_path = str(aliases.get(name, "") or "").strip()
+        if alias_name and alias_path:
+            lines.append(f"- {alias_name} -> {alias_path}")
+    if len(lines) == 1:
+        return f"{title}:\n[]"
+    return "\n".join(lines)
 
 
 def _render_presence_map(title: str, value: object) -> str:
@@ -382,8 +422,11 @@ def _derive_output_field_path(payload: RuntimeStateVerifierInput) -> str | None:
 
 def _derive_selected_operation(payload: RuntimeStateVerifierInput) -> str:
     selected = str(payload.get("selected_operation", "") or "").strip().lower()
-    if selected and selected != "llm":
+    planner_operation = str(payload.get("planner_target_operation", "") or "").strip().lower()
+    if selected and selected not in {"llm", "return"}:
         return selected
+    if planner_operation and planner_operation not in {"none", "return"}:
+        return planner_operation
     task = str(payload.get("task", "") or "").lower()
     if any(marker in task for marker in ("sum", "total", "сумм", "итог")):
         return "sum"
@@ -511,6 +554,25 @@ def _is_ignorable_root_artifact(change: _StateChange) -> bool:
 
 def _filter_ignorable_root_artifacts(changes: list[_StateChange]) -> list[_StateChange]:
     return [change for change in changes if not _is_ignorable_root_artifact(change)]
+
+
+def _looks_like_placeholder_scalar(value: object) -> bool:
+    if value is None:
+        return True
+    text = str(value or "").strip().lower()
+    return text in {"sample", "<max_depth>", "<cycle>", "null"}
+
+
+def _looks_like_unreliable_after_state_value(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    keys = [str(key) for key in value.keys()]
+    numeric_like_keys = [key for key in keys if key.isdigit()]
+    named_keys = [key for key in keys if not key.isdigit()]
+    if not numeric_like_keys or not named_keys:
+        return False
+    numeric_values = [value.get(int(key)) if isinstance(value, dict) and int(key) in value else value.get(key) for key in numeric_like_keys]
+    return all(_looks_like_placeholder_scalar(item) for item in numeric_values)
 
 
 def _related_changes(changes: list[_StateChange], target: str | None) -> list[_StateChange]:
@@ -791,6 +853,44 @@ def _build_path_mismatch_result(
     )
 
 
+def _build_in_place_source_mutation_result(
+    *,
+    source_path: str,
+    changes: list[_StateChange],
+    relevant_changes: list[_StateChange],
+) -> RuntimeStateVerifierResult:
+    return _build_failed_result(
+        error_family="runtime_state",
+        error_code="source_mutated_for_return_only_task",
+        summary=(
+            f"Return-only execution mutated the source workflow path `{source_path}` in place."
+        ),
+        field_path=source_path,
+        expected={
+            "field_path": source_path,
+            "expected_behavior": "Keep workflow state unchanged and return a new transformed value.",
+            "relevant_diff": _compact_changes(relevant_changes),
+        },
+        actual={
+            "changed_paths": _summarize_paths(changes),
+            "relevant_diff": _compact_changes(relevant_changes or changes),
+        },
+        evidence=[
+            "Primary evidence source: before_state/after_state diff.",
+            f"The changed path matches the read source path `{source_path}` of a return-only task.",
+        ],
+        must_change=[
+            f"Do not mutate `{source_path}` in place.",
+            "Build a fresh return value instead of editing workflow-source tables directly.",
+        ],
+        suggested_patch=(
+            "Create a fresh return value and copy or rebuild transformed items instead of mutating the source workflow path."
+        ),
+        patch_scope="function_level",
+        confidence=0.98,
+    )
+
+
 def _evaluate_state_path_mismatch(payload: RuntimeStateVerifierInput) -> RuntimeStateVerifierResult | None:
     before_state = payload.get("before_state")
     after_state = payload.get("after_state")
@@ -800,6 +900,7 @@ def _evaluate_state_path_mismatch(payload: RuntimeStateVerifierInput) -> Runtime
     changes = _collect_state_changes(before_state, after_state)
     changes = _filter_ignorable_root_artifacts(changes)
     expected_update_path = _derive_expected_update_path(payload)
+    source_path = _derive_source_field_path(payload)
 
     if expected_update_path:
         before_found, before_value = _resolve_workflow_path_value(before_state, expected_update_path)
@@ -856,6 +957,28 @@ def _evaluate_state_path_mismatch(payload: RuntimeStateVerifierInput) -> Runtime
         return None
 
     if _derive_expected_result_action(payload) != "save_to_wf_vars" and changes:
+        source_related_changes = _related_changes(changes, source_path) if source_path else []
+        if source_path and source_related_changes and len(source_related_changes) == len(changes):
+            _, after_source_value = _resolve_workflow_path_value(after_state, source_path)
+            if (
+                payload.get("runtime_result") is not None
+                and _looks_like_unreliable_after_state_value(after_source_value)
+            ):
+                return _build_passed_result(
+                    summary=(
+                        f"runtime_result is available, but after_state at `{source_path}` looks structurally unreliable and is not used as blocking state evidence."
+                    ),
+                    evidence=[
+                        "Primary evidence source: runtime_result plus before_state/after_state sanity check.",
+                        f"Observed diff is isolated to `{source_path}`, but the serialized after_state value for that path looks like a mixed-table artifact.",
+                    ],
+                    confidence=0.55,
+                )
+            return _build_in_place_source_mutation_result(
+                source_path=source_path,
+                changes=changes,
+                relevant_changes=source_related_changes,
+            )
         wrong_path = changes[0]["path"]
         result = _build_path_mismatch_result(
             error_code="extra_unintended_state_change",
@@ -1077,6 +1200,9 @@ def _build_runtime_state_verifier_prompt(payload: RuntimeStateVerifierInput) -> 
     available_code_variables = _unique_strings(
         _ensure_string_list(payload.get("available_code_variables")) or _extract_code_variables(code)
     )
+    workflow_aliases = payload.get("workflow_aliases")
+    if not isinstance(workflow_aliases, dict):
+        workflow_aliases = _extract_workflow_aliases(code)
     available_runtime_evidence = payload.get("available_runtime_evidence")
     if not isinstance(available_runtime_evidence, dict):
         available_runtime_evidence = {
@@ -1109,11 +1235,13 @@ def _build_runtime_state_verifier_prompt(payload: RuntimeStateVerifierInput) -> 
         "Strict rules:\n"
         "- Use only explicit input data.\n"
         "- Never invent workflow paths, variables, state changes, or runtime evidence.\n"
-        "- You may reference only names from allowed_workflow_paths, available_code_variables, or focused evidence sections.\n"
-        "- Do not fail on suspicion alone. Cite exact evidence or keep the verdict conservative.",
+        "- You may reference only names from allowed_workflow_paths, available_code_variables, workflow_aliases, or focused evidence sections.\n"
+        "- Do not fail on suspicion alone. Cite exact evidence or keep the verdict conservative.\n"
+        "- If after_state looks structurally inconsistent or artifact-like, do not treat that alone as a confirmed mismatch.",
         "Execution context:\n" + "\n".join(context_lines) if context_lines else "",
         _format_named_list("allowed_workflow_paths", allowed_workflow_paths),
         _format_named_list("available_code_variables", available_code_variables),
+        _format_alias_map("workflow_aliases", workflow_aliases),
         _render_presence_map("available_runtime_evidence", available_runtime_evidence),
         (
             "runtime_result:\n" + _compact_json(payload.get("runtime_result"))
@@ -1206,6 +1334,7 @@ def build_runtime_state_verifier_input_from_state(state: dict[str, Any]) -> Runt
         "output_field_path": output_field_path or None,
         "expected_workflow_paths": expected_workflow_paths,
         "selected_operation": _normalize_nullable_string(compiled_request.get("selected_operation")),
+        "planner_target_operation": _normalize_nullable_string(planner_result.get("target_operation")),
         "operation_argument": compiled_request.get("operation_argument"),
         "semantic_expectations": _ensure_string_list(compiled_request.get("semantic_expectations")),
         "parsed_context": parsed_context,
@@ -1214,6 +1343,7 @@ def build_runtime_state_verifier_input_from_state(state: dict[str, Any]) -> Runt
         "after_state": after_state,
         "allowed_workflow_paths": allowed_workflow_paths,
         "available_code_variables": _extract_code_variables(code),
+        "workflow_aliases": _extract_workflow_aliases(code),
         "available_runtime_evidence": {
             "runtime_result": runtime_result is not None,
             "before_state": before_state is not None,

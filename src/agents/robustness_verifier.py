@@ -30,6 +30,7 @@ Do not invent workflow paths, variables, fields, runtime evidence, or edge cases
 Any path or variable not listed in allowed_workflow_paths, available_code_variables, or the focused evidence sections must be treated as unavailable.
 Fail only when you can point to exact evidence from the input.
 If exact evidence is missing, do not guess and do not fabricate a mismatch.
+If the structured schema shows placeholder text such as "low|medium|high|critical" or "string", replace it with a literal valid value instead of copying the placeholder.
 Return JSON only.
 If passed=false, describe the risky edge case and a minimal safe patch."""
 

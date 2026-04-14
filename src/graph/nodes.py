@@ -93,9 +93,12 @@ Return strict JSON only with exactly these fields:
 Rules:
 1. Choose exactly one candidate from the provided list.
 2. Prefer the candidate whose operation and data shape most directly match the current task.
-3. Prefer the most specific structurally compatible template over a generic one.
-4. Do not invent ids or indexes.
-5. If uncertain, choose the safest candidate that least conflicts with the task.
+3. Prefer planner target_operation over a generic compiler operation like `return` when both are shown.
+4. Prefer the most specific structurally compatible template over a generic one.
+5. If the task keeps an array of objects and augments or transforms each item, do not choose array-to-object or object-to-array templates.
+6. Use only the candidate metadata shown in the prompt. Do not infer hidden template behavior.
+7. Do not invent ids or indexes.
+8. If uncertain, choose the safest candidate that least conflicts with the task.
 """
 
 _GENERATE_SYSTEM = (
@@ -118,13 +121,9 @@ _REFINE_SYSTEM = (
 
 _VALIDATOR_HINT_SYSTEM = (
     "You are a Lua runtime diagnostics analyst for workflow scripts. "
-    "Use the traceback, the numbered script, and the provided workflow context together. "
-    "Do not simply restate the runtime error. Add new diagnostic value. "
-    "Infer the concrete root cause in the code, explain why it fails on this input/context, "
-    "and describe the exact repair path. "
-    "If the traceback points to a wrong argument, missing value, wrong type, nil access, or malformed call, "
-    "name the specific expression, variable, or argument position that must change. "
-    "If a proposed fix would leave the failing expression unchanged, say that it is insufficient and propose a concrete code-level change instead. "
+    "Use the traceback, code, and workflow context together. "
+    "Do not restate the error only. Name the concrete failing expression and the exact repair path. "
+    "If a proposed fix leaves the failing expression unchanged, say that it is insufficient. "
     "Return plain text only in this exact structure:\n"
     "Error type/message: ...\n"
     "Failing line: ...\n"
@@ -136,13 +135,10 @@ _VALIDATOR_HINT_SYSTEM = (
 
 _FIX_VALIDATION_SYSTEM = (
     f"You fix {LOWCODE_LUA_VERSION} workflow scripts that fail during execution. "
-    "You receive the broken script, the Lua runtime error, and an expert analysis of the root cause. "
-    "Return the corrected script.\n"
-    f"{LOWCODE_CONTRACT_TEXT}"
-    "Repair exactly the failing area identified in the error analysis. "
-    "Preserve all working logic and structure. "
-    "Do not convert the script into a console app.\n\n"
-    f"{LOWCODE_RESPONSE_FORMAT_REQUIREMENT}"
+    "Patch only the reported runtime problem. Preserve working logic. "
+    "Use exact wf.vars / wf.initVariables paths from the code or task. "
+    "Do not invent demo tables, console apps, or new wrappers. "
+    "Return only lua{...}lua."
 )
 
 _CONTINUATION_SYSTEM = (
@@ -274,6 +270,8 @@ _PROMPT_SYNTHESIS_GUIDANCE = """Generation guidance:
 - If the task is shape-sensitive, treat an array as a table with numeric keys 1..n without gaps. A table with string keys like `name` or `phone` is an object, not an array. Treat an empty table as an array.
 - If the task is shape-sensitive, explicitly distinguish object-like tables from array-like tables with numeric keys instead of relying only on `type(x) == "table"`, `next(x)`, or empty/non-empty tests.
 - If you need a new array, create it with `_utils.array.new()`, assign items explicitly, then call `_utils.array.markAsArray(arr)` before return/store.
+- Do not use `_utils.array.append`; add array items with `arr[#arr + 1] = value` or `table.insert(arr, value)`.
+- For return-only transforms, prefer building a fresh result value instead of mutating the source workflow path in place.
 - For numeric aggregation over workflow arrays, iterate the items explicitly and convert number-like string values with `tonumber(...)` or guard nils before arithmetic.
 - Keep simple tasks simple, but let complex tasks stay multi-step and explicit."""
 
@@ -993,11 +991,10 @@ def _build_fix_validation_prompt(
         runtime_line_hint,
         f"Failing code context:\n{runtime_code_context}" if runtime_code_context else "",
         f"Error analysis:\n{llm_fix_hint}" if llm_fix_hint else "",
-        f"Current code with line numbers:\n{_format_numbered_code_block(code)}",
+        "Current code body:\n" + code,
         "Fix the runtime error identified in the error analysis.",
         "Use the numbered code to repair the exact failing area.",
         "Preserve working logic and change only what is needed to resolve the error.",
-        _PROMPT_STYLE_RULES,
         LOWCODE_RESPONSE_FORMAT_REQUIREMENT,
     ]
     return _join_prompt_sections(*sections)
@@ -1014,7 +1011,7 @@ def _build_validator_hint_prompt(
     if workflow_context is not None:
         workflow_context_section = (
             "Workflow context used during validation:\n"
-            f"{_compact_json_for_prompt(workflow_context)}\n\n"
+            f"{_compact_json_for_prompt(workflow_context, limit=1200)}\n\n"
         )
     elif raw_context.strip():
         workflow_context_section = (

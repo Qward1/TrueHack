@@ -81,6 +81,7 @@ class TestRuntimeStateVerifierPrompt(unittest.TestCase):
         self.assertIn("expected result action", prompt)
         self.assertIn("allowed_workflow_paths", prompt)
         self.assertIn("available_code_variables", prompt)
+        self.assertIn("workflow_aliases", prompt)
         self.assertIn("runtime_result", prompt)
         self.assertIn("before_state value at wf.vars.cart_count", prompt)
         self.assertIn("after_state value at wf.vars.cart_count", prompt)
@@ -182,6 +183,90 @@ class TestRuntimeStateVerifierAgent(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertEqual(result["error_code"], "extra_unintended_state_change")
         self.assertEqual(result["field_path"], "wf.vars.debug")
+        self.assertEqual(llm.call_count, 0)
+
+    def test_return_only_in_place_source_mutation_is_reported_precisely(self) -> None:
+        llm = StubLLM(response={"passed": True, "summary": "Should not be used."})
+        agent = RuntimeStateVerifierAgent(llm)
+        result = asyncio.run(
+            agent.verify(
+                {
+                    "task": "Add PRIORITY_LABEL to each item and return the result.",
+                    "expected_result_action": "return",
+                    "source_field_path": "wf.vars.RESTbody.result",
+                    "before_state": {
+                        "wf": {
+                            "vars": {
+                                "RESTbody": {
+                                    "result": [
+                                        {"ORDER_ID": "A-100", "DAYS_LEFT": 2},
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                    "after_state": {
+                        "wf": {
+                            "vars": {
+                                "RESTbody": {
+                                    "result": [
+                                        {"ORDER_ID": "A-100", "DAYS_LEFT": 2, "PRIORITY_LABEL": "High"},
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                    "runtime_result": [{"ORDER_ID": "A-100", "DAYS_LEFT": 2, "PRIORITY_LABEL": "High"}],
+                    "code": "local result = wf.vars.RESTbody.result\nlocal item = result[1]\nitem.PRIORITY_LABEL = 'High'\nreturn result",
+                }
+            )
+        )
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["error_code"], "source_mutated_for_return_only_task")
+        self.assertEqual(result["field_path"], "wf.vars.RESTbody.result")
+        self.assertIn("fresh return value", result["fixer_brief"]["suggested_patch"])
+        self.assertEqual(llm.call_count, 0)
+
+    def test_artifact_like_after_state_does_not_create_blocking_failure(self) -> None:
+        llm = StubLLM(response={"passed": True, "summary": "Should not be used."})
+        agent = RuntimeStateVerifierAgent(llm)
+        result = asyncio.run(
+            agent.verify(
+                {
+                    "task": "Add PRIORITY_LABEL to each item and return the result.",
+                    "expected_result_action": "return",
+                    "source_field_path": "wf.vars.RESTbody.result",
+                    "before_state": {
+                        "wf": {
+                            "vars": {
+                                "RESTbody": {
+                                    "result": [
+                                        {"ORDER_ID": "A-100", "DAYS_LEFT": 2},
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                    "after_state": {
+                        "wf": {
+                            "vars": {
+                                "RESTbody": {
+                                    "result": {
+                                        "1": None,
+                                        "DAYS_LEFT": "sample",
+                                        "PRIORITY_LABEL": "sample",
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "runtime_result": [{"ORDER_ID": "A-100", "DAYS_LEFT": 2, "PRIORITY_LABEL": "High"}],
+                    "code": "local result = wf.vars.RESTbody.result\nlocal item = result[1]\nitem.PRIORITY_LABEL = 'High'\nreturn result",
+                }
+            )
+        )
+        self.assertTrue(result["passed"])
+        self.assertIn("structurally unreliable", result["summary"])
         self.assertEqual(llm.call_count, 0)
 
     def test_runtime_result_contradiction_skips_llm(self) -> None:
@@ -345,6 +430,7 @@ class TestStateBridgeAndNode(unittest.TestCase):
         self.assertIn("wf.vars.cart.items", payload["allowed_workflow_paths"])
         self.assertIn("wf.vars.cart_count", payload["allowed_workflow_paths"])
         self.assertIn("total", payload["available_code_variables"])
+        self.assertEqual(payload["workflow_aliases"], {})
         self.assertTrue(payload["available_runtime_evidence"]["after_state"])
 
     def test_build_input_uses_planner_expected_action_and_normalizes_rootless_after_state(self) -> None:

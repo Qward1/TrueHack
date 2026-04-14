@@ -19,48 +19,36 @@ logger = structlog.get_logger(__name__)
 
 _AGENT_NAME = "UniversalVerificationFixer"
 _SYSTEM_PROMPT = """You are UniversalVerificationFixer.
-You fix Lua workflow code after verification.
-Do not solve the whole task from scratch unless patch_scope says rewrite.
-Use verifier_result as the main source of truth.
-Your job:
-- understand the exact reported problem
-- keep working parts unchanged
-- apply the smallest valid patch when possible
-- obey must_change, must_preserve, forbidden_fixes
-Use only the data explicitly provided in the input.
-Do not invent workflow paths, variables, fields, helpers, runtime evidence, or state changes.
-You may use only names from allowed_workflow_paths, available_code_variables, verifier_result, current_lua_code, or focused evidence sections.
-Patch only the reported problem.
-Do not introduce new helper functions, workflow paths, or variables unless they already exist in the current code or are explicitly required by verifier_result.
-Do not ignore the verifier diagnosis.
-Do not return the same code unless no valid patch is possible.
+Patch Lua workflow code after verification.
+Use verifier_result as the source of truth.
+Patch only the reported problem and keep unrelated code unchanged.
+Never invent workflow paths, variables, helpers, runtime evidence, or state changes.
+Use only names from allowed_workflow_paths, available_code_variables, workflow_aliases, verifier_result, current_lua_code, and focused evidence.
+If the issue is unintended state mutation in a return-only task, stop mutating workflow-path aliases in place and build a fresh return value.
+If evidence is weak or contradictory, return changed=false.
 Return JSON only.
 
-Output schema:
-{
-  "fixed": true,
-  "changed": true,
-  "applied_error_family": "string",
-  "applied_error_code": "string",
-  "applied_strategy": "string",
-  "preserved_constraints": [],
-  "remaining_risks": [],
-  "fixed_lua_body": "plain lua code string without lua{ }lua wrapper"
-}
+Output keys:
+fixed, changed, applied_error_family, applied_error_code, applied_strategy,
+preserved_constraints, remaining_risks, fixed_lua_body.
 
 Rules:
-- fixed_lua_body must be a JSON string with Lua code only, without markdown fences and without lua{ }lua
-- if verifier_result.passed=true, keep code unchanged
-- if verifier_result.passed=false, patch exactly that reported error
-- preserve the stated working parts
-- never use forbidden_fixes
-- if no semantic change was possible, return changed=false"""
+- fixed_lua_body is plain Lua body text only
+- no markdown fences
+- no lua{ }lua inside JSON
+- use literal JSON values, not schema placeholder text"""
 
 _VALID_PATCH_SCOPES = {"none", "local", "function_level", "multi_block", "rewrite"}
 _ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200d\ufeff]")
 _FENCED_RE = re.compile(r"^```(?:[A-Za-z0-9_-]+)?\s*([\s\S]*?)```$", re.IGNORECASE)
 _LOWCODE_WRAPPER_RE = re.compile(r"^lua\{\s*([\s\S]*?)\s*\}lua$", re.IGNORECASE)
 _WORKFLOW_PATH_RE = re.compile(r"wf\.(?:vars|initVariables)(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
+_DIRECT_WORKFLOW_ALIAS_RE = re.compile(
+    r"(?im)^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(wf\.(?:vars|initVariables)(?:\.[A-Za-z_][A-Za-z0-9_]*)+)"
+)
+_INDEXED_ALIAS_RE = re.compile(
+    r"(?im)^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*[^]]+\s*\]"
+)
 
 
 class FixerBrief(TypedDict):
@@ -98,6 +86,7 @@ class UniversalVerificationFixerInput(TypedDict, total=False):
     previous_fix_attempts: list[object]
     allowed_workflow_paths: list[str]
     available_code_variables: list[str]
+    workflow_aliases: dict[str, str]
     available_runtime_evidence: dict[str, bool]
 
 
@@ -208,11 +197,14 @@ def _clamp_confidence(value: object) -> float:
     return confidence
 
 
-def _compact_json(value: object) -> str:
+def _compact_json(value: object, *, limit: int = 700) -> str:
     try:
-        return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+        rendered = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
     except TypeError:
-        return json.dumps(str(value), ensure_ascii=False)
+        rendered = json.dumps(str(value), ensure_ascii=False)
+    if len(rendered) <= limit:
+        return rendered
+    return rendered[: limit - 3].rstrip() + "..."
 
 
 def _extract_workflow_paths(text: str) -> list[str]:
@@ -257,6 +249,22 @@ def _extract_code_variables(code: str) -> list[str]:
     return _unique_strings(found)
 
 
+def _extract_workflow_aliases(code: str) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for match in _DIRECT_WORKFLOW_ALIAS_RE.finditer(code or ""):
+        alias = str(match.group(1) or "").strip()
+        workflow_path = str(match.group(2) or "").strip()
+        if alias and workflow_path:
+            aliases[alias] = workflow_path
+    for match in _INDEXED_ALIAS_RE.finditer(code or ""):
+        alias = str(match.group(1) or "").strip()
+        base_alias = str(match.group(2) or "").strip()
+        base_path = aliases.get(base_alias)
+        if alias and base_path:
+            aliases[alias] = base_path + "[*]"
+    return aliases
+
+
 def _split_workflow_path(path: str) -> list[str]:
     normalized = str(path or "").strip()
     if not normalized.startswith("wf."):
@@ -292,6 +300,20 @@ def _format_named_list(title: str, items: list[str]) -> str:
     if not normalized:
         return f"{title}:\n[]"
     return title + ":\n" + "\n".join(f"- {item}" for item in normalized)
+
+
+def _format_alias_map(title: str, aliases: dict[str, str]) -> str:
+    if not isinstance(aliases, dict) or not aliases:
+        return f"{title}:\n[]"
+    lines = [f"{title}:"]
+    for name in sorted(aliases.keys()):
+        alias_name = str(name).strip()
+        alias_path = str(aliases.get(name, "") or "").strip()
+        if alias_name and alias_path:
+            lines.append(f"- {alias_name} -> {alias_path}")
+    if len(lines) == 1:
+        return f"{title}:\n[]"
+    return "\n".join(lines)
 
 
 def _render_presence_map(title: str, value: object) -> str:
@@ -405,9 +427,9 @@ def _build_verifier_diagnosis_section(verifier_result: NormalizedVerifierResult)
     ]
     sections = [
         "Verifier diagnosis:\n" + "\n".join(lines),
-        "Verifier evidence:\n" + _compact_json(verifier_result["evidence"][:5]),
-        "Verifier expected:\n" + _compact_json(verifier_result["expected"]),
-        "Verifier actual:\n" + _compact_json(verifier_result["actual"]),
+        "Verifier evidence:\n" + _compact_json(verifier_result["evidence"][:3], limit=500),
+        "Verifier expected:\n" + _compact_json(verifier_result["expected"], limit=500),
+        "Verifier actual:\n" + _compact_json(verifier_result["actual"], limit=650),
     ]
     return "\n\n".join(section for section in sections if section.strip())
 
@@ -546,7 +568,18 @@ def _normalize_universal_verification_fixer_result(
 def _render_attempts(attempts: list[dict[str, Any]]) -> str:
     if not attempts:
         return "[]"
-    return _compact_json(attempts[:5])
+    compact_attempts: list[dict[str, Any]] = []
+    for item in attempts[:4]:
+        compact_attempts.append(
+            {
+                "verifier_name": _normalize_string(item.get("verifier_name")),
+                "error_code": _normalize_string(item.get("error_code")),
+                "strategy": _normalize_string(item.get("strategy") or item.get("applied_strategy")),
+                "changed": bool(item.get("changed", False)),
+                "note": _normalize_string(item.get("note")),
+            }
+        )
+    return _compact_json(compact_attempts, limit=500)
 
 
 def _build_universal_verification_fixer_prompt(payload: UniversalVerificationFixerInput) -> str:
@@ -565,6 +598,9 @@ def _build_universal_verification_fixer_prompt(payload: UniversalVerificationFix
     available_code_variables = _unique_strings(
         _ensure_string_list(payload.get("available_code_variables")) or _extract_code_variables(code)
     )
+    workflow_aliases = payload.get("workflow_aliases")
+    if not isinstance(workflow_aliases, dict):
+        workflow_aliases = _extract_workflow_aliases(code)
     available_runtime_evidence = payload.get("available_runtime_evidence")
     if not isinstance(available_runtime_evidence, dict):
         available_runtime_evidence = {
@@ -578,45 +614,49 @@ def _build_universal_verification_fixer_prompt(payload: UniversalVerificationFix
     focused_path = verifier_result["field_path"]
     if focused_path:
         for label, root in (
-            ("workflow_context", workflow_context),
             ("before_state", before_state),
             ("after_state", after_state),
+            ("workflow_context", workflow_context),
         ):
             if root is None:
                 continue
             found, value = _resolve_workflow_path_value(root, focused_path)
             if found:
-                focused_sections.append(f"{label} value at {focused_path}:\n{_compact_json(value)}")
+                focused_sections.append(f"{label} value at {focused_path}:\n{_compact_json(value, limit=450)}")
+                if label != "workflow_context":
+                    continue
+
+    runtime_result_section = ""
+    if payload.get("runtime_result") is not None:
+        runtime_result_section = "runtime_result:\n" + _compact_json(payload.get("runtime_result"), limit=450)
+
+    strategy_sections = [
+        f"goal: {verifier_result['fixer_brief']['goal'] or verifier_result['summary']}",
+        f"patch_scope: {verifier_result['fixer_brief']['patch_scope']}",
+        _format_named_list("must_change", verifier_result["fixer_brief"]["must_change"]),
+        _format_named_list("must_preserve", verifier_result["fixer_brief"]["must_preserve"]),
+        _format_named_list("forbidden_fixes", verifier_result["fixer_brief"]["forbidden_fixes"]),
+    ]
+    suggested_patch = verifier_result["fixer_brief"]["suggested_patch"]
+    if suggested_patch:
+        strategy_sections.append("suggested_patch:\n" + suggested_patch)
 
     sections = [
         f"Task:\n{task}" if task else "",
-        "Current broken Lua code:\n" + _wrap_lua_code(code),
+        "Current broken Lua code body:\n" + code,
         "Strict rules:\n"
         "- Use only explicit input data.\n"
         "- Never invent workflow paths, variables, fields, helpers, or runtime evidence.\n"
-        "- You may reference only names from allowed_workflow_paths, available_code_variables, verifier_result, the current Lua code, or focused evidence sections.\n"
+        "- You may reference only names from allowed_workflow_paths, available_code_variables, workflow_aliases, verifier_result, the current Lua code, or focused evidence sections.\n"
         "- Patch only the reported problem and keep unrelated code unchanged.\n"
         "- If no real patch is possible, keep the code unchanged and return changed=false.",
         _build_verifier_diagnosis_section(verifier_result),
-        "Fix strategy:\n"
-        + "\n".join(
-            [
-                f"- goal: {verifier_result['fixer_brief']['goal'] or verifier_result['summary']}",
-                f"- patch_scope: {verifier_result['fixer_brief']['patch_scope']}",
-                f"- must_change: {verifier_result['fixer_brief']['must_change']}",
-                f"- must_preserve: {verifier_result['fixer_brief']['must_preserve']}",
-                f"- forbidden_fixes: {verifier_result['fixer_brief']['forbidden_fixes']}",
-                f"- suggested_patch: {verifier_result['fixer_brief']['suggested_patch']}",
-            ]
-        ),
+        "Fix strategy:\n" + "\n\n".join(section for section in strategy_sections if section.strip()),
         _format_named_list("allowed_workflow_paths", allowed_workflow_paths),
         _format_named_list("available_code_variables", available_code_variables),
+        _format_alias_map("workflow_aliases", workflow_aliases),
         _render_presence_map("available_runtime_evidence", available_runtime_evidence),
-        (
-            "runtime_result:\n" + _compact_json(payload.get("runtime_result"))
-            if payload.get("runtime_result") is not None
-            else ""
-        ),
+        runtime_result_section,
         *focused_sections,
         "previous_fix_attempts:\n" + _render_attempts(previous_attempts),
         "Output rules:\n"
@@ -705,6 +745,7 @@ def build_universal_verification_fixer_input_from_state(state: dict[str, Any]) -
         "previous_fix_attempts": previous_fix_attempts,
         "allowed_workflow_paths": allowed_workflow_paths,
         "available_code_variables": _extract_code_variables(code),
+        "workflow_aliases": _extract_workflow_aliases(code),
         "available_runtime_evidence": {
             "workflow_context": parsed_context is not None,
             "before_state": before_state is not None,

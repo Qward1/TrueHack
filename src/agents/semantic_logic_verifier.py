@@ -16,23 +16,17 @@ logger = structlog.get_logger(__name__)
 _AGENT_NAME = "SemanticLogicVerifier"
 
 _SYSTEM_PROMPT = """You are SemanticLogicVerifier.
-Check only semantic logic errors in a Lua workflow solution.
-Do not judge contract errors.
-Check:
-- wrong filtering condition
-- wrong and/or/not logic
-- missing required items
-- extra items included
+Check only semantic logic:
+- wrong filter logic
+- wrong boolean logic
+- missing or extra items
 - wrong aggregation
 - wrong computed values
-Use runtime_result and state differences as primary evidence when present.
-Use only the data explicitly provided in the input.
-Do not invent workflow paths, variables, fields, results, runtime evidence, state changes, or counterexamples.
-Any path or variable not listed in allowed_workflow_paths, available_code_variables, or the focused evidence sections must be treated as unavailable.
-Fail only when you can point to exact evidence from the input.
-If exact evidence is missing, do not guess and do not fabricate a mismatch.
-Return JSON only.
-If passed=false, give one concrete counterexample, expected behavior, actual behavior, and a minimal patch."""
+Use only explicit input evidence.
+Never invent paths, variables, fields, runtime evidence, or counterexamples.
+If evidence is weak, stay conservative.
+Use literal JSON values, not schema placeholder text.
+Return JSON only."""
 
 _WORKFLOW_PATH_RE = re.compile(r"wf\.(?:vars|initVariables)(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
 _RETURN_SOURCE_RE = re.compile(r"return\s+(wf\.(?:vars|initVariables)(?:\.[A-Za-z_][A-Za-z0-9_]*)+)")
@@ -73,6 +67,7 @@ class SemanticLogicVerifierInput(TypedDict, total=False):
     output_field_path: str | None
     expected_workflow_paths: list[str]
     selected_operation: str | None
+    planner_target_operation: str | None
     operation_argument: object
     semantic_expectations: list[str]
     requested_item_keys: list[str]
@@ -133,33 +128,18 @@ class _FilterSpec(TypedDict, total=False):
     clauses: list[_FilterClause]
 
 
-_OUTPUT_SCHEMA_TEXT = """Return JSON only with these keys:
-{
-  "verifier_name": "SemanticLogicVerifier",
-  "passed": true,
-  "error_family": null,
-  "error_code": null,
-  "severity": "low|medium|high|critical",
-  "summary": "string",
-  "field_path": null,
-  "evidence": [],
-  "expected": {},
-  "actual": {},
-  "fixer_brief": {
-    "goal": "string",
-    "must_change": [],
-    "must_preserve": [],
-    "forbidden_fixes": [],
-    "suggested_patch": "string",
-    "patch_scope": "none|local|function_level|multi_block|rewrite"
-  },
-  "confidence": 0.0
-}
+_OUTPUT_SCHEMA_TEXT = """Return JSON only with keys:
+verifier_name, passed, error_family, error_code, severity, summary,
+field_path, evidence, expected, actual, fixer_brief, confidence.
 
-Output rules:
+fixer_brief keys:
+goal, must_change, must_preserve, forbidden_fixes, suggested_patch, patch_scope.
+
+Rules:
 - Keep expected, actual, evidence, and fixer_brief minimal.
 - field_path must be null or an exact path proven by the input.
 - expected_behavior and actual_behavior must stay short and concrete.
+- Use a literal severity such as "low" or "high".
 - Do not add any path, variable, item, or counterexample that is not explicitly available."""
 
 
@@ -198,7 +178,7 @@ def _clamp_confidence(value: object) -> float:
     return max(0.0, min(1.0, numeric))
 
 
-def _compact_json(value: object, limit: int = 2500) -> str:
+def _compact_json(value: object, limit: int = 900) -> str:
     try:
         rendered = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
     except Exception:
@@ -206,6 +186,23 @@ def _compact_json(value: object, limit: int = 2500) -> str:
     if len(rendered) <= limit:
         return rendered
     return rendered[: limit - 3].rstrip() + "..."
+
+
+def _summarize_for_prompt(value: object, *, max_items: int = 2, max_keys: int = 6) -> object:
+    if isinstance(value, list):
+        summary = [_summarize_for_prompt(item, max_items=max_items, max_keys=max_keys) for item in value[:max_items]]
+        if len(value) > max_items:
+            summary.append(f"... {len(value) - max_items} more items")
+        return summary
+    if isinstance(value, dict):
+        keys = list(value.keys())
+        summary: dict[str, Any] = {}
+        for key in keys[:max_keys]:
+            summary[str(key)] = _summarize_for_prompt(value[key], max_items=max_items, max_keys=max_keys)
+        if len(keys) > max_keys:
+            summary["..."] = f"{len(keys) - max_keys} more keys"
+        return summary
+    return value
 
 
 def _build_prompt_sections(*sections: str) -> str:
@@ -469,8 +466,11 @@ def _derive_output_field_path(payload: SemanticLogicVerifierInput) -> str | None
 
 def _derive_selected_operation(payload: SemanticLogicVerifierInput) -> str:
     selected = str(payload.get("selected_operation", "") or "").strip().lower()
-    if selected and selected != "llm":
+    planner_operation = str(payload.get("planner_target_operation", "") or "").strip().lower()
+    if selected and selected not in {"llm", "return"}:
         return selected
+    if planner_operation and planner_operation not in {"none", "return"}:
+        return planner_operation
     task = str(payload.get("task", "") or "").lower()
     if any(marker in task for marker in ("sum", "total", "сумм", "итог")):
         return "sum"
@@ -1323,11 +1323,11 @@ def _build_semantic_logic_verifier_prompt(payload: SemanticLogicVerifierInput) -
     observed_value_section = ""
     resolved_source_path, resolved_source_value = _resolve_source_value(payload)
     if resolved_source_path and resolved_source_value is not None:
-        source_value_section = f"Original source value at {resolved_source_path}:\n{_compact_json(resolved_source_value)}"
+        source_value_section = f"Original source value at {resolved_source_path}:\n{_compact_json(_summarize_for_prompt(resolved_source_value), limit=320)}"
     observed = _resolve_observed_value(payload)
     if observed is not None:
         observed_label = observed.get("field_path") or "return value"
-        observed_value_section = f"Observed value from {observed['source']} at {observed_label}:\n{_compact_json(observed.get('value'))}"
+        observed_value_section = f"Observed value from {observed['source']} at {observed_label}:\n{_compact_json(_summarize_for_prompt(observed.get('value')), limit=320)}"
 
     expectation_lines: list[str] = []
     if operation:
@@ -1343,9 +1343,13 @@ def _build_semantic_logic_verifier_prompt(payload: SemanticLogicVerifierInput) -
     if requested_item_keys:
         expectation_lines.append("- requested item keys: " + ", ".join(requested_item_keys))
 
+    runtime_result_section = ""
+    if payload.get("runtime_result") is not None and not observed_value_section:
+        runtime_result_section = "runtime_result:\n" + _compact_json(_summarize_for_prompt(payload.get("runtime_result")), limit=320)
+
     sections = [
         f"Task:\n{task}" if task else "",
-        "Scope:\nCheck only semantic logic mismatches. Ignore workflow contract issues and shape-only issues.",
+        "Scope:\nCheck semantic logic only. Ignore contract and shape-only issues.",
         "Strict rules:\n"
         "- Use only explicit input data.\n"
         "- Never invent workflow paths, variables, missing fields, or counterexamples.\n"
@@ -1355,14 +1359,10 @@ def _build_semantic_logic_verifier_prompt(payload: SemanticLogicVerifierInput) -
         _format_named_list("allowed_workflow_paths", allowed_workflow_paths),
         _format_named_list("available_code_variables", available_code_variables),
         _render_presence_map("available_runtime_evidence", available_runtime_evidence),
-        (
-            "runtime_result:\n" + _compact_json(payload.get("runtime_result"))
-            if payload.get("runtime_result") is not None
-            else ""
-        ),
+        runtime_result_section,
         source_value_section,
         observed_value_section,
-        f"Lua solution under review:\n```lua\n{code}\n```",
+        "Lua solution under review:\n" + code,
         _OUTPUT_SCHEMA_TEXT,
     ]
     return _build_prompt_sections(*sections)
@@ -1376,6 +1376,9 @@ def build_semantic_logic_verifier_input_from_state(state: dict[str, Any]) -> Sem
     diagnostics = state.get("diagnostics")
     if not isinstance(diagnostics, dict):
         diagnostics = {}
+    planner_result = compiled_request.get("planner_result")
+    if not isinstance(planner_result, dict):
+        planner_result = {}
 
     task = (
         str(compiled_request.get("verification_prompt", "") or "").strip()
@@ -1428,6 +1431,7 @@ def build_semantic_logic_verifier_input_from_state(state: dict[str, Any]) -> Sem
         "output_field_path": output_field_path or None,
         "expected_workflow_paths": expected_workflow_paths,
         "selected_operation": _normalize_nullable_string(compiled_request.get("selected_operation")),
+        "planner_target_operation": _normalize_nullable_string(planner_result.get("target_operation")),
         "operation_argument": compiled_request.get("operation_argument"),
         "semantic_expectations": _ensure_string_list(compiled_request.get("semantic_expectations")),
         "requested_item_keys": _ensure_string_list(compiled_request.get("requested_item_keys")),

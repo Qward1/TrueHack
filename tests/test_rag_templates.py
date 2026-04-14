@@ -6,7 +6,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from src.graph.nodes import create_nodes
-from src.tools.rag_templates import TemplateMatch, render_template_prompt_block, retrieve_template_matches
+from src.tools.rag_templates import (
+    TemplateMatch,
+    render_template_prompt_block,
+    render_template_selection_prompt,
+    retrieve_template_matches,
+)
 
 
 ROUTE_SYSTEM_PREFIX = "You are an intent classifier"
@@ -121,6 +126,47 @@ class RagPromptStubLLM:
 
 
 class RagTemplateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_selection_prompt_prefers_planner_operation_and_stays_compact(self) -> None:
+        prompt = render_template_selection_prompt(
+            {
+                "task_text": "Для каждого объекта в массиве добавь PRIORITY_LABEL.",
+                "selected_operation": "return",
+                "selected_primary_type": "array_object",
+                "requested_item_keys": ["PRIORITY_LABEL"],
+                "planner_result": {
+                    "reformulated_task": "Для каждого объекта в массиве добавь PRIORITY_LABEL.",
+                    "target_operation": "transform",
+                    "expected_result_action": "return",
+                },
+            },
+            [
+                TemplateMatch(
+                    id="array_objects_to_object_by_key",
+                    title="array to object",
+                    task_type="array_to_object_by_key",
+                    input_shape="array_object",
+                    output_shape="object",
+                    retrieval_text="Convert array to object by key",
+                    llm_context="lua{\nreturn {}\n}lua",
+                    score=0.9,
+                ),
+                TemplateMatch(
+                    id="map_array_objects_pick_and_rename",
+                    title="map array objects",
+                    task_type="map_pick_rename",
+                    input_shape="array_object",
+                    output_shape="array_object",
+                    retrieval_text="Map each object and keep array shape",
+                    llm_context="lua{\nreturn _utils.array.new()\n}lua",
+                    score=0.8,
+                ),
+            ],
+        )
+        self.assertIn("Effective operation: transform", prompt)
+        self.assertIn("Planner target_operation: transform", prompt)
+        self.assertIn("Expected result action: return", prompt)
+        self.assertNotIn("llm_context:", prompt)
+
     async def test_retrieve_template_matches_by_description_but_render_only_code(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             kb_path = Path(tmp_dir) / "kb.jsonl"

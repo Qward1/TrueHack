@@ -123,7 +123,7 @@ class TestUniversalVerificationFixerPrompt(unittest.TestCase):
         prompt = _build_universal_verification_fixer_prompt(
             {
                 "task": "Convert recall time.",
-                "code": "return wf.vars.time",
+                "code": "local value = wf.vars.time\nreturn value",
                 "workflow_context": {"wf": {"initVariables": {"recallTime": "2026-04-13T10:20:30"}}},
                 "before_state": {"wf": {"initVariables": {"recallTime": "2026-04-13T10:20:30"}}},
                 "after_state": {"wf": {"vars": {"time": "1681374030"}}},
@@ -154,9 +154,12 @@ class TestUniversalVerificationFixerPrompt(unittest.TestCase):
         self.assertIn("forbidden_fixes", prompt)
         self.assertIn("allowed_workflow_paths", prompt)
         self.assertIn("available_code_variables", prompt)
+        self.assertIn("workflow_aliases", prompt)
+        self.assertIn("value -> wf.vars.time", prompt)
         self.assertIn("after_state value at wf.vars.time", prompt)
         self.assertIn("previous_fix_attempts", prompt)
         self.assertIn("fixed_lua_body", prompt)
+        self.assertIn("Current broken Lua code body:", prompt)
         self.assertNotIn("Workflow context:\n", prompt)
 
 
@@ -319,7 +322,7 @@ class TestStateBridgeAndNode(unittest.TestCase):
     def test_build_input_from_state_uses_current_pipeline_fields(self) -> None:
         payload = build_universal_verification_fixer_input_from_state(
             {
-                "generated_code": "return wf.vars.time",
+                "generated_code": "local value = wf.vars.time\nreturn value",
                 "compiled_request": {
                     "verification_prompt": "Convert recall time.",
                     "workflow_path_inventory": [{"path": "wf.initVariables.recallTime"}],
@@ -346,7 +349,8 @@ class TestStateBridgeAndNode(unittest.TestCase):
         self.assertEqual(payload["previous_fix_attempts"], [{"strategy": "unchanged", "changed": False}])
         self.assertIn("wf.initVariables.recallTime", payload["allowed_workflow_paths"])
         self.assertIn("wf.vars.time", payload["allowed_workflow_paths"])
-        self.assertEqual(payload["available_code_variables"], [])
+        self.assertEqual(payload["available_code_variables"], ["value"])
+        self.assertEqual(payload["workflow_aliases"], {"value": "wf.vars.time"})
         self.assertIn("wf", payload["after_state"])
         self.assertTrue(payload["available_runtime_evidence"]["workflow_context"])
 

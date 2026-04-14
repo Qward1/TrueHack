@@ -168,6 +168,16 @@ def build_template_query(compiled_request: dict[str, Any]) -> str:
     return "\n".join(part for part in query_parts if part)
 
 
+def _effective_template_operation(compiled_request: dict[str, Any]) -> str:
+    selected_operation = str(compiled_request.get("selected_operation", "") or "").strip().lower()
+    planner = compiled_request.get("planner_result") or {}
+    planner = planner if isinstance(planner, dict) else {}
+    planner_operation = str(planner.get("target_operation", "") or "").strip().lower()
+    if selected_operation in {"", "llm", "return"} and planner_operation and planner_operation != "none":
+        return planner_operation
+    return selected_operation or planner_operation
+
+
 def _lexical_rank(
     compiled_request: dict[str, Any],
     entries: list[dict[str, Any]],
@@ -184,6 +194,7 @@ def _lexical_rank(
     planner = compiled_request.get("planner_result") or {}
     planner = planner if isinstance(planner, dict) else {}
     planner_operation = str(planner.get("target_operation", "") or "").strip().lower()
+    effective_operation = _effective_template_operation(compiled_request)
     requested_item_keys = {
         item.lower()
         for item in compiled_request.get("requested_item_keys", []) or []
@@ -202,11 +213,15 @@ def _lexical_rank(
 
         score = overlap / math.sqrt(len(query_tokens) * len(entry_tokens))
         task_type = str(entry.get("task_type", "") or "").strip().lower()
-        if task_type and task_type in {selected_operation, planner_operation}:
+        if task_type and task_type in {selected_operation, planner_operation, effective_operation}:
             score += 0.35
         input_shape = str(entry.get("input_shape", "") or "").strip().lower()
         if input_shape and input_shape == selected_type:
             score += 0.2
+        output_shape = str(entry.get("output_shape", "") or "").strip().lower()
+        if effective_operation in {"transform", "remove_keys", "filter_keys"}:
+            if selected_type == "array_object" and input_shape == "array_object" and output_shape == "array_object":
+                score += 0.18
 
         tags = {tag.lower() for tag in _coerce_str_list(entry.get("tags"))}
         score += 0.05 * len(requested_item_keys & tags)
@@ -371,16 +386,22 @@ def render_template_selection_prompt(
 
     planner = compiled_request.get("planner_result") or {}
     planner = planner if isinstance(planner, dict) else {}
+    effective_operation = _effective_template_operation(compiled_request)
     requested_item_keys = [
         str(item or "").strip()
         for item in compiled_request.get("requested_item_keys", []) or []
         if str(item or "").strip()
     ]
+    task_text = str(compiled_request.get("task_text", "") or "").strip()
+    reformulated_task = str(planner.get("reformulated_task", "") or "").strip()
 
     task_parts = [
-        str(compiled_request.get("task_text", "") or "").strip(),
-        str(planner.get("reformulated_task", "") or "").strip(),
-        f"Operation: {str(compiled_request.get('selected_operation', '') or '').strip()}",
+        task_text,
+        reformulated_task if reformulated_task and reformulated_task != task_text else "",
+        f"Effective operation: {effective_operation}",
+        f"Compiler operation: {str(compiled_request.get('selected_operation', '') or '').strip()}",
+        f"Planner target_operation: {str(planner.get('target_operation', '') or '').strip()}",
+        f"Expected result action: {str(planner.get('expected_result_action', '') or '').strip()}",
         f"Primary type: {str(compiled_request.get('selected_primary_type', '') or '').strip()}",
         (
             "Requested item keys: " + ", ".join(requested_item_keys)
@@ -402,7 +423,6 @@ def render_template_selection_prompt(
             f"input_shape: {match.input_shape}",
             f"output_shape: {match.output_shape}",
             f"retrieval_text: {match.retrieval_text}" if match.retrieval_text else "",
-            f"llm_context:\n{match.llm_context}",
         ]
         parts.append("\n".join(part for part in candidate_parts if part))
     return "\n\n".join(part for part in parts if part.strip())

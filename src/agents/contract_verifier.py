@@ -28,21 +28,16 @@ logger = structlog.get_logger(__name__)
 _AGENT_NAME = "ContractVerifier"
 
 _SYSTEM_PROMPT = """You are ContractVerifier.
-Check only contract errors in a Lua workflow solution.
-Do not judge business logic.
-Check:
+Check only workflow contract:
 - correct wf.vars / wf.initVariables paths
-- correct return target or update target
+- correct return or update target
 - correct top-level result shape
-- forbidden patterns: print, io.write, io.read, invented demo tables
-Use runtime_result and after_state as primary evidence when present.
-Use only the data explicitly provided in the input.
-Do not invent workflow paths, variables, fields, results, runtime evidence, or state changes.
-Any path or variable not listed in allowed_workflow_paths, available_code_variables, or the focused evidence sections must be treated as unavailable.
-Fail only when you can point to exact evidence from the input.
-If exact evidence is missing, do not guess and do not fabricate a mismatch.
-Return JSON only.
-If passed=false, describe the exact contract mismatch and a minimal patch."""
+- forbid print, io.write, io.read, and invented demo tables
+Use only explicit input evidence.
+Never invent paths, variables, fields, runtime evidence, or state changes.
+If evidence is weak, stay conservative.
+Use literal JSON values, not schema placeholder text.
+Return JSON only."""
 
 _WORKFLOW_PATH_RE = re.compile(r"wf\.(?:vars|initVariables)(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
 _WORKFLOW_ROOT_RE = re.compile(r"\bwf\.(?:vars|initVariables)\b")
@@ -152,32 +147,17 @@ _OUTPUT_SHAPE_EXAMPLE: dict[str, Any] = {
     "confidence": 0.0,
 }
 
-_OUTPUT_SCHEMA_TEXT = """Return JSON only with these keys:
-{
-  "verifier_name": "ContractVerifier",
-  "passed": true,
-  "error_family": null,
-  "error_code": null,
-  "severity": "low|medium|high|critical",
-  "summary": "string",
-  "field_path": null,
-  "evidence": [],
-  "expected": {},
-  "actual": {},
-  "fixer_brief": {
-    "goal": "string",
-    "must_change": [],
-    "must_preserve": [],
-    "forbidden_fixes": [],
-    "suggested_patch": "string",
-    "patch_scope": "none|local|function_level|multi_block|rewrite"
-  },
-  "confidence": 0.0
-}
+_OUTPUT_SCHEMA_TEXT = """Return JSON only with keys:
+verifier_name, passed, error_family, error_code, severity, summary,
+field_path, evidence, expected, actual, fixer_brief, confidence.
 
-Output rules:
-- Keep expected, actual, evidence, and fixer_brief minimal.
+fixer_brief keys:
+goal, must_change, must_preserve, forbidden_fixes, suggested_patch, patch_scope.
+
+Rules:
+- Keep evidence, expected, actual, and fixer_brief minimal.
 - field_path must be null or an exact path proven by the input.
+- Use a literal severity such as "low" or "high".
 - Do not add any path or variable that is not explicitly available."""
 
 
@@ -258,7 +238,7 @@ def _clamp_confidence(value: object) -> float:
     return max(0.0, min(1.0, numeric))
 
 
-def _compact_json(value: object, limit: int = 2500) -> str:
+def _compact_json(value: object, limit: int = 1000) -> str:
     try:
         rendered = json.dumps(value, ensure_ascii=False, indent=2)
     except Exception:
@@ -266,6 +246,23 @@ def _compact_json(value: object, limit: int = 2500) -> str:
     if len(rendered) <= limit:
         return rendered
     return rendered[: limit - 3].rstrip() + "..."
+
+
+def _summarize_for_prompt(value: object, *, max_items: int = 2, max_keys: int = 6) -> object:
+    if isinstance(value, list):
+        summary = [_summarize_for_prompt(item, max_items=max_items, max_keys=max_keys) for item in value[:max_items]]
+        if len(value) > max_items:
+            summary.append(f"... {len(value) - max_items} more items")
+        return summary
+    if isinstance(value, dict):
+        keys = list(value.keys())
+        summary: dict[str, Any] = {}
+        for key in keys[:max_keys]:
+            summary[str(key)] = _summarize_for_prompt(value[key], max_items=max_items, max_keys=max_keys)
+        if len(keys) > max_keys:
+            summary["..."] = f"{len(keys) - max_keys} more keys"
+        return summary
+    return value
 
 
 def _format_named_list(title: str, items: list[str]) -> str:
@@ -875,24 +872,24 @@ def _build_contract_verifier_prompt(payload: ContractVerifierInput) -> str:
         found, value = _resolve_workflow_path_value(payload.get("before_state"), expected_return_path)
         if found:
             focused_sections.append(
-                f"before_state value at {expected_return_path}:\n{_compact_json(value, limit=800)}"
+                f"before_state value at {expected_return_path}:\n{_compact_json(_summarize_for_prompt(value), limit=350)}"
             )
     if expected_update_path and payload.get("before_state") is not None:
         found, value = _resolve_workflow_path_value(payload.get("before_state"), expected_update_path)
         if found:
             focused_sections.append(
-                f"before_state value at {expected_update_path}:\n{_compact_json(value, limit=800)}"
+                f"before_state value at {expected_update_path}:\n{_compact_json(_summarize_for_prompt(value), limit=350)}"
             )
     if expected_update_path and payload.get("after_state") is not None:
         found, value = _resolve_workflow_path_value(payload.get("after_state"), expected_update_path)
         if found:
             focused_sections.append(
-                f"after_state value at {expected_update_path}:\n{_compact_json(value, limit=800)}"
+                f"after_state value at {expected_update_path}:\n{_compact_json(_summarize_for_prompt(value), limit=350)}"
             )
 
     sections = [
         f"Task:\n{task}" if task else "",
-        "Scope:\nCheck contract mismatches only. Ignore business-logic quality and deep semantic correctness.",
+        "Scope:\nCheck contract only. Ignore business logic.",
         "Strict rules:\n"
         "- Use only explicit input data.\n"
         "- Never invent workflow paths, variables, fields, or runtime evidence.\n"
@@ -903,12 +900,12 @@ def _build_contract_verifier_prompt(payload: ContractVerifierInput) -> str:
         _format_named_list("available_code_variables", available_code_variables),
         _render_presence_map("available_runtime_evidence", available_runtime_evidence),
         (
-            "runtime_result:\n" + _compact_json(payload.get("runtime_result"))
+            "runtime_result:\n" + _compact_json(_summarize_for_prompt(payload.get("runtime_result")), limit=350)
             if payload.get("runtime_result") is not None
             else ""
         ),
         *focused_sections,
-        f"Lua solution under review:\n```lua\n{code}\n```",
+        "Lua solution under review:\n" + code,
         _OUTPUT_SCHEMA_TEXT,
     ]
     return _build_prompt_sections(*sections)
