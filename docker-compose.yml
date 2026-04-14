@@ -1,0 +1,42 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: truehack-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    gpus: all
+
+  app:
+    build:
+      context: .
+    container_name: truehack-app
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434/v1
+      LUA_BIN: lua55
+      OLLAMA_MAX_CONCURRENT_REQUESTS: "1"
+      APP_DOCKER_BOOTSTRAP_OLLAMA: "1"
+      APP_WORKSPACE: /workspace
+    ports:
+      - "8765:8765"
+    volumes:
+      - .:/app
+      - ./workspace:/workspace
+    command: ["sh", "/app/docker/app-entrypoint.sh"]
+
+volumes:
+  ollama_data:
+

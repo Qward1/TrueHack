@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+if [ "${APP_DOCKER_BOOTSTRAP_OLLAMA:-1}" = "1" ]; then
+  python /app/scripts/bootstrap_ollama.py
+fi
+
+exec python /app/app.py --host 0.0.0.0 --port 8765 --workspace "${APP_WORKSPACE:-/workspace}"
+

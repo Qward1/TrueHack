@@ -2179,53 +2179,6 @@ async def async_verify_requirements(
         agent_name="RequirementsVerifier",
     )
     normalized = _normalize_verification_result(_extract_json_block(raw))
-    has_concrete_runtime_evidence = any(
-        marker in extra_context_text
-        for marker in (
-            "Original workflow state before execution",
-            "Updated workflow state after execution",
-            "Original workflow value at ",
-            "Updated workflow value at ",
-        )
-    )
-    if normalized["passed"] and extra_context_text and has_concrete_runtime_evidence:
-        challenge_messages = [
-            {
-                "role": "system",
-                "content": (
-                    DEFAULT_VERIFICATION_SYSTEM_PROMPT
-                    + " Perform a second-pass contradiction hunt. Assume the first verdict may be wrong. "
-                    + "Compare the original workflow state to the updated workflow state and search that concrete evidence for any counterexample. "
-                    + "If the observed before/after state change violates the request, you must return passed=false and explain exactly what is wrong."
-                ),
-            },
-            {"role": "user", "content": f"User request:\n{prompt}\n\n{LOWCODE_CONTRACT_TEXT}"},
-            {"role": "user", "content": extra_context_text},
-            {"role": "user", "content": f"Lua solution under review:\n```lua\n{code}\n```"},
-            {
-                "role": "user",
-                "content": (
-                    "The previous provisional verdict said the solution passed. "
-                    "Challenge that verdict. Use the concrete before/after workflow-state evidence to look for any wrong extra items, missing required transformations, incorrect mutations, or incorrect handling of empty values. "
-                    "Return the same strict JSON shape."
-                ),
-            },
-        ]
-        if run_output.strip():
-            challenge_messages.append(
-                {
-                    "role": "user",
-                    "content": f"Runtime output:\n{run_output or 'none'}",
-                }
-            )
-        challenge_raw = await llm.chat(
-            challenge_messages,
-            temperature=DEFAULT_VERIFICATION_TEMPERATURE,
-            agent_name="RequirementsVerifier",
-        )
-        challenge = _normalize_verification_result(_extract_json_block(challenge_raw))
-        if not challenge.get("passed", False) or challenge.get("missing_requirements"):
-            normalized = challenge
     if not normalized["summary"]:
         normalized["summary"] = "Verification completed."
     if normalized["passed"]:

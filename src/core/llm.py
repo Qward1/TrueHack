@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -17,6 +18,7 @@ DEFAULT_URL = "http://127.0.0.1:11434/v1"
 DEFAULT_MODEL = "qwen2.5-coder:7b-instruct"
 DEFAULT_TIMEOUT = 600.0
 DEFAULT_PROMPT_MAX_CHARS = 0
+DEFAULT_MAX_CONCURRENT_REQUESTS = 1
 
 
 def _parse_prompt_limit() -> int:
@@ -28,6 +30,19 @@ def _parse_prompt_limit() -> int:
 
 
 PROMPT_MAX_CHARS = _parse_prompt_limit()
+
+
+def _parse_max_concurrent_requests() -> int:
+    raw = os.getenv("OLLAMA_MAX_CONCURRENT_REQUESTS", str(DEFAULT_MAX_CONCURRENT_REQUESTS))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_CONCURRENT_REQUESTS
+    return max(1, value)
+
+
+MAX_CONCURRENT_REQUESTS = _parse_max_concurrent_requests()
+_LLM_REQUEST_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
 QWEN_NO_THINK_MODELS = frozenset({
     "qwen3.5:9b",
@@ -225,7 +240,8 @@ class LLMProvider:
             messages=message_payload,
         )
 
-        response = await self._client.chat.completions.create(**kwargs)
+        async with _LLM_REQUEST_SEMAPHORE:
+            response = await self._client.chat.completions.create(**kwargs)
         content = response.choices[0].message.content or ""
         cleaned = content.strip()
         write_llm_prompt_audit(

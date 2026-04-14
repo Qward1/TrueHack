@@ -74,9 +74,45 @@ python app.py --model qwen2.5-coder:3b-instruct
 python app.py --host 127.0.0.1 --port 8765 --workspace C:\Work\LuaProjects --model qwen2.5-coder:7b-instruct --url http://127.0.0.1:11434/v1
 ```
 
+### Docker Compose
+
+Есть готовый запуск в один шаг через `docker-compose.yml`.
+
+Что делает compose-конфигурация:
+- поднимает отдельный контейнер `ollama`;
+- поднимает контейнер приложения;
+- ждет готовности Ollama перед стартом UI;
+- проверяет, что все модели из `.env` уже есть в Ollama;
+- если какой-то модели нет, автоматически делает `pull`;
+- после этого запускает web UI на `http://127.0.0.1:8765`.
+
+Подготовка:
+
+```powershell
+copy .env.example .env
+```
+
+Запуск:
+
+```powershell
+docker compose up --build
+```
+
+Остановка:
+
+```powershell
+docker compose down
+```
+
+Замечания для Docker-режима:
+- внутри compose `OLLAMA_BASE_URL` автоматически переопределяется на `http://ollama:11434/v1`;
+- внутри compose `LUA_BIN` автоматически переопределяется на `lua55`, поэтому Windows-путь из локального `.env` контейнеру не мешает;
+- для GPU-ускорения нужен Docker Desktop с включенной GPU/WSL integration и рабочий NVIDIA Container Toolkit.
+
 Переменные окружения (альтернатива CLI-аргументам):
 - `OLLAMA_MODEL` — имя модели (по умолчанию `qwen2.5-coder:7b-instruct`)
 - `OLLAMA_BASE_URL` — URL Ollama API (по умолчанию `http://127.0.0.1:11434/v1`)
+- `OLLAMA_MAX_CONCURRENT_REQUESTS` — максимум одновременных запросов к Ollama из процесса приложения; для VRAM-safe режима рекомендуется `1`
 
 Опционально можно задать отдельные модели для конкретных LLM-агентов через `.env`.
 Приоритет выбора модели такой:
