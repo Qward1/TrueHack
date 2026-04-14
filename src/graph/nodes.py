@@ -72,16 +72,28 @@ _ROUTE_USER = """Categories:
 - retry: rerun validation/fix for already available code
 
 Decision rules:
-1. Use only one of the allowed intents: {allowed_intents}
-2. "change" is valid only when there is code to modify in chat or pasted in the current message
-3. If no code is available yet, requests like "fix/improve/wrap/clean/convert" still mean create new code, not change
-4. "inspect" is valid only when there is code to inspect in chat or pasted in the current message
-5. If the user pasted Lua code in this message, treat it as available code context
+1. Use only one of the allowed intents: create, change, inspect, question, general, retry.
+2. Use the contextual fields below instead of guessing hidden state.
+3. If the message asks what the current program/code does, prefer inspect.
+4. If there are pending clarification questions but the user is clearly asking to explain/review the current code, prefer inspect instead of change.
+5. If the user pasted Lua code in this message, treat it as available code context.
+6. If no code is available yet and the user asks to fix or modify something, prefer create unless the message is clearly just a general question.
+7. retry is only for requests to rerun validation/fixing for already available code.
 
 Current code in chat: {has_code}
 Lua code pasted in current message: {has_message_code}
-Effective code available for modification: {effective_has_code}
-User message: {user_input}
+Effective code available: {effective_has_code}
+Active clarification questions:
+{active_clarifying_questions}
+
+Current base task:
+{base_prompt}
+
+Current target path:
+{target_path}
+
+User message:
+{user_input}
 
 JSON only:"""
 
@@ -217,18 +229,36 @@ _EXPLAIN_SYSTEM = (
 )
 
 _RESPONSE_ASSEMBLER_SYSTEM = (
-    "You assemble the final user-facing response for a Lua workflow assistant. "
-    "Write all visible text in Russian. "
-    "Use concise, concrete wording. "
-    "Preserve the facts from the structured input exactly. "
-    "Do not invent checks, paths, errors, or improvements. "
-    "Do not include hidden reasoning. "
-    "Do not include the generated_code block: it will be appended separately by the application. "
-    "If there is no saved path, do not mention that the path is missing. "
-    "If there is a saved path, mention it. "
-    "Use these section headers when the corresponding data exists: "
-    "\"Что сделано:\", \"Что есть в коде:\", \"Как это работает:\", "
-    "\"Что можно улучшить:\", \"Уточняющие вопросы:\"."
+"You assemble the final user-facing response for a Lua workflow assistant. "
+"Return only the final user-facing response. "
+"Write all visible text in Russian. "
+"Use short, simple, concrete sentences. "
+"Keep the response concise. "
+"Use only facts from the structured input. "
+"Do not invent anything. "
+"Do not add checks, paths, errors, assumptions, explanations, or improvements unless they are present in the structured input. "
+"Do not include hidden reasoning. "
+"Do not include meta-commentary. "
+"Do not mention the structured input, the model, or the agent. "
+"Do not include the generated_code block. "
+"Do not output a section for generated_code. "
+"If there is a saved path, mention it once naturally. "
+"If there is no saved path, do not mention paths. "
+"Output only the sections that have data. "
+"Do not output empty sections. "
+"Do not add an intro or a conclusion. "
+"Use these section headers exactly, and only in this order when relevant: "
+"'Что сделано:', "
+"'Что есть в коде:', "
+"'Как это работает:', "
+"'Что можно улучшить:', "
+"'Уточняющие вопросы:'. "
+"Under each section, use short bullet-style lines or short paragraphs. "
+"Do not use Markdown code fences. "
+"Do not repeat the same fact in multiple sections. "
+"Preserve the facts exactly, but you may rephrase them for clarity. "
+"If the input is incomplete, output only the parts supported by the input. "
+"If the input contains contradictions, do not resolve them and do not add guesses."
 )
 
 _FENCED_BLOCK_RE = re.compile(r"```(?:[A-Za-z0-9_-]+)?\s*([\s\S]*?)```")
@@ -237,87 +267,6 @@ _TRAILING_JSON_CONTEXT_RE = re.compile(
 )
 _INLINE_LOWCODE_BLOCK_RE = re.compile(r"lua\{\s*[\s\S]*?\s*\}lua", re.IGNORECASE)
 _FENCED_CODE_BLOCK_RE = re.compile(r"```(?:lua)?\s*([\s\S]*?)```", re.IGNORECASE)
-_INTENT_CHANGE_MARKERS = (
-    "исправ",
-    "поправ",
-    "почин",
-    "улучш",
-    "доработ",
-    "передел",
-    "измени",
-    "обнови",
-    "адаптир",
-    "оптимиз",
-    "refactor",
-    "modify",
-    "improve",
-    "fix",
-    "update",
-    "change",
-    "adjust",
-)
-_INTENT_CREATE_MARKERS = (
-    "сделай",
-    "создай",
-    "напиши",
-    "сгенер",
-    "реализ",
-    "нужен скрипт",
-    "build",
-    "create",
-    "generate",
-    "write",
-    "implement",
-)
-_INTENT_INSPECT_MARKERS = (
-    "объясн",
-    "обьясн",
-    "как работает",
-    "что делает",
-    "разбер",
-    "проанализ",
-    "ревью",
-    "review",
-    "inspect",
-    "explain",
-    "analyze",
-)
-_INTENT_RETRY_MARKERS = (
-    "/retry",
-    "retry",
-    "повтори",
-    "перезапусти",
-    "прогони еще раз",
-    "заново проверь",
-)
-_INTENT_QUESTION_MARKERS = (
-    "почему",
-    "зачем",
-    "как ",
-    "что ",
-    "what ",
-    "why ",
-    "how ",
-)
-_INTENT_GENERAL_MARKERS = (
-    "привет",
-    "здравствуй",
-    "hello",
-    "hi",
-    "thanks",
-    "спасибо",
-)
-_TASK_CODE_MARKERS = (
-    "скрипт",
-    "код",
-    "lua",
-    "workflow",
-    "wf.vars",
-    "wf.initvariables",
-    "jsonstring",
-    "script",
-    "code",
-)
 _PROMPT_STYLE_RULES = """Hard rules:
 - Use the exact wf.vars / wf.initVariables paths from the task or provided workflow context.
 - Do not recreate the provided input as local demo tables like local data = {...}, local users = {...}, local emails = {...}.
@@ -636,14 +585,6 @@ def _build_clarification_response(compiled_request: dict[str, Any]) -> str:
     return "Нужна явная привязка к workflow-пути. Ответь, например: `используй wf.vars.some.path`."
 
 
-def _normalize_intent_text(text: str) -> str:
-    return re.sub(r"\s+", " ", str(text or "").strip().lower())
-
-
-def _text_has_any(text: str, markers: tuple[str, ...]) -> bool:
-    return any(marker in text for marker in markers)
-
-
 def _extract_message_code_block(user_input: str) -> str:
     raw = str(user_input or "")
     candidates: list[str] = []
@@ -681,132 +622,6 @@ def _strip_message_code_blocks(user_input: str) -> str:
     cleaned = _FENCED_CODE_BLOCK_RE.sub("\n", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
-
-
-def _collect_intent_features(
-    *,
-    user_input: str,
-    has_existing_code: bool,
-    base_prompt: str,
-    active_clarifying_questions: list[str] | None = None,
-) -> dict[str, Any]:
-    message_code = _extract_message_code_block(user_input)
-    cleaned_message = _strip_message_code_blocks(user_input) if message_code else str(user_input or "").strip()
-    normalized = _normalize_intent_text(cleaned_message or user_input)
-    task_text, raw_context = split_task_and_context(cleaned_message)
-
-    has_workflow_context = bool(raw_context.strip()) or any(
-        marker in user_input for marker in ('"wf"', "wf.vars", "wf.initVariables")
-    )
-    has_change_signal = _text_has_any(normalized, _INTENT_CHANGE_MARKERS)
-    has_create_signal = _text_has_any(normalized, _INTENT_CREATE_MARKERS)
-    has_inspect_signal = _text_has_any(normalized, _INTENT_INSPECT_MARKERS)
-    has_retry_signal = _text_has_any(normalized, _INTENT_RETRY_MARKERS)
-    has_question_signal = user_input.strip().endswith("?") or _text_has_any(normalized, _INTENT_QUESTION_MARKERS)
-    has_general_signal = _text_has_any(normalized, _INTENT_GENERAL_MARKERS)
-    has_error_signal = any(
-        marker in user_input.lower()
-        for marker in ("traceback", "runtime error", "syntax error", "stack traceback", "attempt to ", "bad argument")
-    )
-    has_task_code_signal = has_workflow_context or _text_has_any(normalized, _TASK_CODE_MARKERS)
-
-    effective_has_code = bool(has_existing_code or message_code)
-    has_pending_base_prompt = (
-        bool(str(base_prompt or "").strip())
-        and not effective_has_code
-        and str(base_prompt or "").strip() != str(user_input or "").strip()
-    )
-    active_questions = [
-        str(question).strip()
-        for question in (active_clarifying_questions or [])
-        if str(question).strip()
-    ]
-    has_active_code_clarification = bool(has_existing_code and active_questions)
-
-    return {
-        "message_code": message_code,
-        "cleaned_message": cleaned_message,
-        "normalized": normalized,
-        "task_text": task_text,
-        "raw_context": raw_context,
-        "has_workflow_context": has_workflow_context,
-        "has_change_signal": has_change_signal,
-        "has_create_signal": has_create_signal,
-        "has_inspect_signal": has_inspect_signal,
-        "has_retry_signal": has_retry_signal,
-        "has_question_signal": has_question_signal,
-        "has_general_signal": has_general_signal,
-        "has_error_signal": has_error_signal,
-        "has_task_code_signal": has_task_code_signal,
-        "has_existing_code": has_existing_code,
-        "has_message_code": bool(message_code),
-        "effective_has_code": effective_has_code,
-        "has_pending_base_prompt": has_pending_base_prompt,
-        "active_clarifying_questions": active_questions,
-        "has_active_code_clarification": has_active_code_clarification,
-    }
-
-
-def _deterministic_intent_from_features(features: dict[str, Any]) -> tuple[str, str]:
-    if features.get("has_pending_base_prompt"):
-        return "create", "clarification_followup"
-
-    normalized = str(features.get("normalized", "") or "").strip()
-    if not normalized:
-        return "general", "empty_message"
-
-    effective_has_code = bool(features.get("effective_has_code"))
-    has_retry_signal = bool(features.get("has_retry_signal"))
-    has_change_signal = bool(features.get("has_change_signal"))
-    has_create_signal = bool(features.get("has_create_signal"))
-    has_inspect_signal = bool(features.get("has_inspect_signal"))
-    has_question_signal = bool(features.get("has_question_signal"))
-    has_general_signal = bool(features.get("has_general_signal"))
-    has_error_signal = bool(features.get("has_error_signal"))
-    has_task_code_signal = bool(features.get("has_task_code_signal"))
-    is_code_task = bool(
-        has_create_signal
-        or has_change_signal
-        or has_error_signal
-        or bool(features.get("has_workflow_context"))
-        or (has_task_code_signal and not has_question_signal and not has_inspect_signal)
-    )
-    has_active_code_clarification = bool(features.get("has_active_code_clarification"))
-
-    if has_retry_signal:
-        return ("retry", "retry_with_code") if effective_has_code else ("create", "retry_without_code")
-
-    if has_active_code_clarification and effective_has_code:
-        return "change", "active_code_clarification_followup"
-
-    if has_inspect_signal and not (has_change_signal or has_create_signal or has_task_code_signal):
-        return ("inspect", "inspect_existing_code") if effective_has_code else ("question", "inspect_without_code")
-
-    if not effective_has_code:
-        if has_question_signal and not is_code_task:
-            return "question", "question_without_code"
-        if is_code_task:
-            return "create", "no_code_available"
-        if has_general_signal:
-            return "general", "general_message"
-        return "", ""
-
-    if has_error_signal or has_change_signal:
-        return "change", "modify_existing_code"
-
-    if has_inspect_signal and not has_create_signal:
-        return "inspect", "inspect_existing_code"
-
-    if has_create_signal and not has_change_signal:
-        return "create", "explicit_new_code_request"
-
-    if has_question_signal and not is_code_task:
-        return "question", "question_with_code_context"
-
-    if has_general_signal and not is_code_task:
-        return "general", "general_message"
-
-    return "", ""
 
 
 def split_task_and_context(user_input: str) -> tuple[str, str]:
@@ -1387,14 +1202,9 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             for question in state.get("active_clarifying_questions", []) or []
             if str(question).strip()
         ]
-        features = _collect_intent_features(
-            user_input=state["user_input"],
-            has_existing_code=has_code,
-            base_prompt=state.get("base_prompt", ""),
-            active_clarifying_questions=active_clarifying_questions,
-        )
-        message_code = str(features.get("message_code", "") or "").strip()
-        effective_has_code = bool(features.get("effective_has_code"))
+        message_code = _extract_message_code_block(state["user_input"]).strip()
+        cleaned_message = _strip_message_code_blocks(state["user_input"]) if message_code else str(state["user_input"] or "").strip()
+        effective_has_code = bool(has_code or message_code)
         logger.info(
             f"[{_AGENT_ROUTE_INTENT}] started",
             user_input=state["user_input"][:80],
@@ -1402,60 +1212,50 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             has_message_code=bool(message_code),
             effective_has_code=effective_has_code,
         )
-        deterministic_intent, deterministic_reason = _deterministic_intent_from_features(features)
-
         llm_intent = ""
         confidence = 0.0
-        intent_source = "deterministic"
-        if deterministic_intent:
-            intent = deterministic_intent
-        else:
-            allowed_intents = ["create", "question", "general"]
-            if effective_has_code:
-                allowed_intents = ["create", "change", "inspect", "question", "general", "retry"]
+        intent_source = "llm"
+        prompt = _ROUTE_USER.format(
+            has_code=str(has_code).lower(),
+            has_message_code=str(bool(message_code)).lower(),
+            effective_has_code=str(effective_has_code).lower(),
+            active_clarifying_questions=(
+                "\n".join(f"- {question}" for question in active_clarifying_questions)
+                if active_clarifying_questions else "none"
+            ),
+            base_prompt=str(state.get("base_prompt", "") or "").strip() or "none",
+            target_path=str(state.get("target_path", "") or "").strip() or "none",
+            user_input=state["user_input"],
+        )
 
-            prompt = _ROUTE_USER.format(
-                allowed_intents=", ".join(allowed_intents),
-                has_code=str(has_code).lower(),
-                has_message_code=str(bool(message_code)).lower(),
-                effective_has_code=str(effective_has_code).lower(),
-                user_input=state["user_input"],
-            )
+        logger.info(
+            f"[{_AGENT_ROUTE_INTENT}/llm.generate_json] calling",
+            prompt_len=len(prompt),
+            allowed_intents=["create", "change", "inspect", "question", "general", "retry"],
+        )
+        result = await llm.generate_json(
+            prompt,
+            system=_ROUTE_SYSTEM,
+            agent_name=_AGENT_ROUTE_INTENT,
+        )
+        llm_intent = str(result.get("intent", "") or "").strip()
+        confidence = float(result.get("confidence", 0.5))
+        logger.info(
+            f"[{_AGENT_ROUTE_INTENT}/llm.generate_json] done",
+            raw_intent=llm_intent,
+            confidence=confidence,
+        )
 
-            logger.info(
-                f"[{_AGENT_ROUTE_INTENT}/llm.generate_json] calling",
-                prompt_len=len(prompt),
-                allowed_intents=allowed_intents,
-            )
-            result = await llm.generate_json(
-                prompt,
-                system=_ROUTE_SYSTEM,
-                agent_name=_AGENT_ROUTE_INTENT,
-            )
-            llm_intent = str(result.get("intent", "") or "").strip()
-            confidence = float(result.get("confidence", 0.5))
-            logger.info(
-                f"[{_AGENT_ROUTE_INTENT}/llm.generate_json] done",
-                raw_intent=llm_intent,
-                confidence=confidence,
-            )
-
-            intent = llm_intent or "create"
-            intent_source = "llm"
+        intent = llm_intent or "question"
 
         valid_intents = {"create", "change", "inspect", "question", "general", "retry"}
         if intent not in valid_intents:
-            intent = "change" if effective_has_code else "create"
+            intent = "question"
             intent_source = "fallback_invalid"
-
-        if intent not in {"create", "question", "general"} and not effective_has_code:
-            intent = "create"
-            intent_source = "fallback_no_code"
 
         updates: dict[str, Any] = {"intent": intent}
         if message_code and intent in {"change", "inspect", "retry"} and not has_code:
             updates["current_code"] = message_code
-            cleaned_message = str(features.get("cleaned_message", "") or "").strip()
             if cleaned_message and not state.get("base_prompt", "").strip():
                 updates["base_prompt"] = cleaned_message
 
@@ -1464,7 +1264,6 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             intent=intent,
             confidence=confidence,
             source=intent_source,
-            deterministic_reason=deterministic_reason or "none",
             llm_intent=llm_intent or "n/a",
         )
         return updates
@@ -2541,14 +2340,13 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             lines.append(f"Сохранение не удалось: {save_error}\n")
 
         lines.append(
-            "```json\n"
-            f"{format_lowcode_json_payload(code, compiled_request=compiled_request if isinstance(compiled_request, dict) else None, target_path=saved_to or target_path)}\n"
-            "```"
+            "generated_code:\n"
+            f"{format_lowcode_json_payload(code, compiled_request=compiled_request if isinstance(compiled_request, dict) else None, target_path=saved_to or target_path)}"
         )
 
         run_output = diagnostics.get("run_output", "").strip()
         if run_output:
-            lines.append(f"\nРезультат выполнения:\n```\n{run_output}\n```")
+            lines.append(f"\nРезультат выполнения:\n{run_output}")
 
         if isinstance(explanation, dict):
             summary = str(explanation.get("summary", "")).strip()
@@ -2622,7 +2420,8 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             "Если путь сохранения отсутствует, не пиши, что путь не указан.\n"
             "Если путь есть, укажи его.\n"
             "Не добавляй блок generated_code: приложение добавит его само.\n"
-            "Верни только итоговый текст ответа в Markdown.\n\n"
+            "Не используй Markdown-кодовые блоки.\n"
+            "Верни только итоговый текст ответа.\n\n"
             f"Данные:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
         )
 
@@ -2704,14 +2503,13 @@ def create_nodes(llm: LLMProvider) -> dict[str, Callable]:
             assembled_text = str(assembled_text or "").strip()
             if assembled_text:
                 generated_code_block = (
-                    "```json\n"
-                    f"{format_lowcode_json_payload(code, compiled_request=compiled_request if isinstance(compiled_request, dict) else None, target_path=saved_to or state.get('target_path', ''))}\n"
-                    "```"
+                    "generated_code:\n"
+                    f"{format_lowcode_json_payload(code, compiled_request=compiled_request if isinstance(compiled_request, dict) else None, target_path=saved_to or state.get('target_path', ''))}"
                 )
                 response_parts = [assembled_text, generated_code_block]
                 run_output = str(diagnostics.get("run_output", "") or "").strip()
                 if run_output:
-                    response_parts.append(f"Результат выполнения:\n```\n{run_output}\n```")
+                    response_parts.append(f"Результат выполнения:\n{run_output}")
                 response_text = "\n\n".join(part for part in response_parts if str(part).strip())
             logger.info(
                 f"[{_AGENT_PREPARE_RESPONSE}/llm.generate] done",

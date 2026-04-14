@@ -338,7 +338,7 @@ HTML_PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>LowCode Lua Script Builder</title>
+  <title>LocalScriptLua</title>
   <style>
     :root {
       --bg: #f3ecdf;
@@ -381,8 +381,8 @@ HTML_PAGE = """<!doctype html>
       margin: 0 auto;
       padding: 10px 18px;
       display: grid;
-      grid-template-columns: minmax(0, 1.78fr) minmax(340px, 0.82fr);
-      gap: 18px;
+      grid-template-columns: minmax(340px, 0.82fr) minmax(0, 1.78fr);
+      gap: 10px;
       height: 100vh;
       height: 100dvh;
     }
@@ -403,6 +403,7 @@ HTML_PAGE = """<!doctype html>
       min-height: 0;
       height: 100%;
       overflow: hidden;
+      order: 2;
     }
 
     .side-panel {
@@ -413,42 +414,44 @@ HTML_PAGE = """<!doctype html>
       min-height: 0;
       height: 100%;
       overflow: auto;
+      order: 1;
     }
 
     .hero {
       display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
+      justify-content: flex-start;
+      align-items: center;
       gap: 12px;
       padding-bottom: 10px;
       border-bottom: 1px solid rgba(216, 199, 170, 0.7);
       flex-shrink: 0;
     }
 
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-width: 0;
+    }
+
+    .brand-logo {
+      width: 56px;
+      height: 56px;
+      flex: 0 0 auto;
+      display: block;
+      filter: drop-shadow(0 8px 18px rgba(110, 31, 39, 0.16));
+    }
+
+    .brand-copy {
+      min-width: 0;
+    }
+
     .hero h1 {
       margin: 0;
-      font-size: 28px;
+      font-size: 30px;
       line-height: 1;
-      font-family: "Palatino Linotype", Georgia, serif;
-      letter-spacing: 0.02em;
-    }
-
-    .hero p {
-      margin: 6px 0 0;
-      color: var(--muted);
-      max-width: 720px;
-      font-size: 14px;
-    }
-
-    .badge {
-      padding: 8px 12px;
-      border-radius: 999px;
-      border: 1px solid rgba(181, 85, 45, 0.25);
-      background: rgba(181, 85, 45, 0.08);
-      color: var(--accent-dark);
-      font-weight: 700;
-      white-space: nowrap;
-      font-size: 13px;
+      font-family: Georgia, "Times New Roman", serif;
+      letter-spacing: 0.01em;
     }
 
     .toolbar {
@@ -665,6 +668,11 @@ HTML_PAGE = """<!doctype html>
       display: flex;
       flex-direction: column;
       min-height: 0;
+      min-height: 190px;
+      max-height: 62vh;
+      resize: vertical;
+      overflow: auto;
+      flex: 0 0 auto;
     }
 
     .chat-list-head {
@@ -685,8 +693,19 @@ HTML_PAGE = """<!doctype html>
       gap: 8px;
       overflow: auto;
       min-height: 0;
-      max-height: 42vh;
+      max-height: none;
+      flex: 1;
       padding-right: 4px;
+    }
+
+    .code-card {
+      display: flex;
+      flex-direction: column;
+      min-height: 240px;
+      max-height: 68vh;
+      resize: vertical;
+      overflow: auto;
+      flex: 0 0 auto;
     }
 
     .chat-row {
@@ -802,7 +821,8 @@ HTML_PAGE = """<!doctype html>
 
     .code-box {
       min-height: 180px;
-      max-height: 48vh;
+      max-height: none;
+      flex: 1;
       overflow: auto;
       padding: 14px 16px;
       border-radius: 16px;
@@ -878,11 +898,17 @@ HTML_PAGE = """<!doctype html>
   <div class="shell">
     <section class="panel chat-panel">
       <div class="hero">
-        <div>
-          <h1>LowCode Lua Script Builder</h1>
-          <p>Локальный чат для генерации, редактирования и проверки workflow/LUS Lua-скриптов. Runtime проверяет код в LowCode harness, сохраняет `.lua` и JsonString sidecar, а затем объясняет сделанное и предлагает улучшения.</p>
+        <div class="brand">
+          <svg class="brand-logo" viewBox="0 0 100 100" aria-hidden="true">
+            <rect x="4" y="4" width="92" height="92" rx="8" fill="#b73343"></rect>
+            <text x="14" y="46" fill="#fff7ef" font-size="50" font-weight="900" font-family="Arial Black, Trebuchet MS, sans-serif">M</text>
+            <text x="61" y="45" fill="#fff7ef" font-size="50" font-weight="900" font-family="Arial Black, Trebuchet MS, sans-serif">T</text>
+            <text x="61" y="92" fill="#fff7ef" font-size="50" font-weight="900" font-family="Arial Black, Trebuchet MS, sans-serif">C</text>
+          </svg>
+          <div class="brand-copy">
+            <h1>LocalScriptLua</h1>
+          </div>
         </div>
-        <div class="badge" id="statusBadge">Локально</div>
       </div>
 
       <div class="toolbar">
@@ -917,7 +943,7 @@ HTML_PAGE = """<!doctype html>
         <div class="chat-list" id="chatList"></div>
       </div>
 
-      <div class="side-card">
+      <div class="side-card code-card">
         <div class="side-card-head">
           <h2>Последний Код</h2>
           <button type="button" class="ghost-button" id="copyCodeButton">Копировать</button>
@@ -935,7 +961,6 @@ HTML_PAGE = """<!doctype html>
     const stopButton = document.getElementById("stopButton");
     const codeBox = document.getElementById("codeBox");
     const copyCodeButton = document.getElementById("copyCodeButton");
-    const statusBadge = document.getElementById("statusBadge");
     const chatList = document.getElementById("chatList");
     const newChatButton = document.getElementById("newChatButton");
     let activeChatId = null;
@@ -1153,7 +1178,6 @@ HTML_PAGE = """<!doctype html>
       document.querySelectorAll(".chat-item, .chat-delete").forEach((button) => {
         button.disabled = isBusy;
       });
-      statusBadge.textContent = isBusy ? "Выполняется" : "Локально";
     }
 
     function updateSidebar(state) {
@@ -1304,7 +1328,6 @@ HTML_PAGE = """<!doctype html>
       }
       cancelRequested = true;
       stopButton.disabled = true;
-      statusBadge.textContent = "Останавливается";
       try {
         await callApi("/api/cancel", {});
       } catch (error) {
@@ -1383,10 +1406,14 @@ HTML_PAGE = """<!doctype html>
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="LowCode Lua Script Builder — canonical web runtime.")
+    parser = argparse.ArgumentParser(description="LocalScriptLua — canonical web runtime.")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind the local web UI.")
     parser.add_argument("--port", type=int, default=8765, help="Port for the local web UI.")
     parser.add_argument("--no-browser", action="store_true", help="Do not auto-open the browser.")
+    parser.add_argument("--console-chat", action="store_true", help="Run interactive console chat instead of the web UI.")
+    parser.add_argument("--generate", default="", help="Run a one-shot generate request in console mode and exit.")
+    parser.add_argument("--target-path", default="", help="Optional target .lua path for one-shot generate mode.")
+    parser.add_argument("--json", action="store_true", help="Print one-shot generate result as JSON.")
     parser.add_argument(
         "--workspace",
         default=os.getcwd(),
@@ -1660,6 +1687,103 @@ class AppRuntime:
             self._save_current_chat()
             return self.build_full_payload()
 
+    def generate_once(self, prompt: str, target_path: str = "") -> dict:
+        text = str(prompt or "").strip()
+        target_path = str(target_path or "").strip()
+        if not text:
+            return {
+                "ok": False,
+                "error": "Prompt is empty.",
+                "prompt": text,
+                "target_path": target_path,
+                "code": "",
+                "response": "",
+            }
+
+        turn_id = new_turn_id()
+        write_runtime_audit(
+            "generate_api_dispatch",
+            chat_id=0,
+            turn_id=turn_id,
+            prompt_chars=len(text),
+            target_path=target_path,
+        )
+
+        try:
+            result = self._run_async(
+                self.engine.process_message(
+                    chat_id=0,
+                    turn_id=turn_id,
+                    user_input=text,
+                    current_code="",
+                    base_prompt="",
+                    change_requests=[],
+                    workspace_root=self.default_workspace,
+                    target_path=target_path,
+                    awaiting_planner_clarification=False,
+                    planner_pending_questions=[],
+                    planner_original_input="",
+                    planner_clarification_attempts=0,
+                    active_clarifying_questions=[],
+                ),
+                track_pipeline=False,
+            )
+        except Exception as exc:
+            error_text = str(exc) or repr(exc) or type(exc).__name__
+            write_runtime_audit(
+                "generate_api_failed",
+                chat_id=0,
+                turn_id=turn_id,
+                error=error_text,
+                error_type=type(exc).__name__,
+            )
+            logger.error(
+                "generate_api_error",
+                error=error_text,
+                error_type=type(exc).__name__,
+                error_repr=repr(exc),
+            )
+            return {
+                "ok": False,
+                "error": error_text,
+                "prompt": text,
+                "target_path": target_path,
+                "code": "",
+                "response": f"Ошибка: {error_text}",
+            }
+
+        verification = result.get("verification", {}) if isinstance(result, dict) else {}
+        payload = {
+            "ok": True,
+            "error": "",
+            "prompt": text,
+            "target_path": target_path,
+            "intent": result.get("intent", ""),
+            "response_type": result.get("response_type", ""),
+            "response": result.get("response", ""),
+            "code": result.get("current_code", ""),
+            "saved_to": result.get("saved_to", ""),
+            "saved_jsonstring_to": result.get("saved_jsonstring_to", ""),
+            "save_success": result.get("save_success", False),
+            "validation_passed": result.get("validation_passed", False),
+            "verification_passed": bool(verification.get("passed", False)),
+            "verification_summary": str(verification.get("summary", "") or "").strip(),
+            "clarifying_questions": list(result.get("clarifying_questions", []) or []),
+            "suggested_changes": list(result.get("suggested_changes", []) or []),
+            "explanation": result.get("explanation", {}) if isinstance(result.get("explanation", {}), dict) else {},
+        }
+        write_runtime_audit(
+            "generate_api_result",
+            chat_id=0,
+            turn_id=turn_id,
+            intent=payload["intent"],
+            response_type=payload["response_type"],
+            save_success=payload["save_success"],
+            validation_passed=payload["validation_passed"],
+            verification_passed=payload["verification_passed"],
+        )
+        return payload
+
     def _process_via_pipeline(self, text: str) -> str:
         """Run the LangGraph pipeline for user text and return response."""
         sd = self.state_dict
@@ -1913,6 +2037,13 @@ def make_handler(runtime: AppRuntime):
                 self.respond_json(response)
                 return
 
+            if self.path in {"/generate", "/api/generate"}:
+                prompt = str(payload.get("prompt", ""))
+                target_path = str(payload.get("target_path", ""))
+                response = runtime.generate_once(prompt, target_path=target_path)
+                self.respond_json(response)
+                return
+
             if self.path == "/api/cancel":
                 self.respond_json(runtime.cancel_active_pipeline())
                 return
@@ -1969,6 +2100,56 @@ def make_handler(runtime: AppRuntime):
     return Handler
 
 
+def _extract_latest_assistant_text(payload: dict) -> str:
+    messages = payload.get("messages", []) if isinstance(payload, dict) else []
+    if not isinstance(messages, list):
+        return ""
+    for item in reversed(messages):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role", "")).strip() == "assistant":
+            return str(item.get("content", "") or "").strip()
+    return ""
+
+
+def run_console_chat(runtime: AppRuntime) -> int:
+    print("LocalScriptLua — console chat")
+    print("Команды: /help, /retry, /code, /path, /status, /prompt")
+    print("Для выхода: /exit или /quit")
+    while True:
+        try:
+            user_input = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not user_input:
+            continue
+        if user_input.lower() in {"/exit", "/quit"}:
+            break
+        payload = runtime.handle_message(user_input)
+        answer = _extract_latest_assistant_text(payload)
+        if answer:
+            print(answer)
+    return 0
+
+
+def run_console_generate(runtime: AppRuntime, prompt: str, *, target_path: str = "", as_json: bool = False) -> int:
+    result = runtime.generate_once(prompt, target_path=target_path)
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result.get("ok") else 1
+
+    response = str(result.get("response", "") or "").strip()
+    code = str(result.get("code", "") or "").strip()
+    if response:
+        print(response)
+    elif code:
+        print(code)
+    elif result.get("error"):
+        print(f"Ошибка: {result['error']}")
+    return 0 if result.get("ok") else 1
+
+
 def main() -> int:
     configure_console_utf8()
     args = parse_args()
@@ -1989,9 +2170,21 @@ def main() -> int:
     )
 
     runtime = AppRuntime(args)
+
+    if str(getattr(args, "generate", "") or "").strip():
+        return run_console_generate(
+            runtime,
+            str(args.generate),
+            target_path=str(getattr(args, "target_path", "") or ""),
+            as_json=bool(getattr(args, "json", False)),
+        )
+
+    if bool(getattr(args, "console_chat", False)):
+        return run_console_chat(runtime)
+
     server = ThreadingHTTPServer((args.host, args.port), make_handler(runtime))
     url = f"http://{args.host}:{args.port}/"
-    print(f"LowCode Lua Script Builder (LangGraph) запущен: {url}")
+    print(f"LocalScriptLua (LangGraph) запущен: {url}")
     print("Для остановки нажми Ctrl+C")
 
     if not args.no_browser:
