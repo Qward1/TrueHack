@@ -8,4 +8,14 @@ __pycache__
 *.pyd
 logs
 .lua_console_chats.db
+.claude
+.codex
+runtime
+workspace
+tests_tmp_*
+CLAUDE.md
+codex.md
+GENERATION.md
+PREZA.md
+PROGON.md
 

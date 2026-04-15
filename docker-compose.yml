@@ -1,10 +1,43 @@
+name: truehack
+
+x-truehack-image: &truehack-image
+  image: truehack-app:local
+  build:
+    context: .
+
+x-truehack-env: &truehack-env
+  OLLAMA_BASE_URL: http://ollama:11434/v1
+  OLLAMA_MODEL: ${OLLAMA_MODEL:-truehack}
+  OLLAMA_MODEL_CODE_GENERATOR: ${OLLAMA_MODEL_CODE_GENERATOR:-qwen2.5-coder:7b-instruct}
+  OLLAMA_MODEL_TEMPLATE_SELECTOR: ${OLLAMA_MODEL_TEMPLATE_SELECTOR:-qwen2.5-coder:3b-instruct}
+  OLLAMA_MODEL_TASK_PLANNER: ${OLLAMA_MODEL_TASK_PLANNER:-qwen2.5-coder:3b-instruct}
+  OLLAMA_MODEL_INTENT_ROUTER: ${OLLAMA_MODEL_INTENT_ROUTER:-qwen2.5-coder:3b-instruct}
+  OLLAMA_MODEL_CODE_REFINER: ${OLLAMA_MODEL_CODE_REFINER:-qwen2.5-coder:7b-instruct}
+  OLLAMA_MODEL_VALIDATION_FIXER: ${OLLAMA_MODEL_VALIDATION_FIXER:-qwen2.5-coder:7b-instruct}
+  OLLAMA_MODEL_VERIFICATION_FIXER: ${OLLAMA_MODEL_VERIFICATION_FIXER:-qwen2.5-coder:7b-instruct}
+  OLLAMA_MODEL_REQUIREMENTS_VERIFIER: ${OLLAMA_MODEL_REQUIREMENTS_VERIFIER:-qwen2.5-coder:7b-instruct}
+  OLLAMA_MODEL_SOLUTION_EXPLAINER: ${OLLAMA_MODEL_SOLUTION_EXPLAINER:-qwen2.5-coder:7b-instruct}
+  OLLAMA_MODEL_QUESTION_ANSWERER: ${OLLAMA_MODEL_QUESTION_ANSWERER:-qwen2.5-coder:7b-instruct}
+  OLLAMA_MODEL_RESPONSE_ASSEMBLER: ${OLLAMA_MODEL_RESPONSE_ASSEMBLER:-qwen2.5-coder:7b-instruct}
+  RAG_TEMPLATES_ENABLED: ${RAG_TEMPLATES_ENABLED:-true}
+  RAG_TEMPLATES_KB_PATH: ${RAG_TEMPLATES_KB_PATH:-lua_rag_templates_kb.jsonl}
+  RAG_TEMPLATES_TOP_K: ${RAG_TEMPLATES_TOP_K:-5}
+  RAG_TEMPLATES_REQUIRE_PLANNER: ${RAG_TEMPLATES_REQUIRE_PLANNER:-true}
+  RAG_TEMPLATES_EMBED_MODEL: ${RAG_TEMPLATES_EMBED_MODEL:-qwen3-embedding:0.6b}
+  OLLAMA_MAX_CONCURRENT_REQUESTS: ${OLLAMA_MAX_CONCURRENT_REQUESTS:-1}
+  PLANNER_ENABLED: ${PLANNER_ENABLED:-true}
+  OLLAMA_REASONING_EFFORT_TASK_PLANNER: ${OLLAMA_REASONING_EFFORT_TASK_PLANNER:-none}
+  OLLAMA_CREATE_MODEL_NAME: ${OLLAMA_CREATE_MODEL_NAME:-truehack}
+  OLLAMA_CREATE_MODEL_FILE: /app/Modelfile
+
 services:
   ollama:
     image: ollama/ollama:latest
     container_name: truehack-ollama
     restart: unless-stopped
-    ports:
-      - "11434:11434"
+    gpus: all
+    expose:
+      - "11434"
     volumes:
       - ollama_data:/root/.ollama
     healthcheck:
@@ -12,31 +45,39 @@ services:
       interval: 10s
       timeout: 5s
       retries: 30
-    gpus: all
+
+  model-init:
+    <<: *truehack-image
+    container_name: truehack-model-init
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      <<: *truehack-env
+    command: ["python", "/app/scripts/bootstrap_ollama.py"]
 
   app:
-    build:
-      context: .
+    <<: *truehack-image
     container_name: truehack-app
     restart: unless-stopped
     depends_on:
       ollama:
         condition: service_healthy
-    env_file:
-      - .env
+      model-init:
+        condition: service_completed_successfully
     environment:
-      OLLAMA_BASE_URL: http://ollama:11434/v1
+      <<: *truehack-env
       LUA_BIN: lua55
-      OLLAMA_MAX_CONCURRENT_REQUESTS: "1"
-      APP_DOCKER_BOOTSTRAP_OLLAMA: "1"
+      APP_DOCKER_BOOTSTRAP_OLLAMA: "0"
       APP_RUNTIME_DIR: /runtime
       APP_WORKSPACE: /workspace
+      APP_LOG_DIR: /runtime/logs
     ports:
       - "8000:8000"
     volumes:
-      - ./workspace:/workspace
       - ./runtime:/runtime
-    command: ["sh", "/app/docker/app-entrypoint.sh"]
+      - ./workspace:/workspace
 
 volumes:
   ollama_data:

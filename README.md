@@ -2,7 +2,7 @@
   <img src="https://img.shields.io/badge/Python-3.12+-blue?style=flat-square&logo=python" />
   <img src="https://img.shields.io/badge/Ollama-local%20LLM-orange?style=flat-square" />
   <img src="https://img.shields.io/badge/LangGraph-pipeline-green?style=flat-square" />
-  <img src="https://img.shields.io/badge/Lua-5.4%2F5.5-blueviolet?style=flat-square" />
+  <img src="https://img.shields.io/badge/Lua-5.5-blueviolet?style=flat-square" />
   <img src="https://img.shields.io/badge/MTS-True%20Tech%20Hack-red?style=flat-square" />
 </p>
 
@@ -103,7 +103,8 @@ TrueHack/
 ├── Modelfile                       # Конфигурация Ollama-модели
 ├── openapi.yaml                    # Swagger-контракт API
 ├── docker-compose.yml              # Docker Compose (Ollama + App)
-├── Dockerfile                      # Python 3.12 + Lua 5.4
+├── Dockerfile                      # Python 3.12 + встроенный Lua 5.5
+├── vendor/lua-5.5.0/              # Vendored source tree для сборки Lua 5.5 в Docker
 ├── .env.example                    # Шаблон переменных окружения
 ├── lua_rag_templates_kb.jsonl      # База шаблонов (150+ Lua-примеров)
 ├── src/
@@ -135,7 +136,7 @@ TrueHack/
 
 - **Python** 3.12+
 - **Ollama** — [скачать с ollama.com](https://ollama.com/download)
-- **Lua 5.4 / 5.5** — интерпретатор, доступный в PATH или по явному пути
+- **Lua 5.5** — интерпретатор, доступный в PATH или по явному пути
 
 ---
 
@@ -274,25 +275,29 @@ python app.py \
 
 ## Запуск через Docker Compose
 
-Самый простой способ — всё поднимается одной командой, Ollama и приложение запускаются вместе.
-
-### Требования
-
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/)
-- NVIDIA Container Toolkit (для GPU-поддержки)
-
-### Запуск
+Основной способ запуска проекта теперь один:
 
 ```bash
-# Скопировать конфиг
-copy .env.example .env    # Windows
-cp .env.example .env      # Linux / macOS
-
-# Поднять сервисы
-docker compose up --build
+docker compose up --build -d
 ```
 
-Приложение будет доступно по адресу `http://127.0.0.1:8000`.
+Что поднимается автоматически:
+- приложение целиком;
+- Ollama;
+- bootstrap контейнер, который подтягивает нужные модели;
+- кастомная модель `truehack` из `Modelfile`, если она еще не создана;
+- runtime-папка и workspace.
+
+GPU включен по умолчанию для сервиса `ollama` через `gpus: all`, поэтому модели будут запускаться на видеокарте, если Docker на хосте имеет доступ к GPU.
+Если Docker GPU не видит, нужно отдельно включить поддержку GPU в Docker Desktop / WSL или установить NVIDIA Container Toolkit на Linux.
+
+Приложение доступно по адресу:
+
+```text
+http://127.0.0.1:8000
+```
+
+Первый старт может занять заметное время, потому что Ollama скачивает модели.
 
 ### Остановить
 
@@ -300,18 +305,26 @@ docker compose up --build
 docker compose down
 ```
 
+### Что сохраняется
+
+- `./runtime` — SQLite база, логи и runtime-состояние;
+- `./workspace` — generated `.lua` файлы и артефакты;
+- `ollama_data` — скачанные модели Ollama.
+
 ### Сервисы
 
 | Сервис | Порт | Описание |
 |---|---|---|
 | `truehack-app` | `8000` | Web UI и REST API |
-| `truehack-ollama` | `11434` | Ollama LLM-инференс |
+| `truehack-ollama` | internal | Ollama runtime |
+| `truehack-model-init` | internal | автоподтяжка моделей и создание `truehack` |
 
 ---
 
 ## Конфигурация (.env)
 
-Все параметры задаются через `.env` файл. Полный шаблон — `.env.example`.
+`docker compose` уже запускается без предварительного создания `.env`.
+Если нужно переопределить модели или параметры, можно создать `.env` на базе `.env.example`.
 
 ### Основные параметры
 

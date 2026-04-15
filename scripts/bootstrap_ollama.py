@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -25,6 +26,8 @@ MODEL_ENV_KEYS = (
     "OLLAMA_MODEL_QUESTION_ANSWERER",
     "OLLAMA_MODEL_RESPONSE_ASSEMBLER",
 )
+DEFAULT_CREATE_MODEL_NAME = ""
+DEFAULT_CREATE_MODEL_FILE = "/app/Modelfile"
 
 
 def _normalize_root_url() -> str:
@@ -64,8 +67,12 @@ def _wait_for_ollama(root_url: str, attempts: int = 90, delay_seconds: float = 2
 
 def _collect_required_models() -> list[str]:
     models: list[str] = []
+    create_model_name = str(os.getenv("OLLAMA_CREATE_MODEL_NAME", DEFAULT_CREATE_MODEL_NAME) or "").strip()
+    create_model_file = str(os.getenv("OLLAMA_CREATE_MODEL_FILE", DEFAULT_CREATE_MODEL_FILE) or "").strip()
     for key in MODEL_ENV_KEYS:
         value = str(os.getenv(key, "") or "").strip()
+        if create_model_name and value == create_model_name:
+            continue
         if value and value not in models:
             models.append(value)
 
@@ -79,6 +86,20 @@ def _collect_required_models() -> list[str]:
         embed_model = str(os.getenv("RAG_TEMPLATES_EMBED_MODEL", "") or "").strip()
         if embed_model and embed_model not in models:
             models.append(embed_model)
+
+    if create_model_name and create_model_file and os.path.exists(create_model_file):
+        try:
+            with open(create_model_file, "r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.upper().startswith("FROM "):
+                        base_model = line.split(None, 1)[1].strip()
+                        if base_model and base_model not in models:
+                            models.append(base_model)
+        except OSError:
+            pass
 
     return models
 
@@ -139,6 +160,137 @@ def _pull_model(root_url: str, model_name: str) -> None:
     print(f"[bootstrap] Model ready: {model_name}", flush=True)
 
 
+def _streaming_post(root_url: str, endpoint: str, payload: dict, success_message: str) -> None:
+    request = urllib.request.Request(
+        f"{root_url}{endpoint}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    last_status = ""
+    with urllib.request.urlopen(request, timeout=3600.0) as response:
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            status = str(item.get("status", "") or "").strip()
+            if status and status != last_status:
+                print(f"[bootstrap] {status}", flush=True)
+                last_status = status
+            if item.get("error"):
+                raise RuntimeError(str(item["error"]))
+
+    print(success_message, flush=True)
+
+
+def _coerce_parameter_value(raw_value: str) -> object:
+    value = raw_value.strip()
+    lowered = value.lower()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    if re.fullmatch(r"-?\d+", value):
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    if re.fullmatch(r"-?\d+\.\d+", value):
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    return value
+
+
+def _parse_modelfile(modelfile_path: str) -> dict:
+    with open(modelfile_path, "r", encoding="utf-8") as handle:
+        lines = handle.readlines()
+
+    payload: dict[str, object] = {}
+    parameters: dict[str, object] = {}
+    licenses: list[str] = []
+    messages: list[dict[str, str]] = []
+
+    index = 0
+    while index < len(lines):
+        raw_line = lines[index].rstrip("\n")
+        stripped = raw_line.strip()
+        index += 1
+
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        parts = stripped.split(None, 1)
+        command = parts[0].upper()
+        remainder = parts[1] if len(parts) > 1 else ""
+
+        if remainder.startswith('"""'):
+            block_parts: list[str] = []
+            trailing = remainder[3:]
+            if trailing.endswith('"""') and trailing != '"""':
+                remainder = trailing[:-3]
+            else:
+                if trailing:
+                    block_parts.append(trailing)
+                while index < len(lines):
+                    block_line = lines[index].rstrip("\n")
+                    index += 1
+                    if block_line.endswith('"""'):
+                        block_parts.append(block_line[:-3])
+                        break
+                    block_parts.append(block_line)
+                remainder = "\n".join(block_parts)
+
+        value = remainder.strip()
+
+        if command == "FROM":
+            payload["from"] = value
+        elif command == "PARAMETER":
+            param_parts = value.split(None, 1)
+            if len(param_parts) != 2:
+                continue
+            parameters[param_parts[0]] = _coerce_parameter_value(param_parts[1])
+        elif command == "SYSTEM":
+            payload["system"] = value
+        elif command == "TEMPLATE":
+            payload["template"] = value
+        elif command == "LICENSE":
+            licenses.append(value)
+        elif command == "MESSAGE":
+            message_parts = value.split(None, 1)
+            if len(message_parts) != 2:
+                continue
+            messages.append({"role": message_parts[0], "content": message_parts[1]})
+
+    if parameters:
+        payload["parameters"] = parameters
+    if licenses:
+        payload["license"] = licenses if len(licenses) > 1 else licenses[0]
+    if messages:
+        payload["messages"] = messages
+    return payload
+
+
+def _create_model(root_url: str, model_name: str, modelfile_path: str) -> None:
+    payload = _parse_modelfile(modelfile_path)
+    payload["model"] = model_name
+    payload["stream"] = True
+    if "from" not in payload:
+        raise RuntimeError(f"Modelfile is missing FROM: {modelfile_path}")
+    print(f"[bootstrap] Creating Ollama model from Modelfile: {model_name}", flush=True)
+    _streaming_post(
+        root_url,
+        "/api/create",
+        payload,
+        f"[bootstrap] Custom Ollama model ready: {model_name}",
+    )
+
+
 def main() -> int:
     root_url = _normalize_root_url()
     _wait_for_ollama(root_url)
@@ -155,6 +307,16 @@ def main() -> int:
             continue
         _pull_model(root_url, model_name)
         installed_models.add(model_name)
+
+    create_model_name = str(os.getenv("OLLAMA_CREATE_MODEL_NAME", DEFAULT_CREATE_MODEL_NAME) or "").strip()
+    create_model_file = str(os.getenv("OLLAMA_CREATE_MODEL_FILE", DEFAULT_CREATE_MODEL_FILE) or "").strip()
+    if create_model_name and create_model_file and os.path.exists(create_model_file):
+        recreate = str(os.getenv("OLLAMA_CREATE_MODEL_RECREATE", "0") or "").strip().lower() in {"1", "true", "yes", "on"}
+        if recreate or create_model_name not in installed_models:
+            _create_model(root_url, create_model_name, create_model_file)
+            installed_models.add(create_model_name)
+        else:
+            print(f"[bootstrap] Custom Ollama model already present: {create_model_name}", flush=True)
 
     print("[bootstrap] Ollama bootstrap complete.", flush=True)
     return 0

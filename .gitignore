@@ -6,3 +6,5 @@ logs/
 .env
 .lua_console_chats.db
 .lua_console_chat.json
+runtime/
+workspace/
