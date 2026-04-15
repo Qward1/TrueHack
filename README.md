@@ -1,300 +1,516 @@
-# LocalScript / LowCode Lua Script Builder
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.12+-blue?style=flat-square&logo=python" />
+  <img src="https://img.shields.io/badge/Ollama-local%20LLM-orange?style=flat-square" />
+  <img src="https://img.shields.io/badge/LangGraph-pipeline-green?style=flat-square" />
+  <img src="https://img.shields.io/badge/Lua-5.4%2F5.5-blueviolet?style=flat-square" />
+  <img src="https://img.shields.io/badge/MTS-True%20Tech%20Hack-red?style=flat-square" />
+</p>
 
-Локальный web runtime для генерации, доработки, валидации и сохранения workflow/LUS Lua-скриптов.
+<h1 align="center">LocalScriptLua</h1>
 
-Архитектурная схема в нотации C4: [docs/C4.md](/mnt/c/Users/Admin/Desktop/3ABCD/TrueHack/docs/C4.md)
+<p align="center"><b>Локальная AI-система для генерации, доработки, проверки и сохранения Lua-кода</b></p>
 
-## Что делает проект
-- принимает задачу на естественном языке;
-- генерирует или дорабатывает LowCode workflow/LUS script на `Lua 5.5`;
-- запускает локальную проверку через `lua` в temporary LowCode harness;
-- делает fix loop при ошибках;
-- выполняет LLM-проверку соответствия исходному запросу;
-- если в чате указан явный target path или уже есть active target, сохраняет код после успешной локальной валидации и проверки требований:
-  - как чистый целевой `.lua` файл;
-  - как sidecar JSON-артефакт рядом с ним, где значение поля содержит JsonString `lua{...}lua`;
-- возвращает:
-  - код;
-  - user-facing JSON payload с embedded `lua{...}lua`;
-  - путь сохранения, если он был задан;
-  - объяснение реализации;
-  - предложения улучшений;
-  - уточняющие вопросы.
+<p align="center">
+Не просто чат с моделью — аккуратная рабочая среда для Lua.<br/>
+Внешне мягкий интерфейс, внутри — серьёзная система для состояния, пайплайна и автопочинки кода.
+</p>
 
-## Canonical runtime
-Единственный поддерживаемый entry point:
+---
 
-```powershell
-python app.py
+## О проекте
+
+**LocalScriptLua** — решение для кейса MTS True Tech Hack / LocalScript.
+
+Система решает реальную инженерную задачу: LowCode Lua-скрипты часто описываются на естественном языке, а обычная LLM-генерация нестабильна по формату и логике. LocalScriptLua собирает задачу, состояние, код и проверки в единый рабочий поток — нужны не только код, но и проверка, сохранение и объяснение результата.
+
+**Ключевые особенности:**
+
+- Создаёт и дорабатывает Lua-код по описанию на русском или английском
+- Проверяет код локально через Lua harness — без отправки кода наружу
+- Делает fix-loop при ошибках — сам находит и исправляет проблемы
+- Проверяет соответствие исходной задаче через LLM-verifier
+- Отвечает на вопросы по текущему коду
+- Сохраняет `.lua` и sidecar `jsonstring`-артефакт
+- Работает полностью локально — без зависимости от внешних AI API
+
+---
+
+## Возможности системы
+
+| Функция | Описание |
+|---|---|
+| **Генерация кода** | Создаёт Lua-скрипт по задаче на естественном языке |
+| **Доработка кода** | Изменяет существующий скрипт по новому требованию |
+| **Локальная валидация** | Запускает код в Lua harness с mock `wf.vars` / `wf.initVariables` |
+| **Fix-loop** | Автоматически исправляет синтаксические и runtime-ошибки |
+| **Проверка требований** | LLM-verifier сверяет логику кода с исходной задачей |
+| **Semantic fix-loop** | Исправляет семантические ошибки после провала верификации |
+| **Вопросы по коду** | Отвечает на вопросы об уже сгенерированном скрипте |
+| **RAG-шаблоны** | Подбирает релевантный шаблон из базы 150+ Lua-примеров |
+| **Сохранение** | `.lua` файл + sidecar `.jsonstring.txt` артефакт |
+| **История чатов** | SQLite-хранилище с полной историей сессий |
+
+---
+
+## Архитектура
+
+### Компоненты системы
+
+```
+Пользователь (Web UI / API / консоль)
+         │
+         ▼
+      app.py  ──────────────────────────────┐
+  (HTTP-сервер, чаты, состояние)            │
+         │                                  │
+         ▼                                  ▼
+  PipelineEngine                    Файловая система
+  (LangGraph-граф)                  (.lua, sidecar,
+         │                           SQLite, логи, KB)
+         ▼
+      Ollama
+  (LLM + embeddings)
+         │
+         ▼
+  Lua interpreter
+  (локальная валидация)
 ```
 
-## Требования
-- Python 3.12+
-- [Ollama](https://ollama.com/) (локальный LLM runtime)
-- `lua` в PATH
+### Граф пайплайна
 
-## Установка
+```
+Start
+  └─▶ TargetResolver        — определяет файл/папку активного чата
+        └─▶ IntentRouter     — LLM решает: create / change / inspect / question
+              ├─▶ QuestionAnswerer ──────────────────────────────────▶ End
+              └─▶ PlannerAgent       — анализирует задачу, задаёт уточнения
+                    └─▶ GenerationContextCompiler — компилирует контекст
+                          └─▶ RAG    — подбирает Lua-шаблон из КБ
+                                └─▶ CodeGenerator / CodeRefiner
+                                      └─▶ CodeValidator
+                                            ├─▶ [ошибка] ValidationFixer ──▶ CodeValidator
+                                            └─▶ [ок] RequirementsVerifier
+                                                  ├─▶ [ошибка] VerificationFixer ──▶ RequirementsVerifier
+                                                  └─▶ [ок] ResponseAssembler ──▶ End
+```
 
-### 1. Python-зависимости
+### Структура репозитория
+
+```
+TrueHack/
+├── app.py                          # Web UI, HTTP API, chat runtime, console-режимы
+├── requirements.txt                # Зависимости Python
+├── Modelfile                       # Конфигурация Ollama-модели
+├── openapi.yaml                    # Swagger-контракт API
+├── docker-compose.yml              # Docker Compose (Ollama + App)
+├── Dockerfile                      # Python 3.12 + Lua 5.4
+├── .env.example                    # Шаблон переменных окружения
+├── lua_rag_templates_kb.jsonl      # База шаблонов (150+ Lua-примеров)
+├── src/
+│   ├── agents/
+│   │   └── planner.py              # TaskPlanner — анализ и уточнение задачи
+│   ├── core/
+│   │   ├── llm.py                  # LLM-провайдер (OpenAI-compatible Ollama)
+│   │   ├── state.py                # PipelineState — хранилище данных пайплайна
+│   │   └── logging_runtime.py     # Структурированное логирование
+│   ├── graph/
+│   │   ├── engine.py               # PipelineEngine — точка входа в граф
+│   │   ├── builder.py              # Построение LangGraph-графа
+│   │   ├── nodes.py                # Узлы пайплайна
+│   │   └── conditions.py          # Условная маршрутизация
+│   └── tools/
+│       ├── lua_tools.py            # Lua harness, нормализация, диагностика
+│       ├── target_tools.py         # Путь, именование, сохранение
+│       ├── local_runtime.py        # Запуск Lua-процессов
+│       └── rag_templates.py        # RAG: поиск и выбор шаблонов
+├── docs/                           # Архитектурная документация
+└── tests/                          # Тесты пайплайна, planner, RAG, логирования
+```
+
+---
+
+## Быстрый старт (без Docker)
+
+### Требования
+
+- **Python** 3.12+
+- **Ollama** — [скачать с ollama.com](https://ollama.com/download)
+- **Lua 5.4 / 5.5** — интерпретатор, доступный в PATH или по явному пути
+
+---
+
+### Шаг 1 — Скачать репозиторий
+
+```bash
+git clone <url-репозитория>
+cd TrueHack
+```
+
+---
+
+### Шаг 2 — Создать виртуальное окружение и установить зависимости
+
+**Windows (PowerShell):**
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-### 2. Ollama и модель
+**Linux / macOS:**
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-Скачать и установить Ollama: https://ollama.com/download
+---
 
-```powershell
-# Скачать модель (хакатонная конфигурация, 8 GB VRAM)
+### Шаг 3 — Установить Lua
+
+**Windows:**
+1. Скачать `lua-5.4.x_Win64_bin.zip` с [sourceforge.net/projects/luabinaries](https://sourceforge.net/projects/luabinaries/)
+2. Распаковать, например в `C:\lua55\`
+3. Добавить `C:\lua55\` в системную переменную `PATH`, **или** прописать полный путь в `.env`:
+   ```
+   LUA_BIN=C:/lua55/lua55.exe
+   ```
+
+**Ubuntu / Debian:**
+```bash
+sudo apt install lua5.4
+```
+
+**macOS:**
+```bash
+brew install lua
+```
+
+---
+
+### Шаг 4 — Скачать модели через Ollama
+
+Запустить Ollama (если ещё не запущен):
+```bash
+ollama serve
+```
+
+Скачать основную модель для генерации кода:
+```bash
 ollama pull qwen2.5-coder:7b-instruct
+```
 
-# Для слабых GPU (4 GB VRAM) — меньшая модель
+Скачать модель для планировщика, роутера и выбора шаблона:
+```bash
 ollama pull qwen2.5-coder:3b-instruct
 ```
 
-Опционально — создать кастомную модель с зафиксированными параметрами хакатона:
+Скачать эмбеддинг-модель для RAG (рекомендуется):
+```bash
+ollama pull qwen3-embedding:0.6b
+```
 
-```powershell
+> **Для GPU 8 GB VRAM** — используйте `qwen2.5-coder:7b-instruct` (рекомендуется).  
+> **Для GPU 4 GB VRAM** — используйте `qwen2.5-coder:3b-instruct` для всех агентов.
+
+**Создать оптимизированную модель с параметрами хакатона (рекомендуется):**
+```bash
 ollama create truehack -f Modelfile
 ```
 
-## Запуск
+---
 
-```powershell
-# Стандартный запуск (модель по умолчанию: qwen2.5-coder:7b-instruct)
+### Шаг 5 — Настроить переменные окружения
+
+Скопировать шаблон:
+```bash
+# Windows
+copy .env.example .env
+
+# Linux / macOS
+cp .env.example .env
+```
+
+Открыть `.env` и указать путь к Lua, если он не в PATH:
+```env
+LUA_BIN=C:/lua55/lua55.exe
+```
+
+Остальные значения по умолчанию уже настроены для локального запуска.
+
+---
+
+### Шаг 6 — Запустить приложение
+
+```bash
+python app.py
+```
+
+Приложение откроется в браузере автоматически. Если нет — перейти по адресу:
+
+```
+http://127.0.0.1:8000
+```
+
+#### Дополнительные параметры запуска
+
+```bash
+# Указать рабочую папку для сохранения .lua файлов
 python app.py --workspace C:\Work\LuaProjects
 
-# С кастомной моделью из Modelfile
-python app.py --model truehack
-
-# С меньшей моделью (4 GB VRAM)
+# Указать модель явно
 python app.py --model qwen2.5-coder:3b-instruct
 
 # Все параметры
-python app.py --host 127.0.0.1 --port 8000 --workspace C:\Work\LuaProjects --model qwen2.5-coder:7b-instruct --url http://127.0.0.1:11434/v1
+python app.py \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --workspace /path/to/workspace \
+  --model truehack \
+  --url http://127.0.0.1:11434/v1
 ```
 
-### Docker Compose
+---
 
-Есть готовый запуск в один шаг через `docker-compose.yml`.
+## Запуск через Docker Compose
 
-Что делает compose-конфигурация:
-- поднимает отдельный контейнер `ollama`;
-- поднимает контейнер приложения;
-- ждет готовности Ollama перед стартом UI;
-- проверяет, что все модели из `.env` уже есть в Ollama;
-- если какой-то модели нет, автоматически делает `pull`;
-- после этого запускает web UI на `http://127.0.0.1:8000`;
-- не монтирует весь исходный код в контейнер `app`, поэтому запуск не ломается из-за Windows `CRLF`.
+Самый простой способ — всё поднимается одной командой, Ollama и приложение запускаются вместе.
 
-Подготовка:
+### Требования
 
-```powershell
-copy .env.example .env
-```
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+- NVIDIA Container Toolkit (для GPU-поддержки)
 
-Запуск:
+### Запуск
 
-```powershell
+```bash
+# Скопировать конфиг
+copy .env.example .env    # Windows
+cp .env.example .env      # Linux / macOS
+
+# Поднять сервисы
 docker compose up --build
 ```
 
-Остановка:
+Приложение будет доступно по адресу `http://127.0.0.1:8000`.
 
-```powershell
+### Остановить
+
+```bash
 docker compose down
 ```
 
-Замечания для Docker-режима:
-- внутри compose `OLLAMA_BASE_URL` автоматически переопределяется на `http://ollama:11434/v1`;
-- внутри compose `LUA_BIN` автоматически переопределяется на `lua55`, поэтому Windows-путь из локального `.env` контейнеру не мешает;
-- generated workspace-файлы пишутся в `./workspace`, runtime sqlite/logs — в `./runtime`;
-- для GPU-ускорения нужен Docker Desktop с включенной GPU/WSL integration и рабочий NVIDIA Container Toolkit.
+### Сервисы
 
-Переменные окружения (альтернатива CLI-аргументам):
-- `OLLAMA_MODEL` — имя модели (по умолчанию `qwen2.5-coder:7b-instruct`)
-- `OLLAMA_BASE_URL` — URL Ollama API (по умолчанию `http://127.0.0.1:11434/v1`)
-- `OLLAMA_MAX_CONCURRENT_REQUESTS` — максимум одновременных запросов к Ollama из процесса приложения; для VRAM-safe режима рекомендуется `1`
+| Сервис | Порт | Описание |
+|---|---|---|
+| `truehack-app` | `8000` | Web UI и REST API |
+| `truehack-ollama` | `11434` | Ollama LLM-инференс |
 
-Опционально можно задать отдельные модели для конкретных LLM-агентов через `.env`.
-Приоритет выбора модели такой:
-1. `OLLAMA_MODEL_<AGENT_NAME>` для конкретного агента
-2. CLI `--model`
-3. общий `OLLAMA_MODEL`
-4. встроенный default `qwen2.5-coder:7b-instruct`
+---
 
-Поддерживаемые per-agent переменные:
-- `OLLAMA_MODEL_INTENT_ROUTER`
-- `OLLAMA_MODEL_TASK_PLANNER`
-- `OLLAMA_MODEL_CODE_GENERATOR`
-- `OLLAMA_MODEL_CODE_REFINER`
-- `OLLAMA_MODEL_VALIDATION_FIXER`
-- `OLLAMA_MODEL_VERIFICATION_FIXER`
-- `OLLAMA_MODEL_REQUIREMENTS_VERIFIER`
-- `OLLAMA_MODEL_SOLUTION_EXPLAINER`
-- `OLLAMA_MODEL_QUESTION_ANSWERER`
+## Конфигурация (.env)
 
-Пример:
+Все параметры задаются через `.env` файл. Полный шаблон — `.env.example`.
+
+### Основные параметры
 
 ```env
+# Базовая модель (используется для агентов без явного override)
 OLLAMA_MODEL=qwen2.5-coder:7b-instruct
+
+# Адрес Ollama API
+OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
+
+# Путь к исполняемому файлу Lua
+LUA_BIN=lua55
+
+# Ограничение параллельных запросов к Ollama (рекомендуется 1)
+OLLAMA_MAX_CONCURRENT_REQUESTS=1
+```
+
+### Модели по агентам (per-agent routing)
+
+Каждый агент пайплайна может использовать свою модель:
+
+```env
+OLLAMA_MODEL_CODE_GENERATOR=qwen2.5-coder:7b-instruct
+OLLAMA_MODEL_CODE_REFINER=qwen2.5-coder:7b-instruct
+OLLAMA_MODEL_VALIDATION_FIXER=qwen2.5-coder:7b-instruct
+OLLAMA_MODEL_VERIFICATION_FIXER=qwen2.5-coder:7b-instruct
+OLLAMA_MODEL_REQUIREMENTS_VERIFIER=qwen2.5-coder:7b-instruct
+OLLAMA_MODEL_TEMPLATE_SELECTOR=qwen2.5-coder:3b-instruct
 OLLAMA_MODEL_INTENT_ROUTER=qwen2.5-coder:3b-instruct
-OLLAMA_MODEL_REQUIREMENTS_VERIFIER=qwen2.5-coder:14b-instruct
-OLLAMA_MODEL_SOLUTION_EXPLAINER=qwen2.5-coder:3b-instruct
+OLLAMA_MODEL_TASK_PLANNER=qwen2.5-coder:3b-instruct
 ```
 
-## Как задавать путь для Lua
+### RAG-шаблоны
 
-### 1. Явный `.lua` файл
-Пример:
-
-```text
-Создай скрипт заметок в C:\Work\LuaProjects\notes.lua
+```env
+RAG_TEMPLATES_ENABLED=true
+RAG_TEMPLATES_KB_PATH=lua_rag_templates_kb.jsonl
+RAG_TEMPLATES_TOP_K=5
+RAG_TEMPLATES_EMBED_MODEL=qwen3-embedding:0.6b
 ```
 
-Система сохранит итог именно в этот файл и рядом создаст sidecar `*.jsonstring.txt`.
+### TaskPlanner
 
-### 2. Директория
-Пример:
-
-```text
-Преобразуй DATUM и TIME из wf.vars.json.IDOC.ZCDF_HEAD в ISO дату в папке C:\Work\LuaProjects
+```env
+PLANNER_ENABLED=true
 ```
 
-Система построит slug из prompt и создаст:
+---
 
-```text
-C:\Work\LuaProjects\<slug>\<slug>.lua
+## Использование
+
+### Web UI
+
+Основной способ работы. Открыть `http://127.0.0.1:8000`.
+
+**Панель инструментов:**
+
+| Кнопка | Действие |
+|---|---|
+| **Повторить Проверку** | Повторно запустить валидацию и верификацию текущего кода |
+| **Статус** | Показать статус последнего выполнения пайплайна |
+| **Путь** | Показать активный target-путь для сохранения |
+| **Текущий Промпт** | Показать оригинальную задачу текущего чата |
+| **Показать Код** | Отобразить последний сгенерированный код |
+| **Помощь** | Справка по командам |
+
+**Примеры задач:**
+
+```
+Напиши скрипт, который берёт массив items из wf.vars.json.DOC.ZCDF_PACKAGES
+и возвращает только те элементы, у которых sku не пустой
 ```
 
-Если в указанном пути есть невалидные для Windows символы в имени папки или файла, runtime автоматически санитизирует их перед сохранением.
-
-### 3. Follow-up в том же чате
-После первого turn можно писать:
-
-```text
-Добавь сохранение истории
+```
+Преобразуй структуру данных так, чтобы все элементы Items в ZCDF_PACKAGES
+всегда были представлены в виде массивов, даже если они изначально не являются массивами
 ```
 
-Система переиспользует active target текущего чата.
-
-### 4. Без явного пути
-Пример:
-
-```text
-Верни последний email из wf.vars.emails
+```
+Добавь обработку случая когда wf.vars.json.DOC пустой
 ```
 
-Система выполнит полный цикл `generate/refine -> validate -> verify -> explain/respond`, но не будет создавать `.lua` файл и sidecar, если в этом чате ещё нет active target.
+### Команды в чате
 
-## LowCode contract
-- generation target: `Lua 5.5`
-- script description format in prompts/user-facing output: `lua{ ... }lua`
-- `JsonPath` использовать нельзя; доступ к данным должен быть прямым
-- declared variables: `wf.vars`
-- startup variables from `variables`: `wf.initVariables`
-- это workflow/LUS script, а не console/CLI program
-- скрипт должен возвращать значение и/или обновлять `wf.vars`
-- console input/output (`io.read`, `print`, `io.write`) по умолчанию не используются
-- массивы создаются/маркируются через `_utils.array.new()` и `_utils.array.markAsArray(arr)`
-- для shape-sensitive задач массивом считается только table с числовыми ключами `1..n` без пропусков; table со строковыми ключами вроде `name` / `phone` массивом не считается; пустая table считается массивом
-- базовые конструкции: `if`, `while`, `for`, `repeat`
+| Команда | Описание |
+|---|---|
+| `/new` | Начать новый чат |
+| `/retry` | Повторить последнюю генерацию |
+| `/code` | Показать текущий код |
+| `/path [путь]` | Установить/показать путь сохранения |
+| `/status` | Статус пайплайна |
+| `/prompt` | Показать исходную задачу |
 
-Во время локальной validation runtime поднимает временный harness:
-- создаёт mock `wf.vars` и `wf.initVariables`;
-- добавляет `_utils.array.new()` и `_utils.array.markAsArray(arr)`;
-- автоматически строит nested mock-таблицы для найденных цепочек `wf.vars.*` и `wf.initVariables.*`, включая aliased access patterns.
+### REST API
 
-## Pipeline
-Основная ветка:
+Swagger UI доступен по адресу: `http://127.0.0.1:8000/swagger`
 
-```text
-resolve_target -> route_intent -> generate/refine -> validate -> verify -> save -> explain_solution -> respond
+Основные эндпоинты:
+
+```
+POST /api/chat/{chat_id}/message   — отправить сообщение в чат
+GET  /api/chats                    — список чатов
+GET  /api/chat/{chat_id}           — история чата
+POST /api/generate                 — one-shot генерация без истории
 ```
 
-Если проваливается validation/verify:
-- запускается `fix_code`;
-- затем pipeline повторяет цикл проверок;
-- если лимит fix-итераций исчерпан, файл не сохраняется.
+### Console-режим
 
-## Что видно в ответе
-- user-facing JSON payload, где значение поля содержит `lua{ ... }lua`;
-- статус local validation / verification;
-- путь сохранения `.lua` и sidecar JsonString, если сохранение выполнялось;
-- объяснение (что есть в коде и как работает);
-- предложения улучшений;
-- уточняющие вопросы.
+Локальный диалог прямо в терминале:
 
-## Follow-up по предложениям системы
-Если в ответе есть список предложений, можно написать:
-
-```text
-Примени предложение 1
+```bash
+python app.py --console
 ```
 
-Система подставит это как явный change request и запустит новый refine-cycle.
+---
 
-## Команды UI
-- `/new <задача>` — новый проект в текущем чате
-- `/edit <изменение>` — доработать текущий код
-- `/retry` — повторить полный цикл проверок
-- `/code` — показать текущий Lua-код
-- `/path` — показать active Lua target и workspace
-- `/status` — показать статус чата
-- `/prompt` — показать базовую задачу, правки и предложения
+## Модели и параметры
 
-## Runtime
+### Рекомендованная конфигурация (GPU 8 GB VRAM)
 
-Canonical runtime — Ollama с OpenAI-compatible API на `http://127.0.0.1:11434/v1`.
+| Агент | Модель |
+|---|---|
+| Генератор кода | `qwen2.5-coder:7b-instruct` |
+| Исправление ошибок | `qwen2.5-coder:7b-instruct` |
+| Верификатор требований | `qwen2.5-coder:7b-instruct` |
+| Выбор шаблона | `qwen2.5-coder:3b-instruct` |
+| Роутер интента | `qwen2.5-coder:3b-instruct` |
+| Планировщик | `qwen2.5-coder:3b-instruct` |
+| Эмбеддинги (RAG) | `qwen3-embedding:0.6b` |
 
-Модель по умолчанию: `qwen2.5-coder:7b-instruct`.
-Параметры хакатона зафиксированы в `Modelfile` (num_ctx=4096, num_predict=256, num_gpu=99).
+### Параметры модели (Modelfile)
 
-Смена модели:
-- CLI: `python app.py --model qwen2.5-coder:3b-instruct`
-- ENV: `OLLAMA_MODEL=qwen2.5-coder:3b-instruct`
-- Modelfile: `ollama create mymodel -f Modelfile` + `--model mymodel`
+```
+FROM qwen2.5-coder:7b-instruct
 
-Заметки:
-- `e2e`-агент и e2e-gate сейчас временно отключены;
-- `luacheck` сейчас не используется в каноническом runtime;
-- generation/refine/fix ориентированы на workflow/LUS scripts, а не на console/CLI apps;
-- `route_intent` теперь hybrid:
-  - сначала учитывает реальное наличие кода в чате, clarification state и deterministic text signals;
-  - LLM intent classifier используется как fallback для неоднозначных случаев;
-  - если кода ещё нет и пользователь не прислал Lua в сообщении, change-like wording (`исправь`, `улучши`, `оберни`, `очисти`) трактуется как `create`, а не как `change`;
-  - если Lua прислан прямо в сообщении, он может стать входным кодом для `change` / `inspect`;
-- generation/refine/fix теперь остаются model-driven:
-  - compiler подготавливает workflow inventory, path hints и clarification gate;
-  - финальный Lua-код всегда синтезирует модель по текущей задаче и контексту;
-  - prompts больше не подталкивают каждую задачу к shortest-return шаблону и допускают multi-step scripts, loops, guards и helper functions, когда это нужно задаче;
-  - prompts теперь используют один жёсткий format contract: ответ должен начинаться с `lua{` и заканчиваться `}lua`, без кавычек и без code fences;
-  - в generation/fix prompts сокращён служебный шум: вместо ranked candidates / confidence / длинных diagnostics модель получает задачу, основной workflow path, текущий context и короткий список обязательных исправлений;
-  - `fix_code` больше не подсовывает модели прошлый сломанный assistant output и переписывает сценарий по short mandatory-fix list;
-  - generate/refine/fix теперь используют более консервативную temperature policy для parseable workflow context и shape-sensitive tasks;
-  - raw LLM output считается невалидным, если модель вернула fences, quoted wrapper или не начала ответ с `lua{`;
-- verification теперь использует semantic verdict через `summary` + `missing_requirements`, а не только свободный summary;
-- verifier теперь получает concrete runtime evidence:
-  - updated workflow snapshot after execution for mutation scripts;
-  - contradiction-focused second pass can overturn an optimistic false positive;
-  - verifier дополнительно не должен одобрять ответы с markdown/quoted wrappers и shape-sensitive код, где `next(...)` выступает единственной проверкой массива;
-- shape-sensitive задачи теперь проверяются semantic verifier'ом и fix-loop по явным правилам:
-  - нельзя опираться только на `type(x) == "table"` там, где нужно отличать object-like table от array-like table;
-  - проверки `next(x)` / empty-vs-non-empty не считаются достаточным shape detection;
-  - нельзя просто пометить исходный workflow object/scalar как массив через `_utils.array.markAsArray(source)` вместо создания нового array value;
-  - `_utils.array.new()` должен вызываться без inline arguments;
-  - для новых массивов требуется `_utils.array.markAsArray(arr)`;
-- naming для auto-created folder/file и title чата строится из очищенного prompt и санитизируется под Windows;
-- без явного пути в новом чате runtime больше не создаёт fallback file target и показывает код только в ответе;
-- задачи очистки/удаления ключей внутри workflow-объектов больше не считаются простым `return`-сценарием и проходят semantic verification на реальную трансформацию данных;
-- если пользователь в задаче упоминает bare field name из parseable workflow context, runtime пытается однозначно привязать его к `wf.vars.*` или `wf.initVariables.*` и использует это в verification/save gate;
-- fix-loop теперь получает не только raw Lua runtime error, но и нормализованные repair hints для типовых ошибок аргументов, nil access/call, arithmetic/type mismatch и concatenation;
-- `fix_code` теперь делает один внутренний stricter retry, если первый fix-ответ:
-  - не является внятным standalone Lua;
-  - почти не меняет код;
-  - или детерминированно повторяет те же requirement failures;
-- normalizer умеет извлекать Lua не только из `lua{...}lua`, но и из structured model envelopes вроде JSON-объектов с полями `lua` / `code` / `script`, чтобы validation не падала на сыром мета-формате ответа;
-- этот extraction работает и для fenced/meta-wrapped JSON envelopes, если модель вернула ` ```json { ... "field": "lua{...}lua" } ``` ` вместо чистого Lua;
-- README фиксирует текущее состояние кода, а не желаемое будущее.
+PARAMETER num_ctx     4096   # контекстное окно
+PARAMETER num_predict 256    # максимум токенов в ответе
+PARAMETER num_batch   1      # батч для VRAM-ограничений
+PARAMETER num_gpu     99     # полная загрузка на GPU
+PARAMETER temperature 0.2    # детерминированная генерация
+```
+
+---
+
+## Артефакты и наблюдаемость
+
+После каждой генерации система создаёт:
+
+| Файл | Описание |
+|---|---|
+| `*.lua` | Готовый Lua-скрипт |
+| `*.jsonstring.txt` | Sidecar-артефакт: JSON с `lua{...}lua`-обёрткой |
+
+Логи и хранилище:
+
+| Файл | Описание |
+|---|---|
+| `.lua_console_chats.db` | SQLite: чаты, сообщения, состояние сессий |
+| `logs/runtime.jsonl` | Технические события пайплайна |
+| `logs/llm_prompts.jsonl` | Все вызовы моделей (prompt-аудит) |
+
+Автоочистка логов происходит каждые 10 запусков.
+
+---
+
+## Тесты
+
+```bash
+# Запустить все тесты
+python -m pytest tests/ -v
+
+# Тесты конкретного модуля
+python -m pytest tests/test_planner.py -v
+python -m pytest tests/test_rag.py -v
+python -m pytest tests/test_logging.py -v
+```
+
+---
+
+## Команда
+
+**APPLExMISISxMIREA xXЯОМИ** — MTS True Tech Hack 2024
+
+- Дёмин Владислав Русланович
+- Ромашкин Дмитрий Олегович
+- Гасанов Тимур Русланович
+
+---
+
+## Стек технологий
+
+| Компонент | Технология |
+|---|---|
+| LLM-инференс | [Ollama](https://ollama.com) |
+| Оркестрация пайплайна | [LangGraph](https://github.com/langchain-ai/langgraph) |
+| LLM API-клиент | openai-python (OpenAI-compatible endpoint) |
+| Логирование | [structlog](https://www.structlog.org/) |
+| Хранилище чатов | SQLite |
+| Валидация кода | Lua 5.4 (локальный harness) |
+| RAG эмбеддинги | qwen3-embedding:0.6b (через Ollama) |
+| Web UI | Встроенный HTTP-сервер (без внешних фреймворков) |
+| Контейнеризация | Docker + Docker Compose |
