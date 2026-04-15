@@ -227,6 +227,27 @@ class PlannerEnabledPipelineTests(unittest.TestCase):
         self.assertIn("Исходная задача", llm.last_planner_prompt)
         self.assertIn("Ответ пользователя", llm.last_planner_prompt)
 
+    def test_followup_all_paths_answer_is_expanded_for_planner(self) -> None:
+        llm = IntegrationStubLLM(planner_response={
+            "reformulated_task": "Обработать wf.vars.invoices и wf.vars.payments вместе.",
+            "identified_workflow_paths": ["wf.vars.invoices", "wf.vars.payments"],
+            "needs_clarification": False,
+            "confidence": 0.95,
+        })
+        result = self._run_engine(
+            llm,
+            user_input="со всеми",
+            awaiting_planner_clarification=True,
+            planner_pending_questions=[
+                "Уточни, с каким workflow-путём работать: wf.vars.invoices, wf.vars.payments. Ответь, например: `используй wf.vars.invoices`."
+            ],
+            planner_original_input="Сопоставь оплаты со счетами по invoiceId и верни только те счета, у которых оплаченная сумма меньше суммы счета.",
+            planner_clarification_attempts=1,
+        )
+        self.assertFalse(result["awaiting_planner_clarification"])
+        self.assertIn("wf.vars.invoices", llm.last_planner_prompt)
+        self.assertIn("wf.vars.payments", llm.last_planner_prompt)
+
     def test_max_clarification_attempts_forces_continue(self) -> None:
         llm = IntegrationStubLLM(planner_response={
             "reformulated_task": "still ambiguous",

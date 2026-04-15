@@ -168,6 +168,11 @@ WORKFLOW_ROOT_HINT_RE = re.compile(
     r"(?i)(?:\bvars\b|\binitVariables\b|\"vars\"|'vars'|\"initVariables\"|'initVariables')"
 )
 TASK_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9_]+")
+ALL_PATHS_REPLY_RE = re.compile(
+    r"\b(?:со\s+всеми|со\s+всеми\s+этими|со\s+всеми\s+перечисленными|"
+    r"все(?:ми)?\s+перечисленн(?:ые|ыми)|все\s+пути|оба|обе|обоими)\b",
+    re.IGNORECASE,
+)
 SEMANTIC_STEM_GROUPS: dict[str, tuple[str, ...]] = {
     "cart": ("cart", "basket", "корзин"),
     "item": ("item", "items", "товар", "product", "products", "goods", "sku", "позиц", "position"),
@@ -991,6 +996,91 @@ def infer_comparison_paths(task_text: str, inventory: list[dict[str, Any]], expl
     return sorted(best_pair, key=lambda path: (_compare_role_rank(path), path))
 
 
+def infer_cooperative_paths(task_text: str, ranked_candidates: list[dict[str, Any]], inventory: list[dict[str, Any]]) -> list[str]:
+    """Infer a small set of workflow paths that should be used together.
+
+    This is for generic multi-source tasks such as matching, merging, correlating,
+    or filtering one collection by data from another. Unlike compare/diff tasks,
+    the paths cooperate to produce one result.
+    """
+    if not inventory or len(ranked_candidates) < 2:
+        return []
+
+    tokens = _canonicalize_tokens(_extract_task_tokens(task_text))
+    multi_source_markers = {
+        "match", "join", "merge", "combine", "lookup", "map", "filter",
+        "сопостав", "свяж", "объедин", "совмест", "по",
+    }
+    if not any(any(marker in token for marker in multi_source_markers) for token in tokens):
+        return []
+
+    inventory_by_path = {
+        str(entry.get("path", "")).strip(): entry
+        for entry in inventory
+        if str(entry.get("path", "")).strip()
+    }
+    candidates = []
+    top_score = float(ranked_candidates[0]["score"])
+    for candidate in ranked_candidates[:4]:
+        score = float(candidate.get("score", 0.0) or 0.0)
+        path = str(candidate.get("path", "") or "").strip()
+        entry = inventory_by_path.get(path)
+        if not entry:
+            continue
+        path_type = str(entry.get("type", "") or "")
+        if path_type not in {"array_object", "object"}:
+            continue
+        if score < 8 or (top_score - score) >= 4:
+            continue
+        candidates.append(entry)
+
+    if len(candidates) < 2:
+        return []
+
+    pair_scores: list[tuple[float, tuple[str, str]]] = []
+    for index, left in enumerate(candidates):
+        left_path = str(left.get("path", "") or "")
+        left_segments = [str(segment).strip() for segment in left.get("segments", []) if str(segment).strip()]
+        left_type = str(left.get("type", "") or "")
+        left_keys = set(
+            str(key).strip().lower()
+            for key in (left.get("item_keys", []) or left.get("child_keys", []) or [])
+            if str(key).strip()
+        )
+        for right in candidates[index + 1:]:
+            right_path = str(right.get("path", "") or "")
+            right_segments = [str(segment).strip() for segment in right.get("segments", []) if str(segment).strip()]
+            right_type = str(right.get("type", "") or "")
+            if not left_path or not right_path or left_type != right_type:
+                continue
+            if _segments_are_nested(left_segments, right_segments):
+                continue
+
+            shared_keys = left_keys & set(
+                str(key).strip().lower()
+                for key in (right.get("item_keys", []) or right.get("child_keys", []) or [])
+                if str(key).strip()
+            )
+            score = float(len(shared_keys)) * 3.0
+            if _segments_share_parent(left_segments, right_segments):
+                score += 3.0
+            if left_type == "array_object":
+                score += 2.0
+            pair_scores.append((score, (left_path, right_path)))
+
+    if not pair_scores:
+        return []
+
+    pair_scores.sort(key=lambda item: (-item[0], item[1]))
+    best_score, best_pair = pair_scores[0]
+    second_score = pair_scores[1][0] if len(pair_scores) > 1 else None
+    if best_score < 5.0:
+        return []
+    if second_score is not None and (best_score - second_score) < 2.0:
+        return []
+    return sorted(best_pair)
+
+
 def detect_lowcode_operation(task_text: str) -> dict[str, Any]:
     """Detect the dominant simple operation requested by the user."""
     tokens = _canonicalize_tokens(_extract_task_tokens(task_text))
@@ -1149,6 +1239,8 @@ def compile_lowcode_request(
     explicit_paths = list(dict.fromkeys([*explicit_paths_raw, *inferred_explicit_paths]))
     ranked_candidates = rank_workflow_paths(merged_text, inventory, operation, explicit_paths)
     compare_paths = infer_comparison_paths(merged_text, inventory, explicit_paths)
+    cooperative_paths = infer_cooperative_paths(merged_text, ranked_candidates, inventory)
+    selects_all_paths = bool(ALL_PATHS_REPLY_RE.search(str(clarification_text or "")))
 
     selected_primary_path = ""
     selected_save_path = ""
@@ -1170,20 +1262,42 @@ def compile_lowcode_request(
             "",
         ) or "")
         confidence = 1.0
+    elif len(cooperative_paths) >= 2:
+        expected_workflow_paths = list(cooperative_paths)
+        selected_primary_path = cooperative_paths[0]
+        selected_primary_type = str(next(
+            (entry.get("type", "") for entry in inventory if entry.get("path") == selected_primary_path),
+            "",
+        ) or "")
+        confidence = 1.0
     elif len(explicit_exact_raw) == 1:
         selected_primary_path = explicit_exact_raw[0]
         expected_workflow_paths = [selected_primary_path]
         confidence = 1.0
     elif len(explicit_exact_raw) > 1:
         expected_workflow_paths = list(explicit_exact_raw)
-        needs_clarification = True
+        needs_clarification = not selects_all_paths
+        if selects_all_paths:
+            selected_primary_path = explicit_exact_raw[0]
+            selected_primary_type = str(next(
+                (entry.get("type", "") for entry in inventory if entry.get("path") == selected_primary_path),
+                "",
+            ) or "")
+            confidence = 1.0
     elif len(explicit_exact) == 1:
         selected_primary_path = explicit_exact[0]
         expected_workflow_paths = [selected_primary_path]
         confidence = 1.0
     elif len(explicit_exact) > 1:
         expected_workflow_paths = list(explicit_exact)
-        needs_clarification = True
+        needs_clarification = not selects_all_paths
+        if selects_all_paths:
+            selected_primary_path = explicit_exact[0]
+            selected_primary_type = str(next(
+                (entry.get("type", "") for entry in inventory if entry.get("path") == selected_primary_path),
+                "",
+            ) or "")
+            confidence = 1.0
     elif ranked_candidates:
         top = ranked_candidates[0]
         second = ranked_candidates[1] if len(ranked_candidates) > 1 else None

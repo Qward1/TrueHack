@@ -149,6 +149,11 @@ _VALID_FOLLOWUP_ACTIONS = frozenset({"none", "refine_existing_code", "start_new_
 # ---------------------------------------------------------------------------
 
 _WF_PATH_RE = re.compile(r"wf\.(?:vars|initVariables)(?:\.\w+)+")
+_ALL_PATHS_RE = re.compile(
+    r"\b(?:со\s+всеми|со\s+всеми\s+этими|со\s+всеми\s+перечисленными|"
+    r"все(?:ми)?\s+перечисленн(?:ые|ыми)|все\s+пути|оба|обе|обоими)\b",
+    re.IGNORECASE,
+)
 
 
 def _extract_workflow_paths_from_text(text: str) -> list[str]:
@@ -156,6 +161,23 @@ def _extract_workflow_paths_from_text(text: str) -> list[str]:
     if not text:
         return []
     return sorted(set(_WF_PATH_RE.findall(text)))
+
+
+def _expand_all_paths_answer(user_input: str, pending_questions: list[str]) -> str:
+    cleaned = str(user_input or "").strip()
+    if not cleaned or not _ALL_PATHS_RE.search(cleaned):
+        return cleaned
+
+    available_paths = _extract_workflow_paths_from_text("\n".join(str(question or "") for question in pending_questions))
+    if len(available_paths) < 2:
+        return cleaned
+
+    return (
+        "Используй все перечисленные workflow-пути: "
+        + ", ".join(available_paths)
+        + ". "
+        + cleaned
+    )
 
 
 def _normalize_planner_result(raw: dict, user_input: str) -> dict[str, Any]:
@@ -386,11 +408,12 @@ def create_planner_node(llm: LLMProvider) -> Callable:
 
         # Build the input the planner actually sees.
         if awaiting and original_input:
+            normalized_answer = _expand_all_paths_answer(user_input, pending_questions)
             question_block = "\n".join(f"- {q}" for q in pending_questions if q)
             effective_input = (
                 f"Исходная задача: {original_input}\n\n"
                 f"Уточняющие вопросы:\n{question_block}\n\n"
-                f"Ответ пользователя: {user_input}"
+                f"Ответ пользователя: {normalized_answer}"
             ).strip()
         else:
             effective_input = user_input

@@ -148,6 +148,35 @@ class LowcodeAlignmentTests(unittest.TestCase):
         )
         self.assertIn("compare_values", compiled["semantic_expectations"])
 
+    def test_compile_request_infers_two_array_paths_for_multi_source_task(self) -> None:
+        compiled = compile_lowcode_request(
+            task_text="Сопоставь оплаты со счетами по invoiceId и верни только те счета, у которых оплаченная сумма меньше суммы счета.",
+            raw_context="""{
+  "wf": {
+    "vars": {
+      "invoices": [
+        { "invoiceId": "INV-1", "amount": 1000 },
+        { "invoiceId": "INV-2", "amount": 1500 },
+        { "invoiceId": "INV-3", "amount": 700 }
+      ],
+      "payments": [
+        { "invoiceId": "INV-1", "amount": 1000 },
+        { "invoiceId": "INV-2", "amount": 400 },
+        { "invoiceId": "INV-2", "amount": 300 },
+        { "invoiceId": "INV-3", "amount": 700 }
+      ]
+    }
+  }
+}""",
+        )
+
+        self.assertFalse(compiled["needs_clarification"])
+        self.assertEqual(compiled["selected_primary_path"], "wf.vars.invoices")
+        self.assertEqual(
+            compiled["expected_workflow_paths"],
+            ["wf.vars.invoices", "wf.vars.payments"],
+        )
+
     def test_compile_request_preserves_parsed_context_for_runtime_validation(self) -> None:
         compiled = compile_lowcode_request(
             task_text="Convert wf.initVariables.recallTime to unix timestamp.",
