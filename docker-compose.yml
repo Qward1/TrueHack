@@ -5,6 +5,9 @@ x-truehack-image: &truehack-image
   build:
     context: .
 
+x-truehack-image-runtime: &truehack-image-runtime
+  image: truehack-app:local
+
 x-truehack-env: &truehack-env
   OLLAMA_BASE_URL: http://ollama:11434/v1
   OLLAMA_MODEL: ${OLLAMA_MODEL:-truehack}
@@ -47,7 +50,7 @@ services:
       retries: 30
 
   model-init:
-    <<: *truehack-image
+    <<: *truehack-image-runtime
     container_name: truehack-model-init
     restart: "no"
     depends_on:
