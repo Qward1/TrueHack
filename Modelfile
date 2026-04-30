@@ -1,0 +1,17 @@
+# Modelfile for MTS True Tech Hack / LocalScript
+# Target: 8 GB VRAM GPU, no CPU offload
+#
+# Usage:
+#   ollama create truehack -f Modelfile
+#   python app.py --model truehack
+#
+# For weaker GPUs (4 GB VRAM) use the base model directly:
+#   python app.py --model qwen2.5-coder:3b-instruct
+
+FROM qwen2.5-coder:7b-instruct
+
+PARAMETER num_ctx 4096
+PARAMETER num_predict 256
+PARAMETER num_batch 1
+PARAMETER num_gpu 99
+PARAMETER temperature 0.2

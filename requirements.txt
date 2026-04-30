@@ -1,9 +1,4 @@
-# Python dependencies
-langgraph
-langchain-core
-lupa
-typing-extensions
-
-# System runtime dependencies, install separately:
-# - lua or luajit
-# - luacheck (for example: luarocks install luacheck)
+openai>=1.30.0
+langgraph>=0.2.0
+structlog>=24.1.0
+python-dotenv>=1.0.0

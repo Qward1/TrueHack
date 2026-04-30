@@ -1,481 +1,529 @@
-# TrueHach
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.12+-blue?style=flat-square&logo=python" />
+  <img src="https://img.shields.io/badge/Ollama-local%20LLM-orange?style=flat-square" />
+  <img src="https://img.shields.io/badge/LangGraph-pipeline-green?style=flat-square" />
+  <img src="https://img.shields.io/badge/Lua-5.5-blueviolet?style=flat-square" />
+  <img src="https://img.shields.io/badge/MTS-True%20Tech%20Hack-red?style=flat-square" />
+</p>
 
-Локальная агентская система на `LangGraph` для генерации, запуска, тестирования и ремонта `Lua`-скриптов.
+<h1 align="center">LocalScriptLua</h1>
 
-## Быстрый старт
+<p align="center"><b>Локальная AI-система для генерации, доработки, проверки и сохранения Lua-кода</b></p>
 
-### Проверенный сценарий: Windows + LM Studio + `lua.exe` + `luacheck`
+<p align="center">
+Не просто чат с моделью — аккуратная рабочая среда для Lua.<br/>
+Внешне мягкий интерфейс, внутри — серьёзная система для состояния, пайплайна и автопочинки кода.
+</p>
 
-Это основной и уже проверенный способ запуска для текущего проекта.
+---
 
-Что должно быть запущено и установлено:
+## О проекте
 
-1. В `LM Studio` должна быть загружена модель и включен `Local Server`.
-2. Должны работать команды:
-   - `where lua`
-   - `where luacheck`
-   - `where py`
+**LocalScriptLua** — решение для кейса MTS True Tech Hack / LocalScript.
 
-Быстрая проверка:
+Система решает реальную инженерную задачу: LowCode Lua-скрипты часто описываются на естественном языке, а обычная LLM-генерация нестабильна по формату и логике. LocalScriptLua собирает задачу, состояние, код и проверки в единый рабочий поток — нужны не только код, но и проверка, сохранение и объяснение результата.
 
-```cmd
-cd C:\Users\Admin\Desktop\TrueHach
-py main.py --check-runtime --prompt test
+**Ключевые особенности:**
+
+- Создаёт и дорабатывает Lua-код по описанию на русском или английском
+- Проверяет код локально через Lua harness — без отправки кода наружу
+- Делает fix-loop при ошибках — сам находит и исправляет проблемы
+- Проверяет соответствие исходной задаче через LLM-verifier
+- Отвечает на вопросы по текущему коду
+- Сохраняет `.lua` и sidecar `jsonstring`-артефакт
+- Работает полностью локально — без зависимости от внешних AI API
+
+---
+
+## Возможности системы
+
+| Функция | Описание |
+|---|---|
+| **Генерация кода** | Создаёт Lua-скрипт по задаче на естественном языке |
+| **Доработка кода** | Изменяет существующий скрипт по новому требованию |
+| **Локальная валидация** | Запускает код в Lua harness с mock `wf.vars` / `wf.initVariables` |
+| **Fix-loop** | Автоматически исправляет синтаксические и runtime-ошибки |
+| **Проверка требований** | LLM-verifier сверяет логику кода с исходной задачей |
+| **Semantic fix-loop** | Исправляет семантические ошибки после провала верификации |
+| **Вопросы по коду** | Отвечает на вопросы об уже сгенерированном скрипте |
+| **RAG-шаблоны** | Подбирает релевантный шаблон из базы 150+ Lua-примеров |
+| **Сохранение** | `.lua` файл + sidecar `.jsonstring.txt` артефакт |
+| **История чатов** | SQLite-хранилище с полной историей сессий |
+
+---
+
+## Архитектура
+
+### Компоненты системы
+
+```
+Пользователь (Web UI / API / консоль)
+         │
+         ▼
+      app.py  ──────────────────────────────┐
+  (HTTP-сервер, чаты, состояние)            │
+         │                                  │
+         ▼                                  ▼
+  PipelineEngine                    Файловая система
+  (LangGraph-граф)                  (.lua, sidecar,
+         │                           SQLite, логи, KB)
+         ▼
+      Ollama
+  (LLM + embeddings)
+         │
+         ▼
+  Lua interpreter
+  (локальная валидация)
 ```
 
-Если все в порядке, ты увидишь примерно такой результат:
+### Граф пайплайна
 
-```json
-{
-  "backend_preference": "auto",
-  "selected_backend": "lua",
-  "lua_path": "C:\\Users\\Admin\\AppData\\Local\\Programs\\Lua\\bin\\lua.EXE",
-  "luajit_path": null,
-  "linter": "C:\\Users\\Admin\\AppData\\Roaming\\luarocks\\bin\\luacheck",
-  "lupa_available": false,
-  "ready": true
-}
+```
+Start
+  └─▶ TargetResolver        — определяет файл/папку активного чата
+        └─▶ IntentRouter     — LLM решает: create / change / inspect / question
+              ├─▶ QuestionAnswerer ──────────────────────────────────▶ End
+              └─▶ PlannerAgent       — анализирует задачу, задаёт уточнения
+                    └─▶ GenerationContextCompiler — компилирует контекст
+                          └─▶ RAG    — подбирает Lua-шаблон из КБ
+                                └─▶ CodeGenerator / CodeRefiner
+                                      └─▶ CodeValidator
+                                            ├─▶ [ошибка] ValidationFixer ──▶ CodeValidator
+                                            └─▶ [ок] RequirementsVerifier
+                                                  ├─▶ [ошибка] VerificationFixer ──▶ RequirementsVerifier
+                                                  └─▶ [ок] ResponseAssembler ──▶ End
 ```
 
-Обычный запуск:
+### Структура репозитория
 
-```cmd
-cd C:\Users\Admin\Desktop\TrueHach
-py main.py
+```
+TrueHack/
+├── app.py                          # Web UI, HTTP API, chat runtime, console-режимы
+├── requirements.txt                # Зависимости Python
+├── Modelfile                       # Конфигурация Ollama-модели
+├── openapi.yaml                    # Swagger-контракт API
+├── docker-compose.yml              # Docker Compose (Ollama + App)
+├── Dockerfile                      # Python 3.12 + встроенный Lua 5.5
+├── vendor/lua-5.5.0/              # Vendored source tree для сборки Lua 5.5 в Docker
+├── .env.example                    # Шаблон переменных окружения
+├── lua_rag_templates_kb.jsonl      # База шаблонов (150+ Lua-примеров)
+├── src/
+│   ├── agents/
+│   │   └── planner.py              # TaskPlanner — анализ и уточнение задачи
+│   ├── core/
+│   │   ├── llm.py                  # LLM-провайдер (OpenAI-compatible Ollama)
+│   │   ├── state.py                # PipelineState — хранилище данных пайплайна
+│   │   └── logging_runtime.py     # Структурированное логирование
+│   ├── graph/
+│   │   ├── engine.py               # PipelineEngine — точка входа в граф
+│   │   ├── builder.py              # Построение LangGraph-графа
+│   │   ├── nodes.py                # Узлы пайплайна
+│   │   └── conditions.py          # Условная маршрутизация
+│   └── tools/
+│       ├── lua_tools.py            # Lua harness, нормализация, диагностика
+│       ├── target_tools.py         # Путь, именование, сохранение
+│       ├── local_runtime.py        # Запуск Lua-процессов
+│       └── rag_templates.py        # RAG: поиск и выбор шаблонов
+├── docs/                           # Архитектурная документация
+└── tests/                          # Тесты пайплайна, planner, RAG, логирования
 ```
 
-После этого программа сама попросит prompt:
+---
 
-```text
-Введите prompt для Lua-скрипта:
-```
+## Быстрый старт (без Docker)
 
-Именно этот способ лучше использовать для длинных русскоязычных prompt в Windows `cmd`, чтобы не упираться в кавычки и кодировку командной строки.
+### Требования
 
-Если нужен запуск одной строкой:
+- **Python** 3.12+
+- **Ollama** — [скачать с ollama.com](https://ollama.com/download)
+- **Lua 5.5** — интерпретатор, доступный в PATH или по явному пути
 
-```cmd
-cd C:\Users\Admin\Desktop\TrueHach
-py main.py --prompt "Write a simple Lua script that reads one line and prints its length."
-```
+---
 
-### Если запускаешь из WSL
-
-`lua` и `luacheck` из проекта уже подхватываются, но `LM Studio` по адресу `http://127.0.0.1:1234/v1` в WSL может быть недоступен.
-
-Проверка:
+### Шаг 1 — Скачать репозиторий
 
 ```bash
-python3 main.py --check-runtime --prompt test
-curl http://127.0.0.1:1234/v1/models
+git clone <url-репозитория>
+cd TrueHack
 ```
 
-Если `curl` не отвечает, запускай пайплайн из обычного Windows `cmd`, а не из WSL.
+---
 
-Система работает как пайплайн из нескольких агентов:
+### Шаг 2 — Создать виртуальное окружение и установить зависимости
 
-1. `parse_task` - разбирает пользовательский запрос и превращает его в структурированную спецификацию.
-2. `plan_task` - строит план реализации, проверки и тестирования.
-3. `generate_code` - генерирует Lua-код по спецификации и плану.
-4. `execute_code` - запускает Lua-код и собирает результат выполнения.
-5. `test_code` - генерирует и запускает тестовый сценарий.
-6. `repair_code` - исправляет код по результатам выполнения и тестов.
-7. `finalize_artifact` - собирает итоговый финальный JSON-артефакт после успешной валидации.
-
-## Состояния графа
-
-- `NEW_TASK`
-- `PARSED`
-- `PLANNED`
-- `CODE_GENERATED`
-- `EXECUTED`
-- `TESTED`
-- `REPAIR_NEEDED`
-- `FINALIZED`
-- `FAILED`
-
-## Текущая архитектура
-
-- Граф собирается в [graph.py](/mnt/c/Users/Admin/Desktop/TrueHach/graph.py)
-- Состояние описано в [state.py](/mnt/c/Users/Admin/Desktop/TrueHach/state.py)
-- Реестр и подмена версий агентов идут через [factory.py](/mnt/c/Users/Admin/Desktop/TrueHach/factory.py)
-- Базовый LLM-клиент для LM Studio находится в [llm_client.py](/mnt/c/Users/Admin/Desktop/TrueHach/llm_client.py)
-- Исполнение Lua, LuaJIT, `lupa` и `luacheck` собрано в [lua_runtime.py](/mnt/c/Users/Admin/Desktop/TrueHach/lua_runtime.py)
-- CLI-входная точка находится в [main.py](/mnt/c/Users/Admin/Desktop/TrueHach/main.py)
-
-Агенты лежат по папкам `agents/<role>/<version>.py`.  
-Это позволяет добавлять новые версии логики без переписывания графа.
-
-## Модель
-
-По умолчанию проект ожидает локальную модель LM Studio по адресу:
-
-```text
-http://127.0.0.1:1234/v1
+**Windows (PowerShell):**
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 ```
 
-По умолчанию используется модель:
-
-```text
-yi-coder-9b-chat
-```
-
-Клиент использует OpenAI-compatible endpoint `/chat/completions`.
-
-## Установка Python-зависимостей
-
+**Linux / macOS:**
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Для Windows:
+---
 
-```cmd
-cd C:\Users\Admin\Desktop\TrueHach
-py -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
+### Шаг 3 — Установить Lua
+
+**Windows:**
+1. Скачать `lua-5.4.x_Win64_bin.zip` с [sourceforge.net/projects/luabinaries](https://sourceforge.net/projects/luabinaries/)
+2. Распаковать, например в `C:\lua55\`
+3. Добавить `C:\lua55\` в системную переменную `PATH`, **или** прописать полный путь в `.env`:
+   ```
+   LUA_BIN=C:/lua55/lua55.exe
+   ```
+
+**Ubuntu / Debian:**
+```bash
+sudo apt install lua5.4
 ```
 
-Содержимое [requirements.txt](/mnt/c/Users/Admin/Desktop/TrueHach/requirements.txt):
+**macOS:**
+```bash
+brew install lua
+```
 
-- `langgraph`
-- `langchain-core`
-- `typing-extensions`
-- `lupa`
+---
 
-`lupa` нужна как Python fallback/runtime для исполнения Lua, если нет отдельного бинарника `lua` или `luajit`.
+### Шаг 4 — Скачать модели через Ollama
 
-## Установка Lua runtime
+Запустить Ollama (если ещё не запущен):
+```bash
+ollama serve
+```
 
-Для реального исполнения нужен хотя бы один из вариантов:
+Скачать основную модель для генерации кода:
+```bash
+ollama pull qwen2.5-coder:7b-instruct
+```
 
-1. `lua`
-2. `luajit`
-3. Python-пакет `lupa`
+Скачать модель для планировщика, роутера и выбора шаблона:
+```bash
+ollama pull qwen2.5-coder:3b-instruct
+```
 
-Для линтинга нужен:
+Скачать эмбеддинг-модель для RAG (рекомендуется):
+```bash
+ollama pull qwen3-embedding:0.6b
+```
 
-1. `luacheck`
+> **Для GPU 8 GB VRAM** — используйте `qwen2.5-coder:7b-instruct` (рекомендуется).  
+> **Для GPU 4 GB VRAM** — используйте `qwen2.5-coder:3b-instruct` для всех агентов.
 
-### Вариант 1. Системные пакеты
+**Создать оптимизированную модель с параметрами хакатона (рекомендуется):**
+```bash
+ollama create truehack -f Modelfile
+```
 
-На Linux/WSL:
+---
+
+### Шаг 5 — Настроить переменные окружения
+
+Скопировать шаблон:
+```bash
+# Windows
+copy .env.example .env
+
+# Linux / macOS
+cp .env.example .env
+```
+
+Открыть `.env` и указать путь к Lua, если он не в PATH:
+```env
+LUA_BIN=C:/lua55/lua55.exe
+```
+
+Остальные значения по умолчанию уже настроены для локального запуска.
+
+---
+
+### Шаг 6 — Запустить приложение
 
 ```bash
-sudo apt update
-sudo apt install -y lua5.4 luajit luarocks
-sudo luarocks install luacheck
+python app.py
 ```
 
-Если пакет `lua5.4` ставит бинарник не как `lua`, можно явно передать путь через `--lua-path`.
+Приложение откроется в браузере автоматически. Если нет — перейти по адресу:
 
-### Вариант 1b. Windows
-
-Если проект запускается на обычном Windows, а не внутри WSL, самый простой путь такой:
-
-1. Установить Python.
-2. Установить Python-зависимости проекта.
-3. Либо поставить `lua`/`luajit` и `luacheck`, либо использовать `lupa`.
-
-#### Самый простой вариант для Windows: только через `lupa`
-
-Если не хочется отдельно ставить `lua.exe`, можно использовать Python runtime:
-
-```powershell
-py -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-python main.py --prompt "Напиши Lua-скрипт" --lua-backend lupa
+```
+http://127.0.0.1:8000
 ```
 
-#### Вариант с `lua.exe` или `luajit.exe`
+#### Дополнительные параметры запуска
 
-Если у тебя уже есть `lua.exe` или `luajit.exe`, добавь каталог с бинарником в `PATH` или передай путь явно:
+```bash
+# Указать рабочую папку для сохранения .lua файлов
+python app.py --workspace C:\Work\LuaProjects
 
-```powershell
-python main.py --prompt "Напиши Lua-скрипт" --lua-backend lua --lua-path "C:\Lua\lua.exe"
-python main.py --prompt "Напиши Lua-скрипт" --lua-backend luajit --luajit-path "C:\LuaJIT\luajit.exe"
+# Указать модель явно
+python app.py --model qwen2.5-coder:3b-instruct
+
+# Все параметры
+python app.py \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --workspace /path/to/workspace \
+  --model truehack \
+  --url http://127.0.0.1:11434/v1
 ```
 
-Проверить, что Windows видит бинарники:
+---
 
-```powershell
-where lua
-where luajit
-where luacheck
+## Запуск через Docker Compose
+
+Основной способ запуска проекта теперь один:
+
+```bash
+docker compose up --build -d
 ```
 
-Если `luacheck` установлен отдельно, можно тоже передать путь явно:
+Что поднимается автоматически:
+- приложение целиком;
+- Ollama;
+- bootstrap контейнер, который подтягивает нужные модели;
+- кастомная модель `truehack` из `Modelfile`, если она еще не создана;
+- runtime-папка и workspace.
 
-```powershell
-python main.py --prompt "Напиши Lua-скрипт" --lua-backend lua --lua-path "C:\Lua\lua.exe" --luacheck-path "C:\LuaRocks\luacheck.bat"
-```
+GPU включен по умолчанию для сервиса `ollama` через `gpus: all`, поэтому модели будут запускаться на видеокарте, если Docker на хосте имеет доступ к GPU.
+Если Docker GPU не видит, нужно отдельно включить поддержку GPU в Docker Desktop / WSL или установить NVIDIA Container Toolkit на Linux.
 
-#### Как поставить `luacheck` на Windows
-
-Обычно `luacheck` ставят через `LuaRocks`. После установки `LuaRocks` команда выглядит так:
-
-```powershell
-luarocks install luacheck
-```
-
-Если `luarocks` не прописан в `PATH`, можно использовать полный путь до `luarocks.bat`.
-
-#### Если `luarocks install luacheck` падает на `x86_64-w64-mingw32-gcc`
-
-Типичный лог выглядит так:
+Приложение доступно по адресу:
 
 ```text
-"x86_64-w64-mingw32-gcc" не является внутренней или внешней командой
+http://127.0.0.1:8000
 ```
 
-Это значит, что `LuaRocks` пытается собрать зависимость `luafilesystem` из исходников, но в системе нет GCC toolchain для Windows.
+Первый старт может занять заметное время, потому что Ollama скачивает модели.
 
-Что нужно сделать:
-
-1. Установить MSYS2.
-2. Установить через MSYS2 пакет GCC для Windows.
-3. Добавить каталог с GCC в `PATH`.
-4. Повторить установку `luacheck`.
-
-Пример рабочего пути:
-
-1. Установить MSYS2 в `C:\msys64`.
-2. Открыть терминал `MSYS2 UCRT64`.
-3. Выполнить:
+### Остановить
 
 ```bash
-pacman -Syu
-pacman -S --needed mingw-w64-ucrt-x86_64-gcc
+docker compose down
 ```
 
-4. Добавить в `PATH`:
+### Что сохраняется
 
-```text
-C:\msys64\ucrt64\bin
+- `./runtime` — SQLite база, логи и runtime-состояние;
+- `./workspace` — generated `.lua` файлы и артефакты;
+- `ollama_data` — скачанные модели Ollama.
+
+### Сервисы
+
+| Сервис | Порт | Описание |
+|---|---|---|
+| `truehack-app` | `8000` | Web UI и REST API |
+| `truehack-ollama` | internal | Ollama runtime |
+| `truehack-model-init` | internal | автоподтяжка моделей и создание `truehack` |
+
+---
+
+## Конфигурация (.env)
+
+`docker compose` уже запускается без предварительного создания `.env`.
+Если нужно переопределить модели или параметры, можно создать `.env` на базе `.env.example`.
+
+### Основные параметры
+
+```env
+# Базовая модель (используется для агентов без явного override)
+OLLAMA_MODEL=qwen2.5-coder:7b-instruct
+
+# Адрес Ollama API
+OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
+
+# Путь к исполняемому файлу Lua
+LUA_BIN=lua55
+
+# Ограничение параллельных запросов к Ollama (рекомендуется 1)
+OLLAMA_MAX_CONCURRENT_REQUESTS=1
 ```
 
-5. Проверить:
+### Модели по агентам (per-agent routing)
 
-```powershell
-gcc --version
-where gcc
+Каждый агент пайплайна может использовать свою модель:
+
+```env
+OLLAMA_MODEL_CODE_GENERATOR=qwen2.5-coder:7b-instruct
+OLLAMA_MODEL_CODE_REFINER=qwen2.5-coder:7b-instruct
+OLLAMA_MODEL_VALIDATION_FIXER=qwen2.5-coder:7b-instruct
+OLLAMA_MODEL_VERIFICATION_FIXER=qwen2.5-coder:7b-instruct
+OLLAMA_MODEL_REQUIREMENTS_VERIFIER=qwen2.5-coder:7b-instruct
+OLLAMA_MODEL_TEMPLATE_SELECTOR=qwen2.5-coder:3b-instruct
+OLLAMA_MODEL_INTENT_ROUTER=qwen2.5-coder:3b-instruct
+OLLAMA_MODEL_TASK_PLANNER=qwen2.5-coder:3b-instruct
 ```
 
-6. После этого снова запустить:
+### RAG-шаблоны
 
-```powershell
-luarocks install luacheck
+```env
+RAG_TEMPLATES_ENABLED=true
+RAG_TEMPLATES_KB_PATH=lua_rag_templates_kb.jsonl
+RAG_TEMPLATES_TOP_K=5
+RAG_TEMPLATES_EMBED_MODEL=qwen3-embedding:0.6b
 ```
 
-Если твоя сборка LuaRocks ожидает именно `x86_64-w64-mingw32-gcc`, это, как правило, означает, что ей нужен MinGW-w64 toolchain. В большинстве случаев установка GCC через MSYS2 решает проблему. Это вывод по симптомам ошибки и типичному поведению LuaRocks на Windows.
+### TaskPlanner
 
-#### Адрес LM Studio на Windows
-
-Если проект запускается не внутри Docker/контейнера, а прямо в Windows, локальный LM Studio обычно удобнее указывать так:
-
-```powershell
-python main.py --prompt "Напиши Lua-скрипт" --base-url "http://127.0.0.1:1234/v1"
+```env
+PLANNER_ENABLED=true
 ```
 
-Если проект запускается из контейнера и LM Studio работает на хост-машине Windows, тогда `host.docker.internal` подходит:
+---
 
-```powershell
-python main.py --prompt "Напиши Lua-скрипт" --base-url "http://host.docker.internal:1234/v1"
+## Использование
+
+### Web UI
+
+Основной способ работы. Открыть `http://127.0.0.1:8000`.
+
+**Панель инструментов:**
+
+| Кнопка | Действие |
+|---|---|
+| **Повторить Проверку** | Повторно запустить валидацию и верификацию текущего кода |
+| **Статус** | Показать статус последнего выполнения пайплайна |
+| **Путь** | Показать активный target-путь для сохранения |
+| **Текущий Промпт** | Показать оригинальную задачу текущего чата |
+| **Показать Код** | Отобразить последний сгенерированный код |
+| **Помощь** | Справка по командам |
+
+**Примеры задач:**
+
+```
+Напиши скрипт, который берёт массив items из wf.vars.json.DOC.ZCDF_PACKAGES
+и возвращает только те элементы, у которых sku не пустой
 ```
 
-### Вариант 2. Сборка Lua из исходников, которые уже лежат в проекте
+```
+Преобразуй структуру данных так, чтобы все элементы Items в ZCDF_PACKAGES
+всегда были представлены в виде массивов, даже если они изначально не являются массивами
+```
 
-В репозитории уже есть каталог `lua-5.5.0/`.
+```
+Добавь обработку случая когда wf.vars.json.DOC пустой
+```
 
-Пример для Linux/WSL:
+### Команды в чате
+
+| Команда | Описание |
+|---|---|
+| `/new` | Начать новый чат |
+| `/retry` | Повторить последнюю генерацию |
+| `/code` | Показать текущий код |
+| `/path [путь]` | Установить/показать путь сохранения |
+| `/status` | Статус пайплайна |
+| `/prompt` | Показать исходную задачу |
+
+### REST API
+
+Swagger UI доступен по адресу: `http://127.0.0.1:8000/swagger`
+
+Основные эндпоинты:
+
+```
+POST /api/chat/{chat_id}/message   — отправить сообщение в чат
+GET  /api/chats                    — список чатов
+GET  /api/chat/{chat_id}           — история чата
+POST /api/generate                 — one-shot генерация без истории
+```
+
+### Console-режим
+
+Локальный диалог прямо в терминале:
 
 ```bash
-cd lua-5.5.0
-make linux
+python app.py --console
 ```
 
-После этого можно запускать проект так:
+---
+
+## Модели и параметры
+
+### Рекомендованная конфигурация (GPU 8 GB VRAM)
+
+| Агент | Модель |
+|---|---|
+| Генератор кода | `qwen2.5-coder:7b-instruct` |
+| Исправление ошибок | `qwen2.5-coder:7b-instruct` |
+| Верификатор требований | `qwen2.5-coder:7b-instruct` |
+| Выбор шаблона | `qwen2.5-coder:3b-instruct` |
+| Роутер интента | `qwen2.5-coder:3b-instruct` |
+| Планировщик | `qwen2.5-coder:3b-instruct` |
+| Эмбеддинги (RAG) | `qwen3-embedding:0.6b` |
+
+### Параметры модели (Modelfile)
+
+```
+FROM qwen2.5-coder:7b-instruct
+
+PARAMETER num_ctx     4096   # контекстное окно
+PARAMETER num_predict 256    # максимум токенов в ответе
+PARAMETER num_batch   1      # батч для VRAM-ограничений
+PARAMETER num_gpu     99     # полная загрузка на GPU
+PARAMETER temperature 0.2    # детерминированная генерация
+```
+
+---
+
+## Артефакты и наблюдаемость
+
+После каждой генерации система создаёт:
+
+| Файл | Описание |
+|---|---|
+| `*.lua` | Готовый Lua-скрипт |
+| `*.jsonstring.txt` | Sidecar-артефакт: JSON с `lua{...}lua`-обёрткой |
+
+Логи и хранилище:
+
+| Файл | Описание |
+|---|---|
+| `.lua_console_chats.db` | SQLite: чаты, сообщения, состояние сессий |
+| `logs/runtime.jsonl` | Технические события пайплайна |
+| `logs/llm_prompts.jsonl` | Все вызовы моделей (prompt-аудит) |
+
+Автоочистка логов происходит каждые 10 запусков.
+
+---
+
+## Тесты
 
 ```bash
-python3 main.py --prompt "Напиши Lua-скрипт" --lua-backend lua --lua-path ./lua-5.5.0/src/lua
+# Запустить все тесты
+python -m pytest tests/ -v
+
+# Тесты конкретного модуля
+python -m pytest tests/test_planner.py -v
+python -m pytest tests/test_rag.py -v
+python -m pytest tests/test_logging.py -v
 ```
 
-### Вариант 3. Только через `lupa`
+---
 
-Если CLI-бинарников нет, но установлен `lupa`, можно принудительно выбрать Python runtime:
+## Команда
 
-```bash
-python3 main.py --prompt "Напиши Lua-скрипт" --lua-backend lupa
-```
+**APPLExMISISxMIREA xXЯОМИ** — MTS True Tech Hack 2024
 
-## Проверка runtime
+- Дёмин Владислав Русланович
+- Ромашкин Дмитрий Олегович
+- Гасанов Тимур Русланович
 
-Проверить, что видит система:
+---
 
-```bash
-python3 main.py --check-runtime --prompt test
-```
+## Стек технологий
 
-Для Windows:
-
-```cmd
-py main.py --check-runtime --prompt test
-```
-
-Пример ожидаемого вывода:
-
-```json
-{
-  "backend_preference": "auto",
-  "selected_backend": "lua",
-  "lua_path": "/usr/bin/lua",
-  "luajit_path": null,
-  "linter": "/usr/bin/luacheck",
-  "lupa_available": true,
-  "ready": true
-}
-```
-
-## Запуск
-
-Простой запуск:
-
-```bash
-python3 main.py --prompt "Напиши Lua-модуль с функцией add(a, b)"
-```
-
-Для Windows `cmd` лучше так:
-
-```cmd
-py main.py
-```
-
-Если нужен prompt прямо в команде:
-
-```cmd
-py main.py --prompt "Write a simple Lua script that reads one line and prints its length."
-```
-
-Для длинных русских prompt в Windows `cmd` удобнее не передавать `--prompt`, а вставлять текст после запуска `py main.py`.
-
-С ручным выбором backend:
-
-```bash
-python3 main.py --prompt "Напиши Lua-модуль с функцией add(a, b)" --lua-backend luajit
-python3 main.py --prompt "Напиши Lua-модуль с функцией add(a, b)" --lua-backend lua
-python3 main.py --prompt "Напиши Lua-модуль с функцией add(a, b)" --lua-backend lupa
-```
-
-С явными путями:
-
-```bash
-python3 main.py \
-  --prompt "Напиши Lua-модуль с функцией add(a, b)" \
-  --lua-backend lua \
-  --lua-path /usr/bin/lua \
-  --luacheck-path /usr/local/bin/luacheck
-```
-
-Показать полное состояние графа:
-
-```bash
-python3 main.py --prompt "Напиши Lua-модуль с функцией add(a, b)" --show-state
-```
-
-Windows:
-
-```cmd
-py main.py --show-state
-```
-
-Посмотреть доступные версии агентов:
-
-```bash
-python3 main.py --list-versions
-```
-
-## Переключение версий агентов
-
-Каждую роль можно переключать независимо.
-
-Пример:
-
-```bash
-python3 main.py \
-  --prompt "Напиши Lua-модуль с функцией add(a, b)" \
-  --agent-version parse_task=v1 \
-  --agent-version generate_code=v1 \
-  --agent-version repair_code=v1
-```
-
-Также это можно делать через переменные окружения:
-
-```bash
-export GENERATE_CODE_VERSION=v1
-export REPAIR_CODE_VERSION=v1
-python3 main.py --prompt "Напиши Lua-модуль"
-```
-
-## Переменные окружения
-
-### LM Studio
-
-```bash
-export LM_STUDIO_BASE_URL=http://127.0.0.1:1234/v1
-export LM_STUDIO_MODEL=yi-coder-9b-chat
-export LM_STUDIO_API_KEY=lm-studio
-export LM_STUDIO_TIMEOUT=120
-export LM_STUDIO_TEMPERATURE=0.2
-```
-
-### Runtime
-
-```bash
-export LUA_BACKEND=auto
-export LUA_PATH=/usr/bin/lua
-export LUAJIT_PATH=/usr/bin/luajit
-export LUACHECK_PATH=/usr/local/bin/luacheck
-export LUA_EXEC_TIMEOUT=15
-export MAX_ATTEMPTS=3
-export ARTIFACTS_DIR=artifacts
-```
-
-## Что возвращает пайплайн
-
-После успешного завершения граф возвращает структурированный `final_artifact` в состоянии:
-
-- `task_goal`
-- `lua_code`
-- `implementation_summary`
-- `validation_summary`
-- `usage_notes`
-- `limitations`
-
-CLI при успешном запуске печатает:
-
-- итоговый `Status`
-- краткую формулировку задачи
-- summary по execution
-- summary по tests
-
-## Как сейчас выбирается runtime
-
-Если задан `LUA_BACKEND=auto`, то порядок такой:
-
-1. `lua`
-2. `luajit`
-3. `lupa`
-
-Если backend выбран явно, система будет использовать только его.
-
-## Ограничения текущей реализации
-
-- Для LLM используется прямой HTTP-клиент к LM Studio, без `langchain-openai`.
-- FastAPI в проект пока не добавлен.
-- Качество генерации и ремонта зависит от доступности локальной модели в `LM Studio`.
-- Если ни `lua`, ни `luajit`, ни `lupa` недоступны, этапы `execute_code` и `test_code` завершатся ошибкой.
-- Если запускать из WSL, `LM Studio` на `127.0.0.1:1234` может быть недоступен, даже если в Windows он работает нормально.
+| Компонент | Технология |
+|---|---|
+| LLM-инференс | [Ollama](https://ollama.com) |
+| Оркестрация пайплайна | [LangGraph](https://github.com/langchain-ai/langgraph) |
+| LLM API-клиент | openai-python (OpenAI-compatible endpoint) |
+| Логирование | [structlog](https://www.structlog.org/) |
+| Хранилище чатов | SQLite |
+| Валидация кода | Lua 5.4 (локальный harness) |
+| RAG эмбеддинги | qwen3-embedding:0.6b (через Ollama) |
+| Web UI | Встроенный HTTP-сервер (без внешних фреймворков) |
+| Контейнеризация | Docker + Docker Compose |

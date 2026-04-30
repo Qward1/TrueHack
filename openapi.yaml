@@ -1,0 +1,409 @@
+openapi: 3.0.3
+info:
+  title: LocalScriptLua API
+  description: |
+    HTTP API для LocalScriptLua.
+
+    Поддерживает:
+    - stateful chat-режим для UI и внешних клиентов
+    - stateless generate-режим для one-shot генерации
+    - управление чатами
+    - отмену активной генерации
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:8000
+    description: Локальный сервер по умолчанию
+
+tags:
+  - name: Chat
+    description: Stateful chat API
+  - name: Generate
+    description: Stateless one-shot code generation
+  - name: Runtime
+    description: Runtime state and cancellation
+  - name: Chats
+    description: Chat management
+
+paths:
+  /api/state:
+    get:
+      tags: [Runtime]
+      summary: Получить текущее состояние UI и активного чата
+      operationId: getState
+      responses:
+        "200":
+          description: Полное состояние приложения
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FullPayload"
+
+  /api/message:
+    post:
+      tags: [Chat]
+      summary: Отправить сообщение в текущий чат
+      operationId: sendMessage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message:
+                  type: string
+                  description: Сообщение пользователя
+            example:
+              message: "Для каждого объекта в wf.vars.RESTbody.result добавь поле PRIORITY_LABEL"
+      responses:
+        "200":
+          description: Обновленное состояние приложения и чата
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FullPayload"
+
+  /generate:
+    post:
+      tags: [Generate]
+      summary: Сгенерировать код без сохранения истории чата
+      operationId: generate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenerateRequest"
+            example:
+              prompt: "Функция factorial(n) для n >= 0"
+              target_path: "C:/work/factorial.lua"
+      responses:
+        "200":
+          description: Результат one-shot генерации
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenerateResponse"
+
+  /api/generate:
+    post:
+      tags: [Generate]
+      summary: Алиас для /generate
+      operationId: generateApi
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenerateRequest"
+      responses:
+        "200":
+          description: Результат one-shot генерации
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenerateResponse"
+
+  /api/cancel:
+    post:
+      tags: [Runtime]
+      summary: Остановить активную генерацию
+      operationId: cancelGeneration
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        "200":
+          description: Статус запроса на отмену
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [cancel_requested, message]
+                properties:
+                  cancel_requested:
+                    type: boolean
+                  message:
+                    type: string
+              example:
+                cancel_requested: true
+                message: "Остановка запрошена."
+
+  /api/chats/new:
+    post:
+      tags: [Chats]
+      summary: Создать новый чат и переключиться на него
+      operationId: createChat
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        "200":
+          description: Обновленное состояние приложения
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FullPayload"
+
+  /api/chats/switch:
+    post:
+      tags: [Chats]
+      summary: Переключиться на существующий чат
+      operationId: switchChat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [chat_id]
+              properties:
+                chat_id:
+                  type: integer
+                  description: Идентификатор чата
+            example:
+              chat_id: 12
+      responses:
+        "200":
+          description: Обновленное состояние приложения
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FullPayload"
+        "404":
+          description: Чат не найден
+
+  /api/chats/delete:
+    post:
+      tags: [Chats]
+      summary: Удалить чат
+      operationId: deleteChat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [chat_id]
+              properties:
+                chat_id:
+                  type: integer
+                  description: Идентификатор чата
+            example:
+              chat_id: 12
+      responses:
+        "200":
+          description: Обновленное состояние приложения
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FullPayload"
+        "404":
+          description: Чат не найден
+
+components:
+  schemas:
+    GenerateRequest:
+      type: object
+      required: [prompt]
+      properties:
+        prompt:
+          type: string
+          description: Текст задачи на естественном языке
+        target_path:
+          type: string
+          description: Необязательный путь для сохранения .lua-файла
+
+    GenerateResponse:
+      type: object
+      required:
+        - ok
+        - error
+        - prompt
+        - target_path
+        - code
+        - response
+      properties:
+        ok:
+          type: boolean
+        error:
+          type: string
+        prompt:
+          type: string
+        target_path:
+          type: string
+        intent:
+          type: string
+        response_type:
+          type: string
+        response:
+          type: string
+        code:
+          type: string
+        saved_to:
+          type: string
+        saved_jsonstring_to:
+          type: string
+        save_success:
+          type: boolean
+        validation_passed:
+          type: boolean
+        verification_passed:
+          type: boolean
+        verification_summary:
+          type: string
+        clarifying_questions:
+          type: array
+          items:
+            type: string
+        suggested_changes:
+          type: array
+          items:
+            type: string
+        explanation:
+          type: object
+          additionalProperties: true
+      example:
+        ok: true
+        error: ""
+        prompt: "Функция factorial(n) для n >= 0"
+        target_path: "C:/work/factorial.lua"
+        intent: "create"
+        response_type: "code"
+        response: "Код готов."
+        code: |
+          lua{
+          local n = wf.initVariables.n
+          if n <= 1 then
+              return 1
+          end
+          return n
+          }lua
+        saved_to: "C:/work/factorial.lua"
+        saved_jsonstring_to: ""
+        save_success: true
+        validation_passed: true
+        verification_passed: true
+        verification_summary: "Проверка пройдена."
+        clarifying_questions: []
+        suggested_changes: []
+        explanation: {}
+
+    FullPayload:
+      type: object
+      required: [active_chat_id, state, messages, chats]
+      properties:
+        active_chat_id:
+          type: integer
+        state:
+          $ref: "#/components/schemas/StatePayload"
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatMessage"
+        chats:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatSummary"
+
+    StatePayload:
+      type: object
+      required:
+        - chat_id
+        - has_project
+        - base_prompt
+        - change_requests
+        - current_code
+        - target_path
+        - workspace_root
+        - last_intent
+        - last_saved_path
+        - last_saved_jsonstring_path
+        - change_requests_count
+        - suggested_changes
+        - clarifying_questions
+        - pipeline_running
+        - active_agent_name
+        - active_agent_label
+      properties:
+        chat_id:
+          type: integer
+        has_project:
+          type: boolean
+        base_prompt:
+          type: string
+        change_requests:
+          type: array
+          items:
+            type: string
+        current_code:
+          type: string
+        target_path:
+          type: string
+        workspace_root:
+          type: string
+        last_intent:
+          type: string
+        last_saved_path:
+          type: string
+        last_saved_jsonstring_path:
+          type: string
+        change_requests_count:
+          type: integer
+        suggested_changes:
+          type: array
+          items:
+            type: string
+        clarifying_questions:
+          type: array
+          items:
+            type: string
+        pipeline_running:
+          type: boolean
+        active_agent_name:
+          type: string
+        active_agent_label:
+          type: string
+
+    ChatMessage:
+      type: object
+      additionalProperties: true
+      properties:
+        role:
+          type: string
+        title:
+          type: string
+        content:
+          type: string
+        created_at:
+          type: string
+      example:
+        role: "assistant"
+        title: "Ответ"
+        content: "Код готов."
+        created_at: "2026-04-14T19:48:15+00:00"
+
+    ChatSummary:
+      type: object
+      additionalProperties: true
+      properties:
+        id:
+          type: integer
+        title:
+          type: string
+        updated_at:
+          type: string
+      example:
+        id: 42
+        title: "Добавить PRIORITY_LABEL"
+        updated_at: "2026-04-14T19:48:15+00:00"
