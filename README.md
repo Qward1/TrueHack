@@ -506,7 +506,7 @@ python -m pytest tests/test_logging.py -v
 
 ## Команда
 
-**APPLExMISISxMIREA xXЯОМИ** — MTS True Tech Hack 2024
+**APPLExMISISxMIREA xXЯОМИ** — MTS True Tech Hack 2026
 
 - Дёмин Владислав Русланович
 - Ромашкин Дмитрий Олегович
